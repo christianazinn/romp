@@ -12616,11 +12616,14 @@ class SdkBackend:
         LOST. Flag it `dropped`, so the chat renders "never delivered" with restore/dismiss instead of a
         sent-looking bubble that rides the live tail with a stale timestamp forever (the user 2026-07-29:
         a two-day-old lost send kept resurfacing mid-chat, hopping turns as new ones landed, posing as
-        history). Event-based — keyed on the spawn/boot that orphaned the send, never on age — and
-        self-correcting: an echo whose text actually LANDED still prunes by text on the next build, so a
-        premature flag can never stick to a delivered message; and one the transcript scan below FINDS
-        is not flagged in the first place (2026-09-06). The flag rides the registry mirror
-        (_persist_echoes), so it survives further restarts.
+        history). Keyed on the spawn/boot that orphaned the send, and since 2026-09-12 on the send's AGE
+        at that event (REDELIVER_MAX_AGE_S, thirty minutes by default): a human send inside the line is
+        re-delivered below; one older than it is marked never delivered and the session told once, and
+        it will be offered back to the user through a card the kernel makes. Self-correcting: an echo
+        whose text actually LANDED still prunes by text on the next build, so a premature flag can never
+        stick to a delivered message; and one the transcript scan below FINDS is not flagged in the
+        first place (2026-09-06). The flag rides the registry mirror (_persist_echoes), so it survives
+        further restarts.
 
         A HUMAN send the transcript has OUTRUN — its text never landed, and a later genuine-human input
         did (_input_landed_after) — takes the flag path even under refeed (2026-09-11): the composer's
@@ -12657,10 +12660,13 @@ class SdkBackend:
                      and not a.get("_landed") and not _queued(a)]
         if not newly:
             return
-        # RE-DELIVER, don't just flag (the user 2026-08-23, their strongest point in the restart
-        # audit: a typed prompt queued at 11:20 was silently discarded by the 11:25 restart, and
-        # losing input to a restart is the one thing this must never do). A HUMAN send whose loss is
-        # proven — and whose text a direct transcript scan (_text_landed) confirms never landed, as a
+        # RE-DELIVER, don't just flag, up to the AGE LINE (the user 2026-08-23, in the restart audit,
+        # who wanted a typed prompt queued at 11:20 and silently discarded by the 11:25 restart to have
+        # survived it; and 2026-09-14, reviewing the line, who accepted thirty minutes as the bound and
+        # wants what falls past it offered back through a card the kernel makes). The rule since then:
+        # typed input inside the line is re-fed; past it, it is marked never delivered, said once, and
+        # comes back through that card, so nothing a restart held goes unsaid. A HUMAN send inside the
+        # line whose loss is proven — and whose text a direct transcript scan (_text_landed) confirms never landed, as a
         # user record or as the queued_command attachment of a mid-turn splice — goes back into the
         # queue in send order, exactly like the surviving queue, recreating the pre-restart state:
         # the LIVE session's _pending when one is running (its mirror rewrites reg['queue'] on every
