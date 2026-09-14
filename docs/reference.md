@@ -1365,6 +1365,40 @@ same amount. The raise on the session side separates the tiers: the wrapper
 writes it in the session's own process, after the kernel has spawned it, so the
 kernel keeps its own. None of this subsection applies on the launchd path.
 
+### Messages across a restart
+
+A message sent to a session while its CLI is busy waits in the kernel's queue
+for that session; one the CLI has taken but not yet written to the transcript
+is the CLI's to land. A restart ends the CLI, so at the next boot, and at any
+fresh spawn for the session, the kernel checks every message the dead CLI was
+holding: one that reached the transcript is left alone, and one that did not is
+put back into the session's queue behind whatever is already waiting, in send
+order, so the session reads it as if the restart had not happened. Two
+variables bound this:
+
+- `ROMP_REDELIVER_MAX_AGE_S=<seconds>` is the age line on that re-delivery;
+  the default is `1800`, thirty minutes. A message older than this at the
+  restart is not re-fed: it is kept in the chat marked never delivered, where
+  it can be restored or dismissed, and the session is told once, in one line
+  naming how many were dropped and the time of the oldest. The line exists
+  because a landing the kernel's transcript scan cannot see would otherwise be
+  re-fed at every restart, for days (measured 2026-09-12: the same texts re-fed
+  at two restarts in one night, one of them landing six times). It applies
+  only to messages the CLI was holding, never to the queue proper: a message
+  still waiting its turn is delivered however long the kernel was down. `0`
+  switches the line off, and every unlanded message is re-fed whatever its
+  age. The kernel reads it once, when it starts, so set it where the kernel's
+  service sees it (`service.env`, then a restart).
+- `ROMP_KERNEL_HTTP_TIMEOUT_S=<seconds>` is how long `romp send`, `romp
+  interrupt` and `romp end` wait for the kernel's answer; the default is `10`.
+  A kernel that took the request but answered late (mid-restart, or under
+  load) is exit `3`, with a line saying the message may already have been
+  delivered and not to retry blindly; a kernel nobody is listening on is still
+  `kernel not reachable`, exit `1`, with nothing sent; a refusal the kernel
+  wrote is its own words, exit `1`. Widen it on a slow box. There is no off:
+  a send with no bound would hang the script that runs it. Each command reads
+  it from its own environment, so it can be set for one call.
+
 ## Kernel performance counters
 
 `GET /perf` returns one JSON document of counters the kernel keeps at all
