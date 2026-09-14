@@ -8321,15 +8321,33 @@ class SdkSession:
         self.backend._log("cron dedupe (%s): blocked a replayed schedule fire — its %s slot was "
                           "already delivered (a fresh process re-fires passed slots on resume)"
                           % (self.name, when), problem=False)
-        mark = getattr(self.backend, "mark_echo_refused", None)
-        if callable(mark):
-            try:                                   # off the loop thread like the reg write; never decides the block
-                await asyncio.to_thread(mark, self.sid, prompt, "replayed schedule slot")
-            except Exception as e:
-                self.backend._log("cron dedupe (%s): refused-echo mark failed: %s" % (self.name, e))
+        self._mark_refused_aside(prompt, "replayed schedule slot")   # beside the verdict, never under the cap
         return {"decision": "block",
                 "reason": "This scheduled prompt already ran for its %s slot — skipping the "
                           "duplicate." % when}
+
+    def _mark_refused_aside(self, prompt: str, why: str):
+        """Flag the echo wearing a prompt the gate REFUSED (SdkBackend.mark_echo_refused) on a thread of its own,
+        OUTSIDE the hook's cap, and return that thread (None when the backend carries no mark). The verdict is
+        decided by the time this runs and must not wait on it: the mark is a reg write, and awaited under
+        _prompt_submit_hook's wait_for a stalled write ran the cap out AFTER the block was decided, which the hook
+        answers {}: a decided block turned into an allow, and the replayed schedule fired anyway (the pull request
+        review, 2026-09-14). A dedicated thread rather than the loop's executor, because the stall this guards
+        against is that pool wedged on reg reads and the mark must not queue behind it; and not a task on the
+        loop, whose close would cancel the write unstarted. A failure is one log line and never touches the
+        verdict."""
+        mark = getattr(self.backend, "mark_echo_refused", None)
+        if not callable(mark):
+            return None
+
+        def run():
+            try:
+                mark(self.sid, prompt, why)
+            except Exception as e:
+                self.backend._log("cron dedupe (%s): refused-echo mark failed: %s" % (self.name, e))
+        t = threading.Thread(target=run, name="romp-refused-mark-" + self.sid[:8], daemon=True)
+        t.start()
+        return t
 
     # ---- subagent tracking (the transparency tmux never had) ----
 

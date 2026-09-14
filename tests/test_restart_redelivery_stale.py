@@ -11,6 +11,7 @@ mirror across restarts. The queue proper (sends never fed) is not under the line
 import json
 import os
 import tempfile
+import threading
 import time
 import unittest
 from unittest import mock
@@ -212,14 +213,15 @@ class TheRefusedFlag(Fixture):
         self.assertEqual(self.be.mark_echo_refused(SID, ""), 0)
         self.assertEqual(self.be.mark_echo_refused(SID, "nothing wears this"), 0)
 
-    def test_the_gates_block_marks_the_echo(self):
-        # The real gate over a real backend (tests/test_cron_replay_dedupe.py's shape): the first fire records the
-        # slot, a FRESH session's second fire is the restart replay and is blocked — and the block flags the echo
-        # wearing that prompt refused, so the next boot's re-delivery never treats it as a lost send.
+    def _replay(self, logs=None):
+        """The real gate over a real backend (tests/test_cron_replay_dedupe.py's shape): the first fire records the
+        slot, and a FRESH session's second fire of the same prompt is the restart replay. An echo wearing the prompt
+        is stashed live before that fire. Returns (backend, the fresh session, the prompt, the state dir)."""
         import asyncio
         from pathlib import Path
         d = tempfile.mkdtemp()
-        be = sb.SdkBackend(d, "/bin/true", lambda *a, **k: None, log=lambda *a, **k: None)
+        be = sb.SdkBackend(d, "/bin/true", lambda *a, **k: None, log=(logs.append if logs is not None else
+                                                                      lambda *a, **k: None))
         cron, prompt = "* * * * *", "ping me every minute"
         sb.write_reg(Path(d), SID, {
             "sid": SID, "name": "web", "cwd": "/tmp", "alive": True,
@@ -231,13 +233,68 @@ class TheRefusedFlag(Fixture):
         be._stash_live(SID, "echo:refused1", {"type": "user", "uuid": "echo:refused1", "session_id": SID,
                                               "t": FRESH_T, "author": "human", "_echo_text": prompt,
                                               "message": {"role": "user", "content": [{"type": "text", "text": prompt}]}})
-        again = sb.SdkSession(be, sb.read_reg(Path(d), SID))
-        out = asyncio.run(again._prompt_submit_hook({"prompt": prompt}, None, None))
+        return be, sb.SdkSession(be, sb.read_reg(Path(d), SID)), prompt, Path(d)
+
+    @staticmethod
+    def _mark_waits(be, stall_s=0.0):
+        """Wrap the backend's mark so a test can WAIT for it (and stall it): the gate issues the mark beside its
+        verdict, on a thread of its own, so the verdict comes back before the flag is on. Returns the Event the
+        wrapped mark sets when it has run."""
+        real, done = be.mark_echo_refused, threading.Event()
+
+        def wrapped(sid, text, reason=""):
+            try:
+                if stall_s:
+                    time.sleep(stall_s)
+                return real(sid, text, reason)
+            finally:
+                done.set()
+        be.mark_echo_refused = wrapped
+        return done
+
+    def _timed_fire(self, sess, prompt):
+        import asyncio
+
+        async def run():
+            t0 = time.monotonic()
+            out = await sess._prompt_submit_hook({"prompt": prompt}, None, None)
+            return out, time.monotonic() - t0
+        return asyncio.run(run())
+
+    def test_the_gates_block_marks_the_echo(self):
+        # The block flags the echo wearing that prompt refused, so the next boot's re-delivery never treats it as a
+        # lost send; the flag rides the mirror at once.
+        be, again, prompt, d = self._replay()
+        done = self._mark_waits(be)
+        out, _ = self._timed_fire(again, prompt)
         self.assertEqual(out.get("decision"), "block", "the replayed slot is refused")
+        self.assertTrue(done.wait(5), "the mark ran")
         a = be._live[SID]["echo:refused1"]
         self.assertTrue(a.get("dropped") and a.get("refused"), "…and the echo wearing it is flagged refused")
-        mirror = (sb.read_reg(Path(d), SID) or {}).get("echoes") or []
+        mirror = (sb.read_reg(d, SID) or {}).get("echoes") or []
         self.assertTrue(any(e.get("refused") for e in mirror), "the flag is on the mirror already")
+
+    def test_a_stalled_mark_never_turns_the_block_into_an_allow(self):
+        """The mark is a reg write. Awaited INSIDE _prompt_submit_hook's cap (asyncio.wait_for, {} = allowed on a
+        timeout), a stalled write ran the cap out AFTER the verdict was decided: the block came back as an allow and
+        the replayed schedule fired anyway (the pull request review, 2026-09-14). So the verdict is returned first
+        and the mark runs beside it, outside the cap: with the mark stalled far past a 50 ms cap, the block still
+        arrives inside the cap, the cap never trips, and the flag lands once the mark is through."""
+        logs = []
+        be, again, prompt, d = self._replay(logs)
+        done = self._mark_waits(be, stall_s=0.6)
+        before = os.environ.get("ROMP_PROMPT_HOOK_TIMEOUT_S")
+        os.environ["ROMP_PROMPT_HOOK_TIMEOUT_S"] = "0.05"
+        self.addCleanup(lambda: os.environ.pop("ROMP_PROMPT_HOOK_TIMEOUT_S", None) if before is None
+                        else os.environ.__setitem__("ROMP_PROMPT_HOOK_TIMEOUT_S", before))
+        out, took = self._timed_fire(again, prompt)
+        self.assertEqual(out.get("decision"), "block", "the verdict does not wait on the mark")
+        self.assertLess(took, 0.5, "…and arrives inside the cap, not after the stalled write")
+        self.assertFalse(any("ran past its" in str(m) for m in logs), "the cap never tripped: nothing was under it")
+        self.assertTrue(done.wait(5), "the mark still ran, outside the cap")
+        a = be._live[SID]["echo:refused1"]
+        self.assertTrue(a.get("dropped") and a.get("refused"), "…and flagged the echo once it was through")
+        self.assertTrue(any(e.get("refused") for e in ((sb.read_reg(d, SID) or {}).get("echoes") or [])))
 
 
 class TheMirror(Fixture):
