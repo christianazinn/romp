@@ -12662,7 +12662,7 @@ class SdkBackend:
             return
         # RE-DELIVER, don't just flag, up to the AGE LINE (the user 2026-08-23, in the restart audit,
         # who wanted a typed prompt queued at 11:20 and silently discarded by the 11:25 restart to have
-        # survived it; and 2026-09-14, reviewing the line, who accepted thirty minutes as the bound and
+        # survived it; and 2026-09-13, reviewing the line, who accepted thirty minutes as the bound and
         # wants what falls past it offered back through a card the kernel makes). The rule since then:
         # typed input inside the line is re-fed; past it, it is marked never delivered, said once, and
         # comes back through that card, so nothing a restart held goes unsaid. A HUMAN send inside the
