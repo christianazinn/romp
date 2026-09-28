@@ -15348,7 +15348,8 @@ class SdkBackend:
         return True
 
     def model_switches_live(self) -> bool:
-        """False FOR NOW (see SessionBackend.model_switches_live), although set_model rides the SDK control
+        """True on this install (the note at the end); upstream ships False (see SessionBackend.model_switches_live),
+        although set_model rides the SDK control
         channel and the CLI does adopt a mid-turn switch at its next API call: on CLI 2.1.257 a switch
         applied INSIDE a turn corrupts the transcript. The CLI pushes its three /model breadcrumb records
         (caveat, <command-name>/model, <local-command-stdout>Set model to X) into the in-memory conversation
@@ -15363,8 +15364,14 @@ class SdkBackend:
         _do_set_model refreshes the live model name at once, so an old-model response still streaming then
         reads as a capacity fallback (a false 'Model changed automatically' card, a badge flap). Flip this to
         True only once the CLI parents mid-turn breadcrumbs at the turn's tail AND that refresh waits out
-        inflight>0 (review of PR #923, 2026-09-04; verified against the installed binary, not the docs)."""
-        return False
+        inflight>0 (review of PR #923, 2026-09-04; verified against the installed binary, not the docs).
+        TRUE on this install since 2026-09-16, at the user's request (the user 2026-09-16, who wanted picks applied
+        mid-turn again, as they had been before the kernel update that parked them). What forced it: with picks
+        parked on busy sessions, every later `romp send` parked behind the pick in press order and the drain
+        never found the busy sessions idle, so parked sends piled up for about an hour. The breadcrumb caveat
+        above is unverified on the CLIs installed since (2.1.273 and later) and is watched; the revert is this
+        one line and the two pins in tests/test_model_live_midturn.py."""
+        return True
 
     def busy(self, sid: str) -> "bool | None":
         """Authoritative in-flight signal (see SessionBackend.busy): a turn is running (inflight>0) OR one is

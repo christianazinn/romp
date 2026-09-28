@@ -38369,8 +38369,8 @@ def _forwards_sends(be):
 
 
 def _model_switches_live(be):
-    """True if this backend applies a model pick to a RUNNING session mid-turn (no shipped backend yet: the
-    SDK has the channel for it but declares False for now — see SdkBackend.model_switches_live), so
+    """True if this backend applies a model pick to a RUNNING session mid-turn (on this install the SDK
+    declares True; upstream it declares False — see SdkBackend.model_switches_live), so
     _set_model_or_park fires the pick into an open turn instead of parking it until the turn ends.
     getattr-guarded like _forwards_sends: a backend / test fake without the capability reads as False (park
     while a turn runs, fire at its end — the pre-#923 rule)."""
@@ -38902,7 +38902,7 @@ def _route_setter_command(be, sid, text, client=None, floating=False, state=None
         return True
     if model_pick:
         # the model setter has its OWN rule (an open turn fires it live only on a backend that declares
-        # model_switches_live — none shipped does yet, so the SDK still parks; #923), so its verdict is
+        # model_switches_live — on this install the SDK does, so its pick fires live; #923), so its verdict is
         # read, not inferred from _ops_gate, which would say `queued` for a pick that had already applied
         parked = _set_model_or_park(be, sid, value, floating=floating)
         if parked is None:
