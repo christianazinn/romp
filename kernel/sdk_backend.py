@@ -3499,6 +3499,12 @@ def fed_text_opener(text: str) -> str:
 _POSTAL_MID_RE = getattr(_em, "POSTAL_RE", None) or re.compile(r"<!--\s*romp-msg-id:\s*(\S+?)\s*-->")
 
 
+# How many postal message ids a session remembers as TAKEN (SdkBackend.deliver), newest kept. The bus re-posts a chunk
+# whose /deliver it got no answer for within seconds to minutes, so a few hundred ids cover it with room to spare;
+# the list rides the session's registry, so it outlives a kernel restart (2026-09-29).
+POSTAL_TAKEN_KEEP = 256
+
+
 def postal_mids(text) -> list[str]:
     """The postal message ids a fed text carries — its `<!-- romp-msg-id: <id> -->` markers, in order, deduped. A
     non-empty answer says the text is a bus BANNER (SdkBackend.deliver): peer mail, whose only durable copy is the
@@ -5754,6 +5760,11 @@ class SdkSession:
         # the record that lands the text (FIFO per text, at or after the feed) — the landed atom then carries
         # the same id the queued copy and the echo wore, and the chat places by identity, never by text.
         self._pending_meta: list = queue_meta_from_reg(reg)   # the ids the mirror carries, aligned with _pending
+        # The postal message ids this session has TAKEN (SdkBackend.deliver queued a banner carrying them), newest last,
+        # bounded at POSTAL_TAKEN_KEEP and mirrored to reg['postalTaken'], so a repeat of a banner (the bus re-posting a
+        # /deliver it got no answer for) is recognised and not queued twice, across a kernel restart too (2026-09-29).
+        self._postal_taken: list = [m for m in (reg.get("postalTaken") or [])
+                                    if isinstance(m, str) and m][-POSTAL_TAKEN_KEEP:]
         self._fed_meta: list = []
         self._landed_qid: dict = {}
         # A /clear the CLI has TAKEN is tracked by the IDENTITY of its optimistic echo (the taken copy's qid),
@@ -5976,6 +5987,44 @@ class SdkSession:
         landing will never come, and a later same-text landing must not be paired with it."""
         with self._lock:
             self._fed_meta = [f for f in self._fed_meta if f.get("qid") != qid]
+
+    def take_postal(self, mids) -> list:
+        """Record the postal message ids `mids` as taken by this session; returns the ones it had taken already, and
+        records nothing when that is all of them (a repeat). The check and the record are one hold of self._lock, so two
+        posts of one banner racing each other take it once. Mirrored to the registry (reg['postalTaken'])."""
+        mids = [m for m in (mids or []) if isinstance(m, str) and m]
+        if not mids:
+            return []
+        with self._lock:
+            seen = [m for m in mids if m in self._postal_taken]
+            if len(seen) == len(mids):
+                return seen
+            self._postal_taken.extend(m for m in mids if m not in self._postal_taken)
+            del self._postal_taken[:-POSTAL_TAKEN_KEEP]
+        self._persist_postal_taken()
+        return seen
+
+    def forget_postal(self, mids) -> None:
+        """Drop `mids` from the taken ids: the banner carrying them went back to the bus (a teardown stranded it,
+        _return_stranded_mail), so the bus's re-delivery of them is new mail to queue, not a repeat."""
+        drop = {m for m in (mids or []) if isinstance(m, str)}
+        with self._lock:
+            kept = [m for m in self._postal_taken if m not in drop]
+            if len(kept) == len(self._postal_taken):
+                return
+            self._postal_taken = kept
+        self._persist_postal_taken()
+
+    def _persist_postal_taken(self) -> None:
+        """Mirror the taken ids to the registry. Snapshot and write are one step under _persist_lock, as the queue
+        mirror's are (_persist_queue), so the last write is the latest snapshot."""
+        with self._persist_lock:
+            with self._lock:
+                snap = list(self._postal_taken)
+            try:
+                self.backend._update_reg(self.sid, postalTaken=snap)
+            except Exception:
+                self.backend._log("persist postal taken (%s): %s" % (self.name, traceback.format_exc()))
 
     def enqueue(self, text: str, qid: str | None = None, qts: int | None = None, paths: list | None = None):
         """Deliver a user turn (called from the kernel thread). Held in self._pending —
@@ -6534,6 +6583,7 @@ class SdkSession:
                 continue
             put_back = [m for m in mids if m in back and m not in held_by_bus]
             held_here = [m for m in mids if m in held_by_bus]
+            self.forget_postal(put_back + held_here)          # the bus re-delivers them: new mail then, not a repeat
             self.backend._log("stranded mail (%s): a banner fed to the abandoned client never resulted%s%s%s"
                               % (self.name,
                                  ("; handed back to the bus by id for re-delivery (%s)" % ", ".join(put_back)) if put_back else "",
@@ -15319,11 +15369,30 @@ class SdkBackend:
         next turn — the SDK analogue of the tmux pane-inject (the user 2026-06-26). NO optimistic human echo:
         it's a peer's mail, not the user's composer input; the transcript records it and the chat renders it as
         a postal card. True if the session is live/resumable (so the bus consumed the maildir copy), else False
-        (the bus keeps it for the drain backstop)."""
+        (the bus keeps it for the drain backstop).
+
+        SAFE TO REPEAT (2026-09-29): a banner whose message ids (its `romp-msg-id` markers) this session has ALL
+        taken already is answered True and not queued again. The bus re-posts a chunk whose /deliver got no answer
+        within its wait, and a slow kernel had usually queued it: before this every re-post queued another copy, and
+        one message reached a session thirty-odd times. A banner carrying a new id beside taken ones is queued whole
+        (it cannot be split here; a message twice beats one never) and said in the log."""
         s = self._ensure(sid)
         if not s:
             return False
-        s.enqueue(text)
+        mids = postal_mids(text)
+        seen = s.take_postal(mids)
+        if mids and len(seen) == len(mids):
+            self._log("postal deliver (%s): a banner whose message ids were all taken already (%s); answered taken, "
+                      "not queued again" % (s.name, ", ".join(mids)))
+            return True
+        if seen:
+            self._log("postal deliver (%s): a banner carrying %d of %d message ids taken already (%s) is queued whole"
+                      % (s.name, len(seen), len(mids), ", ".join(seen)), problem=True)
+        try:
+            s.enqueue(text)
+        except Exception:
+            s.forget_postal([m for m in mids if m not in seen])   # not queued: its ids are not taken
+            raise
         self._poke()
         return True
 
