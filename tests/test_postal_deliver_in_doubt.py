@@ -18,6 +18,16 @@ The fix has two halves, and these tests pin both:
   banner whose message ids the session has all taken already (a bounded list, persisted in the registry so it
   outlives a kernel restart), and forgets the ids it hands back to the bus when a teardown strands a banner.
 
+The review of the first cut added four more, pinned here too:
+- a chunk nothing will re-post is RELEASED back to new/ under its own ids (an unexec row, a log line): when the
+  kernel's answered listing no longer carries the recipient (or a remote peer's heartbeat has lapsed), when it has
+  gone unlisted past DOUBT_GONE_GRACE with no answer either way, and when the live push is switched off. Held in cur/
+  it read as delivered for good, out of reach of the orphan bounce and the stuck-mail warning, and the retry pass
+  asked for a session list on every pass for ever;
+- the kernel queues a banner and records its ids as taken in one lock hold and one registry write, so a kernel death
+  or a racing re-post can never meet the ids taken with the banner in no queue;
+- a stranded banner's ids are forgotten BEFORE the bus is asked to take the mail back, since the bus re-posts at once.
+
 SYNTHETIC fixtures only: invented text, placeholder uuids, TESTHOST; no real session names or message ids.
 """
 import json
@@ -162,14 +172,15 @@ class SlowKernelDoesNotRedeliver(_SdkWorld, unittest.TestCase):
     def setUp(self):
         self._make_backend(_fresh_sid())
         self._seam = os.environ.pop("ROMP_SESSIONS_FILE", None)   # not a seam test: let _push actually post
-        self.saved = (pm.KERNEL_BASE, pm._push_disabled, pm._log, pm.local_agents, urllib.request.urlopen)
+        self.saved = (pm.KERNEL_BASE, pm._push_disabled, pm._log, pm._kernel_sessions_checked, urllib.request.urlopen)
         self.srv = ThreadingHTTPServer(("127.0.0.1", 0), _SlowKernel)
         threading.Thread(target=self.srv.serve_forever, daemon=True).start()
         pm.KERNEL_BASE = "http://127.0.0.1:%d" % self.srv.server_address[1]
         pm._push_disabled = lambda: False
         self.logged = []
         pm._log = self.logged.append
-        pm.local_agents = lambda threads=False: [{"id": self.to, "name": "api", "state": "idle"}]
+        # the listing, stubbed at its one source (local_agents and local_agents_checked both read it)
+        pm._kernel_sessions_checked = lambda threads=False: ([{"id": self.to, "name": "api", "state": "idle"}], True)
         real = self.saved[4]
         # the bus's own wait, shortened: whatever timeout the caller passes, the socket gives up after CLIENT_WAIT
         urllib.request.urlopen = lambda req, timeout=None, **k: real(req, timeout=CLIENT_WAIT, **k)
@@ -182,7 +193,7 @@ class SlowKernelDoesNotRedeliver(_SdkWorld, unittest.TestCase):
         self.srv.server_close()
         if self._seam is not None:
             os.environ["ROMP_SESSIONS_FILE"] = self._seam
-        pm.KERNEL_BASE, pm._push_disabled, pm._log, pm.local_agents, urllib.request.urlopen = self.saved
+        pm.KERNEL_BASE, pm._push_disabled, pm._log, pm._kernel_sessions_checked, urllib.request.urlopen = self.saved
         pm.STREAKS.pop(self.to, None)
         self._drop_backend()
 
@@ -325,6 +336,172 @@ class InDoubtResolution(unittest.TestCase):
         self.assertEqual((pm.MAILDOUBT / self.SID).read_text().split(), [self.mid])
 
 
+class _PrivateMaildir:
+    """A maildir of its own per test (the module's is shared, and the orphan sweep and the retry pass walk every box
+    in it): the mail, pending, held and in-doubt roots moved under a fresh temp dir; the ledger stays shared (its
+    rows are keyed by message ids no other test mints)."""
+    _ROOTS = ("MAILROOT", "MAILPENDING", "MAILHELD", "MAILDOUBT", "WARNED")
+
+    def _private_maildir(self):
+        self._roots = {k: getattr(pm, k) for k in self._ROOTS}
+        base = tempfile.mkdtemp()
+        for k in self._ROOTS:
+            setattr(pm, k, pm.Path(base) / k.lower())
+
+    def _shared_maildir(self):
+        for k, v in self._roots.items():
+            setattr(pm, k, v)
+
+
+class InDoubtRecipientGone(_PrivateMaildir, unittest.TestCase):
+    """A chunk held in doubt that nothing will re-post is RELEASED back to new/ under its own ids, loudly (review of
+    2026-09-29). Before, a recipient that never came back live kept its claim in cur/ for good, read in the sender's
+    receipts; the orphan bounce and the stuck-mail warning read new/ only, so the sender was never told; and every
+    retry pass asked the kernel for a session list for ever. The event keyed on is the kernel's ANSWERED listing
+    without the recipient (and no durable record holding it alive); where no event can come (the listing does not
+    answer, or a blink the durable record vouches for persists) the bound is DOUBT_GONE_GRACE."""
+
+    def setUp(self):
+        self._private_maildir()
+        self.SID = _fresh_sid("44444444-5555-6666-7777-")
+        self.sender = _fresh_sid("11111111-2222-3333-4444-")
+        self._seam = os.environ.pop("ROMP_SESSIONS_FILE", None)
+        self.saved = (pm._kernel_post, pm._push_disabled, pm._log, pm._kernel_sessions_checked, pm.ORPHAN_GRACE)
+        pm._push_disabled = lambda: False
+        self.logged, self.posted, self.fetches = [], [], []
+        pm._log = self.logged.append
+        # the sender is live; the recipient is not listed
+        self.rows, self.answered = [{"id": self.sender, "name": "web", "state": "idle"}], True
+        pm._kernel_sessions_checked = lambda threads=False: (self.fetches.append(threads),
+                                                             (list(self.rows), self.answered))[1]
+        self.resp = pm.NO_ANSWER
+
+        def post(path, body, timeout=2, no_answer=None):
+            self.posted.append(body)
+            return no_answer if self.resp is pm.NO_ANSWER else self.resp
+        pm._kernel_post = post
+        pm.STREAKS.pop(self.SID, None)
+        self.mid = pm.deliver(self.SID, "web", self.sender, "an invented note about the build", kind="coordinate")
+        pm._push(self.SID, {"id": self.SID, "state": "idle"})
+        self.assertEqual(pm._doubt_read(self.SID), [[self.mid]], "the unanswered chunk is held in doubt")
+        self.posted.clear()
+        self.resp = {"ok": True, "injected": True}            # from here on every post is answered taken
+        self.reg = pm.STATE.parent / "sdk" / (self.SID + ".json")
+
+    def tearDown(self):
+        if self._seam is not None:
+            os.environ["ROMP_SESSIONS_FILE"] = self._seam
+        pm._kernel_post, pm._push_disabled, pm._log, pm._kernel_sessions_checked, pm.ORPHAN_GRACE = self.saved
+        for d in (getattr(pm, "_DOUBT_GONE_SINCE", {}), pm.HEARTBEATS, pm.STREAKS):
+            d.pop(self.SID, None)
+        pm.STREAKS.pop(self.sender, None)
+        if self.reg.exists():
+            self.reg.unlink()
+        self._shared_maildir()
+
+    def _in_new(self):
+        return [m["id"] for m in pm.read_box(self.SID, consume=False)]
+
+    def _posted_to(self, sid):
+        return [b for b in self.posted if b.get("id") == sid]
+
+    def _gone_since(self):
+        return getattr(pm, "_DOUBT_GONE_SINCE", {})
+
+    def _run_out_the_bound(self):
+        """Move the moment the recipient was first found unlisted back past DOUBT_GONE_GRACE."""
+        if self.SID in self._gone_since():
+            self._gone_since()[self.SID] -= pm.DOUBT_GONE_GRACE + 1
+
+    def test_a_recipient_the_kernel_no_longer_lists_is_released_the_sender_told_and_the_asking_stops(self):
+        pm._retry_pending()
+        self.assertEqual(self._in_new(), [self.mid],
+                         "back in new/ under its own id: before the fix it stayed claimed in cur/ for good")
+        self.assertEqual(pm._doubt_read(self.SID), [], "the record is gone")
+        self.assertEqual(_timeline(self.mid), ["sent", "exec", "unexec"],
+                         "the exec row is retracted, so the sender's receipt reads pending, not read")
+        self.assertTrue(any("released" in ln and self.SID in ln and "no longer carries" in ln for ln in self.logged),
+                        "said in the log, with the reason: %r" % (self.logged,))
+        self.assertEqual(self._posted_to(self.SID), [], "nothing posted to a recipient that is not live")
+        # the orphan sweep reads new/, so the sender hears; its note is pushed on a thread, joined here
+        pm.ORPHAN_GRACE = 0
+        before = set(threading.enumerate())
+        pm._sweep_orphans()
+        for t in set(threading.enumerate()) - before:
+            t.join(10)
+        self.assertEqual(_timeline(self.mid)[-1], "bounced", "the orphan sweep reached the mail")
+        self.assertTrue(any("UNDELIVERED" in b.get("text", "") for b in self._posted_to(self.sender)),
+                        "the sender was woken with the bounce: %r" % (self.posted,))
+        self.fetches.clear()
+        for _ in range(49):
+            pm._retry_pending()
+        self.assertEqual(self.fetches, [],
+                         "49 more passes ask the kernel for nothing: before the fix every pass fetched the session "
+                         "list for the held chunk, for ever")
+
+    def test_a_listing_blink_the_durable_record_vouches_for_waits_then_the_bound_releases_it(self):
+        self.reg.parent.mkdir(parents=True, exist_ok=True)
+        self.reg.write_text(json.dumps({"sid": self.SID, "alive": True}))
+        pm._retry_pending()
+        self.assertEqual(pm._doubt_read(self.SID), [[self.mid]],
+                         "an answered listing without a session whose record reads alive is a blink: it waits")
+        self.assertEqual(self._in_new(), [])
+        self._run_out_the_bound()
+        pm._retry_pending()
+        self.assertEqual(self._in_new(), [self.mid])
+        self.assertEqual(pm._doubt_read(self.SID), [])
+        self.assertTrue(any("released" in ln and "durable record reads alive" in ln for ln in self.logged), self.logged)
+
+    def test_an_unanswered_listing_waits_then_the_bound_releases_it(self):
+        self.rows, self.answered = [], False                   # the kernel does not answer the listing
+        pm._retry_pending()
+        self.assertEqual(pm._doubt_read(self.SID), [[self.mid]], "no answer is no word on the recipient: it waits")
+        self._run_out_the_bound()
+        pm._retry_pending()
+        self.assertEqual(self._in_new(), [self.mid])
+        self.assertTrue(any("released" in ln and "did not answer" in ln for ln in self.logged), self.logged)
+
+    def test_seen_live_again_the_clock_starts_over(self):
+        self.answered = False
+        pm._retry_pending()
+        self.assertIn(self.SID, self._gone_since(), "unlisted, unanswered: the wait starts")
+        self.rows = self.rows + [{"id": self.SID, "name": "api", "state": "working"}]
+        self.answered = True
+        self.resp = pm.NO_ANSWER                               # listed again, and still no answer to the re-post
+        pm._retry_pending()
+        self.assertEqual(len(self._posted_to(self.SID)), 1, "a listed recipient's chunk is re-posted")
+        self.assertNotIn(self.SID, self._gone_since(), "listed again: the wait for a gone recipient starts over")
+        self.assertEqual(pm._doubt_read(self.SID), [[self.mid]])
+
+    def test_a_remote_peer_whose_heartbeat_stands_is_re_posted_not_released(self):
+        pm.HEARTBEATS[self.SID] = ("api", time.time())         # a remote peer: its wake rides the kernel's wake-router
+        pm._retry_pending()
+        self.assertEqual([b["id"] for b in self.posted], [self.SID],
+                         "re-posted like a local session's: before, only the local listing counted, and a remote "
+                         "peer's chunk was never re-posted")
+        self.assertEqual(pm._doubt_read(self.SID), [], "answered taken: retired")
+        self.assertEqual(self._in_new(), [])
+
+    def test_a_remote_peer_whose_heartbeat_lapsed_is_released(self):
+        pm.HEARTBEATS[self.SID] = ("api", time.time() - pm.HEARTBEAT_TTL - 5)
+        pm._retry_pending()
+        self.assertEqual(self._in_new(), [self.mid])
+        self.assertTrue(any("released" in ln and "heartbeat has lapsed" in ln for ln in self.logged), self.logged)
+
+    def test_with_the_push_switched_off_the_chunk_goes_back_for_the_drain(self):
+        # romp-postal-nopush: _push returns before it looks at a chunk in doubt, so nothing would ever re-post it, and
+        # the Stop-hook drain reads new/ only; before the fix the claim sat in cur/ out of every road's reach
+        self.rows = self.rows + [{"id": self.SID, "name": "api", "state": "idle"}]   # live, and ready
+        pm._push_disabled = lambda: True
+        pm._retry_pending()
+        self.assertEqual(self._in_new(), [self.mid], "back in new/, where the drain reads")
+        self.assertEqual(pm._doubt_read(self.SID), [])
+        self.assertEqual(_timeline(self.mid), ["sent", "exec", "unexec"])
+        self.assertEqual(self.posted, [], "no push while it is switched off")
+        self.assertTrue(any("released" in ln and "switched off" in ln for ln in self.logged), self.logged)
+        self.assertEqual(pm._drain(self.SID)["messages"][0]["id"], self.mid, "the drain gets it")
+
+
 class KernelPostTellsUnsentFromUnanswered(unittest.TestCase):
     """_kernel_post: a request that never left (urllib wraps a connect or send failure in URLError) is None, as
     before; a request sent in full and then not answered is the caller's `no_answer`, and None for every caller
@@ -416,11 +593,65 @@ class KernelDeliverIsSafeToRepeat(_SdkWorld, unittest.TestCase):
 
     def test_the_taken_list_is_bounded(self):
         for i in range(sb.POSTAL_TAKEN_KEEP + 20):
-            self.sess.take_postal(["1700%06d.000000.TESTHOST" % i])
+            self.be.deliver(TO, _banner("1700%06d.000000.TESTHOST" % i))
         reg = sb.read_reg(self.be.state_dir, TO) or {}
         self.assertEqual(len(reg.get("postalTaken") or []), sb.POSTAL_TAKEN_KEEP)
         self.assertEqual(reg["postalTaken"][-1], "1700%06d.000000.TESTHOST" % (sb.POSTAL_TAKEN_KEEP + 19),
                          "the newest ids are kept")
+
+    def _strand(self, b):
+        """`b` fed to a client that a teardown then abandoned: the loop top's reconcile finds it stranded."""
+        self.sess._pending.clear()
+        self.sess.inflight = 1
+        self.sess._inflight_texts.append(b)
+        self.sess._reconcile_stranded()
+
+    def test_a_re_post_that_lands_while_the_bus_takes_the_mail_back_is_queued(self):
+        # the bus's put-back wakes the session and re-posts at once: here the re-post lands INSIDE the bus's answer,
+        # before the kernel's handback returns. Before the fix the ids were forgotten only after the bus answered, so
+        # that re-post read them as taken, was answered taken and never queued: the mail was lost
+        b = _banner(MID1, MID2)
+        self.be.deliver(TO, b)
+        answers = []
+
+        def restore_and_repost(sid, mids):
+            answers.append(self.be.deliver(TO, b))
+            return set(mids)
+        self.be.postal_restore = restore_and_repost
+        self._strand(b)
+        self.assertEqual(answers, [True])
+        self.assertEqual(self.sess.pending(), [b], "the re-post is queued: new mail, not a repeat")
+        self.assertTrue(self.be.deliver(TO, b))
+        self.assertEqual(self.copies(MID1), 1, "and its ids are taken again, so a further repeat is not")
+
+    def test_a_banner_the_bus_does_not_take_back_is_re_headed_with_its_ids_still_taken(self):
+        # the ids are forgotten before the bus is asked; a bus that gives no answer leaves the banner here, re-headed,
+        # and its ids are taken again in the same step, so the bus's own re-post of them is still a repeat
+        b = _banner(MID1)
+        self.be.deliver(TO, b)
+        self.be.postal_restore = lambda sid, mids: None
+        self._strand(b)
+        self.assertEqual(self.sess.pending(), [b], "re-headed")
+        self.assertTrue(self.be.deliver(TO, b))
+        self.assertEqual(self.sess.pending(), [b], "one copy")
+        self.assertIn(MID1, (sb.read_reg(self.be.state_dir, TO) or {}).get("postalTaken") or [])
+
+    def test_a_kernel_death_between_the_writes_never_leaves_an_id_taken_without_its_banner(self):
+        # the first cut wrote the taken ids and the queue in two registry writes: a kernel that died between them came
+        # back with the ids taken and the banner gone, answered the bus's re-post "taken", and the bus retired the mail
+        class _KernelDied(BaseException):
+            pass
+        b = _banner(MID1)
+
+        def die(*a, **k):
+            raise _KernelDied()
+        self.sess._persist_queue = die                        # the queue's registry write never happens
+        with self.assertRaises(_KernelDied):
+            self.be.deliver(TO, b)
+        self.sess = self._new_session()                       # the restarted kernel seeds from the registry
+        self.assertTrue(self.be.deliver(TO, b), "the bus re-posts the chunk it got no answer for")
+        self.assertEqual(self.copies(MID1), 1, "queued: before the fix the ids were on disk and the banner was not, "
+                                               "so the re-post was answered taken and queued nowhere")
 
     def test_ids_handed_back_to_the_bus_are_forgotten_so_their_re_delivery_is_queued(self):
         b = _banner(MID1, MID2)

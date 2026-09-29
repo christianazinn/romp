@@ -115,6 +115,52 @@ class UsageLogPrune(unittest.TestCase):
             finally:
                 jd.USAGE, jd._USAGE_PRUNE_BYTES = saved_usage, saved_cap
 
+    def test_a_prune_that_keeps_more_than_the_floor_does_not_rewrite_on_every_call(self):
+        # 2026-09-29: the retained month weighed ~134MB against the fixed 128MiB trigger, so every judge call (11-16 a
+        # minute) found the file over the line, rewrote all of it inside the kernel (~2.7s of CPU) and landed back
+        # over the line. The trigger now follows what the last prune kept: half again past it, and never under the
+        # floor. The floor is forced low here, so every row is inside the 31 days and the whole file is "kept".
+        # Rewrites are counted at os.replace onto the log (an inode check is fooled by the filesystem reusing them).
+        import time as _time
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as td:
+            saved_usage, saved_cap = jd.USAGE, jd._USAGE_PRUNE_BYTES
+            real_replace, rewrites = os.replace, []
+
+            def replace(src, dst, *a, **k):
+                if Path(dst) == jd.USAGE:
+                    rewrites.append(1)
+                return real_replace(src, dst, *a, **k)
+            try:
+                jd.USAGE = Path(td) / "judge-usage.jsonl"
+                now = int(_time.time())
+                jd.USAGE.write_text("".join(json.dumps({"t": now - 60 * i, "judge": "captioner", "pad": "x" * 300})
+                                            + "\n" for i in range(200)))   # ~70KB: the 22 calls below add ~10%
+                jd._USAGE_PRUNE_BYTES = 10                     # force the trigger
+                call = lambda: jd._log_judge_usage("captioner", "fast", "test-model", None, {"usage": {}})
+                with mock.patch.object(jd.os, "replace", replace):
+                    call()                                     # over the floor, nothing written down yet: one prune
+                    self.assertEqual(len(rewrites), 1)
+                    kept = jd.USAGE.stat().st_size
+                    for _ in range(20):
+                        call()
+                    self.assertEqual(len(rewrites), 1,
+                                     "no rewrite on the calls after a prune: before the fix every call rewrote the "
+                                     "file, since what the prune kept still stood over the fixed trigger")
+                    self.assertLessEqual(int((Path(td) / "judge-usage.jsonl.kept").read_text()), kept,
+                                         "the prune writes down what it kept, beside the log")
+                    getattr(jd, "_USAGE_KEPT", {}).pop(str(jd.USAGE), None)   # a fresh process (a kernel restart)
+                    call()
+                    self.assertEqual(len(rewrites), 1, "the kept size outlives the process that pruned")
+                    with open(jd.USAGE, "a") as f:             # grows half again past what the prune kept
+                        f.write("".join(json.dumps({"t": now, "judge": "planner", "pad": "x" * 64}) + "\n"
+                                        for _ in range(kept // 80)))
+                    call()
+                    self.assertEqual(len(rewrites), 2, "past half again, it prunes once more")
+            finally:
+                getattr(jd, "_USAGE_KEPT", {}).pop(str(jd.USAGE), None)
+                jd.USAGE, jd._USAGE_PRUNE_BYTES = saved_usage, saved_cap
+
     def test_healthy_log_untouched(self):
         with tempfile.TemporaryDirectory() as td:
             saved_usage = jd.USAGE

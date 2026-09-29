@@ -265,6 +265,9 @@ WINDOW = 30        # loop-guard rolling window (seconds)
 MAX = 6            # loop-guard: max auto-deliveries per window before pausing
 RETRY_INTERVAL = int(os.environ.get("ROMP_POSTAL_RETRY", "5"))  # re-attempt deferred deliveries every N s
 DELIVER_TIMEOUT = 12  # seconds _push waits for the kernel's answer to a /deliver before the chunk is in doubt
+DOUBT_GONE_GRACE = int(os.environ.get("ROMP_POSTAL_DOUBT_GONE_GRACE", "300"))  # an in-doubt chunk's recipient unlisted
+#   this long with no word on whether it lives (the listing unanswered, or a blink its durable record vouches for) has
+#   its chunk put back in new/; an answered listing that no longer carries it releases the chunk at once (2026-09-29)
 ORPHAN_GRACE = int(os.environ.get("ROMP_POSTAL_ORPHAN_GRACE", "900"))  # bounce unread mail to a dead recipient after N s
 STUCK_GRACE = int(os.environ.get("ROMP_POSTAL_STUCK_GRACE", "600"))  # warn the SENDER when a LIVE-but-idle recipient still hasn't read after N s
 
@@ -2555,11 +2558,17 @@ def _put_back(sid, msgs):
 # record, an answered not-taken or a refusal puts the mail back for the drain (the old roll-back). A connect that is
 # refused, or no answer again, settles nothing: the record stands. A message restore() moves back to new/ meanwhile
 # (the kernel handing back a banner a teardown stranded) leaves the record. The record lives on disk, so a bus that
-# re-execs on a code change picks it up; a recipient that is never live again keeps its claim, which the kernel's
-# persisted queue most likely carries.
+# re-execs on a code change picks it up.
+# A chunk nothing can re-post is RELEASED: put back in new/ under its own ids with an unexec row, the record dropped,
+# and a log line (_doubt_release). That happens when the recipient is no longer a live session (the retry pass's
+# answered listing lacks it and no durable record holds it alive; or a remote peer's heartbeat has lapsed), when it
+# has gone unlisted for DOUBT_GONE_GRACE with no answer either way, and when the live push is switched off. Back in
+# new/, the mail is what the orphan bounce and the stuck-mail warning read, so the sender is told; held in cur/, it
+# read as delivered for good and the retry pass asked the kernel for a session list on every pass for ever.
 _DOUBT_LOCK = threading.Lock()   # every read-modify-write of a record, and the set below
 _DOUBT_BUSY = set()              # sids whose in-doubt chunks one thread is re-posting now; the others skip, never post twice
 _DOUBT_FAULT_SAID = set()        # sids whose record could not be read, said once per spell
+_DOUBT_GONE_SINCE = {}           # sid -> when the retry pass first found an in-doubt recipient unlisted (this process)
 
 
 def _doubt_read(sid):
@@ -2697,6 +2706,69 @@ def _resolve_in_doubt(sid, agent):
     finally:
         with _DOUBT_LOCK:
             _DOUBT_BUSY.discard(sid)
+
+
+def _doubt_release(sid, why):
+    """Put every chunk held in doubt for `sid` back in new/, loudly: nothing will re-post it (`why` says what stopped
+    that), and a claim left in cur/ reads as delivered for good while the orphan bounce and the stuck-mail warning,
+    which read new/ only, never tell the sender. Each message goes back under its own id (restore: an unexec row, so
+    the sender's receipt reads pending again, and the pending marker raised); one whose cur/ cannot be read is held for
+    the retry loop (mail-held/, _hold_claim); one gone from cur/ (recalled, swept) has nothing left to settle. Every
+    released id leaves the record. The kernel may have queued some of it, so a later drain can feed a second copy (a
+    push is recognised by message id): a message twice beats one never. Another thread re-posting for `sid` now ->
+    None and nothing moves (the next pass tries again); else how many went back to new/."""
+    with _DOUBT_LOCK:
+        if sid in _DOUBT_BUSY:
+            return None
+        _DOUBT_BUSY.add(sid)
+    try:
+        _DOUBT_GONE_SINCE.pop(sid, None)
+        mids = [m for c in _doubt_read(sid) for m in c]
+        if not mids:
+            return 0
+        restored, held, gone = [], [], []
+        for mid in mids:
+            r = restore(sid, mid)                       # a RESTORED id leaves the record inside restore (_doubt_forget)
+            if r == RESTORED:
+                restored.append(mid)
+            elif r == RESTORE_UNKNOWN:
+                _hold_claim(sid, mid)                   # mail-held/ answers for it now; the exec row is retracted there
+                held.append(mid)
+            else:
+                gone.append(mid)
+            _doubt_forget(sid, mid)                     # settled here whatever restore answered
+        _log("push to %s: %d msg(s) held in doubt released, since %s: %d put back in new/ under their own ids (the "
+             "drain, the orphan bounce and the stuck-mail warning read them there)%s%s"
+             % (sid, len(mids), why, len(restored),
+                ("; %d held for the retry loop (cur/ unreadable): %s" % (len(held), ", ".join(held))) if held else "",
+                ("; %d no longer in cur/: %s" % (len(gone), ", ".join(gone))) if gone else ""))
+        return len(restored)
+    finally:
+        with _DOUBT_LOCK:
+            _DOUBT_BUSY.discard(sid)
+
+
+def _doubt_gone_why(sid, answered):
+    """The retry pass found `sid`, which holds a chunk in doubt, in no live listing (neither the kernel's local sessions
+    nor a remote peer's heartbeat). Returns why its chunk is released now, or "" to wait a pass.
+
+    The EVENT keyed on is the kernel's ANSWERED session listing without the recipient, the same reading the orphan
+    sweep acts on: the kernel lists every session it owns that is running or resumable, so one absent from its answer
+    is not a live session. Its durable registry record corroborates an absence first (_durable_session, the refusal
+    path's check against a restart-settle blink): a record that still reads alive waits. No event arrives while the
+    listing goes unanswered (a kernel that is down, or too slow to list) or while a blink persists, so there the bound
+    is time: DOUBT_GONE_GRACE after this process first found the recipient unlisted."""
+    now = time.time()
+    since = _DOUBT_GONE_SINCE.setdefault(sid, now)
+    if sid in HEARTBEATS:                    # a remote peer (its wake rides the kernel's wake-router): its heartbeat is
+        return "the remote peer's heartbeat has lapsed (not live)"   # its liveness, and it is past HEARTBEAT_TTL
+    if answered and not _durable_session(sid, True):
+        return "the kernel's session list no longer carries the recipient (not a live session)"
+    if now - since >= DOUBT_GONE_GRACE:
+        return ("the recipient has gone unlisted for %d s (%s)"
+                % (int(now - since), "the kernel's session list did not answer" if not answered
+                   else "its durable record reads alive, but the kernel does not list it"))
+    return ""
 
 
 def _push(sid, agent):
@@ -3493,24 +3565,38 @@ def _retry_pending():
     (its mail waits for revival); a stale marker (new/ already empty) is reconciled away. The claims
     restore() could not answer for (mail-held/) are put back first, so their mail is pending mail this
     same pass (2026-09-14). A recipient with a chunk in doubt (mail-in-doubt/: posted, never answered) is visited
-    whether or not new mail waits, so its _push re-posts that chunk under the same ids (2026-09-29)."""
+    whether or not new mail waits, so its _push re-posts that chunk under the same ids (2026-09-29); a local session
+    or a remote peer whose heartbeat stands both count as live for it. A chunk nothing will re-post is released back
+    to new/ (_doubt_release): every one when the live push is switched off (romp-postal-nopush or romp-postal-off:
+    the drain is the only road left, and it reads new/), and one whose recipient is gone (_doubt_gone_why)."""
     _retry_held_claims()
     markers = [m.name for m in MAILPENDING.iterdir() if m.is_file()] if MAILPENDING.is_dir() else []
     doubt = _doubt_sids()                      # recipients with a claim in doubt: re-posted whether or not new mail waits
+    if doubt and _push_disabled():
+        for sid in doubt:                      # no push will re-post them: back to new/, where the drain reads
+            _doubt_release(sid, "the live push is switched off, so nothing would re-post it")
+        doubt = []
     if not markers and not doubt:
         return                                 # nothing pending: no GET /sessions this pass (2026-09-06)
     live = None                                # fetched once, and only for a marker that still holds mail
+    if doubt:
+        rows, answered = local_agents_checked(threads=True)
+        live = {a["id"]: a for a in rows}
+        reach = {a["id"]: a for a in _with_remote_presence(list(rows))}   # + remote peers whose heartbeat stands
     for sid in doubt:
-        if live is None:
-            live = {a["id"]: a for a in local_agents(threads=True)}
-        if sid in live:
+        if sid in reach:
+            _DOUBT_GONE_SINCE.pop(sid, None)
             try:
-                _push(sid, live[sid])          # re-posts the chunk in doubt; a dead recipient's claim waits for it
+                _push(sid, reach[sid])         # re-posts the chunk in doubt (claims nothing new until it is answered)
             except Exception as e:
                 _log("retry push to %s failed: %s" % (sid, e))
+            continue
+        why = _doubt_gone_why(sid, answered)
+        if why:
+            _doubt_release(sid, why)           # back in new/: the orphan bounce tells the sender; no more asking for it
     for sid in markers:
         if sid in doubt:
-            continue                           # its _push above ran (or it is not live, and neither would this be)
+            continue                           # visited above: re-posted, or released and not live (this pass leaves it)
         newd = MAILROOT / sid / "new"
         empty = _dir_empty(newd)
         if empty is None:
