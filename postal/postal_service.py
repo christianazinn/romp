@@ -1231,6 +1231,15 @@ def format_receipts(recs):
 # ───────────────────────── the bus (server) ─────────────────────────
 
 HEARTBEATS = {}        # id -> (name, last_seen_epoch)   (remote presence)
+# The ids whose latest heartbeat was a REMOTE peer's: the kernel's listing did not carry it and this host's kernel keeps
+# no registry record for it (_has_local_record). Presence in HEARTBEATS says nothing about that: a LOCAL session's beat
+# is filed there too whenever the listing does not answer (a kernel slower than 6 s to list, mid-restart), and the
+# in-doubt release read every id ever filed there as a remote peer, so under a slow kernel a local session's held chunk
+# was released at once, skipping DOUBT_GONE_GRACE, the log naming a lapsed heartbeat (review of 2026-09-29). A lapsed
+# beat leaves both (_prune_heartbeats); the mark outlives the beat only while the peer holds a chunk in doubt, so its
+# release still names the true reason.
+_REMOTE_BEATS = set()
+_BEATS_LOCK = threading.Lock()   # every write to HEARTBEATS and _REMOTE_BEATS (the heartbeat route, the retry pass's prune)
 STREAKS = {}           # id -> (count, last_epoch)        (loop guard)
 _lock = threading.Lock()
 
@@ -1500,16 +1509,64 @@ def _record_heartbeat(sid, name):
     back so a local session's MCP can stop heartbeating (2026-09-06: every local beat cost the kernel
     three GET /sessions for a no-op). An UNANSWERED listing (kernel mid-restart) is False and records
     the beat exactly as before — the answer is derived from the listing only, never from the
-    client's claim, so a remote session never hears "local" and never stops."""
+    client's claim, so a remote session never hears "local" and never stops.
+
+    A recorded beat is also marked a REMOTE peer's (_REMOTE_BEATS) only when this host's kernel keeps no registry
+    record for the sid (_has_local_record): a local session's beat under an unanswered listing is presence, as it always
+    was, and never makes it a remote peer to the in-doubt release (2026-09-29). A beat the listing confirms local drops
+    any presence an earlier unanswered beat left for it."""
     local = False
     if sid and _safe_id(sid):
         rows, answered = local_agents_checked(threads=True)
         if answered and any(a["id"] == sid for a in rows):
             local = True
+            with _BEATS_LOCK:
+                HEARTBEATS.pop(sid, None)
+                _REMOTE_BEATS.discard(sid)
         else:
-            HEARTBEATS[sid] = (name or "?", time.time())
+            remote = not _has_local_record(sid)
+            with _BEATS_LOCK:
+                HEARTBEATS[sid] = (name or "?", time.time())
+                if remote:
+                    _REMOTE_BEATS.add(sid)
+                else:
+                    _REMOTE_BEATS.discard(sid)
     _write_remote_sids()                           # presence changed → refresh the deadness mirror
     return local
+
+
+def _has_local_record(sid):
+    """Does this host's kernel keep a durable record for `sid`: its SDK registry file (a comment thread's included), or
+    a row in its Codex registry? The kernel writes a session's record before the session can run, so a sid with one is
+    a LOCAL session whatever a listing said, and a heartbeat from it is never a remote peer's (_record_heartbeat). A
+    record or registry that exists but cannot be read answers True: the local reading waits DOUBT_GONE_GRACE where a
+    remote one would release at once, so it is the side a fault falls to."""
+    if not _safe_id(sid):
+        return False
+    if _path_state(STATE.parent / "sdk" / (sid + ".json")) != "missing":
+        return True
+    try:
+        rows = json.loads(CODEX_REGISTRY.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return False
+    except (OSError, ValueError):
+        return True
+    return not isinstance(rows, dict) or sid in rows
+
+
+def _prune_heartbeats(keep=()):
+    """Drop every beat past HEARTBEAT_TTL: nothing reads a lapsed one (presence and the remote-sids mirror filter by the
+    TTL), and before this nothing ever removed one (review of 2026-09-29). A remote-peer mark goes with its beat,
+    except for an id in `keep` (the recipients still holding a chunk in doubt), whose release must still read it as a
+    remote peer whose heartbeat lapsed; the retry pass calls this, and a mark left that way goes on the first pass after
+    the chunk is settled."""
+    now = time.time()
+    with _BEATS_LOCK:
+        for sid, (_nm, ts) in list(HEARTBEATS.items()):
+            if now - ts >= HEARTBEAT_TTL:
+                del HEARTBEATS[sid]
+        for sid in [s for s in _REMOTE_BEATS if s not in HEARTBEATS and s not in keep]:
+            _REMOTE_BEATS.discard(sid)
 
 def present_count_checked():
     """(present count, answered) for the autostop gate: local rows plus heartbeat presence, and whether
@@ -2592,7 +2649,10 @@ def _doubt_read(sid):
 
 def _doubt_write_locked(sid, chunks):
     """Replace `sid`'s record with `chunks` (atomic rename; an empty list removes it). Under _DOUBT_LOCK. True iff it
-    landed; a fault is logged."""
+    landed; a fault is logged. A record removed is a hold SETTLED, by whatever path (the retry pass's answer, a send's
+    or a wake's own _push, restore, a release), so the gone-clock goes with it: before, only a release and the retry
+    pass seeing the recipient listed cleared it, and a hold settled by any other push left its start time for the next
+    hold, which was then released on its first unlisted pass (review of 2026-09-29)."""
     p = MAILDOUBT / sid
     try:
         if not chunks:
@@ -2600,6 +2660,7 @@ def _doubt_write_locked(sid, chunks):
                 p.unlink()
             except FileNotFoundError:
                 pass
+            _DOUBT_GONE_SINCE.pop(sid, None)
             return True
         MAILDOUBT.mkdir(parents=True, exist_ok=True)
         tmp = MAILDOUBT / (".%s.tmp" % sid)          # a leading dot: never read back as a sid (_safe_id refuses it)
@@ -2617,7 +2678,10 @@ def _doubt_add(sid, mids):
     if not (_safe_id(sid) and mids):
         return False
     with _DOUBT_LOCK:
-        return _doubt_write_locked(sid, _doubt_read(sid) + [list(mids)])
+        held = _doubt_read(sid)
+        if not held:
+            _DOUBT_GONE_SINCE.pop(sid, None)         # a hold with none before it starts its own clock
+        return _doubt_write_locked(sid, held + [list(mids)])
 
 
 def _doubt_drop(sid, mids):
@@ -2757,11 +2821,16 @@ def _doubt_gone_why(sid, answered):
     is not a live session. Its durable registry record corroborates an absence first (_durable_session, the refusal
     path's check against a restart-settle blink): a record that still reads alive waits. No event arrives while the
     listing goes unanswered (a kernel that is down, or too slow to list) or while a blink persists, so there the bound
-    is time: DOUBT_GONE_GRACE after this process first found the recipient unlisted."""
+    is time: DOUBT_GONE_GRACE after this process first found the recipient unlisted.
+
+    A REMOTE peer (its wake rides the kernel's wake-router) is one whose last beat was marked remote (_REMOTE_BEATS) and
+    for which this host's kernel still keeps no registry record (_has_local_record); its heartbeat is its liveness, and
+    it is past HEARTBEAT_TTL here. Presence in HEARTBEATS is not that: a local session's beat lands there whenever the
+    listing does not answer (review of 2026-09-29)."""
     now = time.time()
     since = _DOUBT_GONE_SINCE.setdefault(sid, now)
-    if sid in HEARTBEATS:                    # a remote peer (its wake rides the kernel's wake-router): its heartbeat is
-        return "the remote peer's heartbeat has lapsed (not live)"   # its liveness, and it is past HEARTBEAT_TTL
+    if sid in _REMOTE_BEATS and not _has_local_record(sid):
+        return "the remote peer's heartbeat has lapsed (not live)"
     if answered and not _durable_session(sid, True):
         return "the kernel's session list no longer carries the recipient (not a live session)"
     if now - since >= DOUBT_GONE_GRACE:
@@ -3572,6 +3641,7 @@ def _retry_pending():
     _retry_held_claims()
     markers = [m.name for m in MAILPENDING.iterdir() if m.is_file()] if MAILPENDING.is_dir() else []
     doubt = _doubt_sids()                      # recipients with a claim in doubt: re-posted whether or not new mail waits
+    _prune_heartbeats(keep=set(doubt))         # lapsed beats leave; a peer holding a chunk keeps its remote mark
     if doubt and _push_disabled():
         for sid in doubt:                      # no push will re-post them: back to new/, where the drain reads
             _doubt_release(sid, "the live push is switched off, so nothing would re-post it")

@@ -28,6 +28,15 @@ The review of the first cut added four more, pinned here too:
   or a racing re-post can never meet the ids taken with the banner in no queue;
 - a stranded banner's ids are forgotten BEFORE the bus is asked to take the mail back, since the bus re-posts at once.
 
+The review of round two added three more here (a fourth, the judge-usage prune's back-off after a failed write, is
+pinned in tests/test_timeline_bars_resilience.py):
+- a remote peer is told from a local session by a mark set only on a real remote heartbeat (no local registry record),
+  never by presence in the heartbeat table, where a local session's beat lands whenever the kernel's list is slow; a
+  lapsed beat leaves the table;
+- the gone-clock goes with the hold, whatever path settles it (a send's or a wake's own push, a hand-back, a release);
+- a stranded banner is handed back IN HAND: a bus re-post of it queued before the hand-back settles is the one copy,
+  even when the bus's answer then times out.
+
 SYNTHETIC fixtures only: invented text, placeholder uuids, TESTHOST; no real session names or message ids.
 """
 import json
@@ -394,6 +403,7 @@ class InDoubtRecipientGone(_PrivateMaildir, unittest.TestCase):
         pm._kernel_post, pm._push_disabled, pm._log, pm._kernel_sessions_checked, pm.ORPHAN_GRACE = self.saved
         for d in (getattr(pm, "_DOUBT_GONE_SINCE", {}), pm.HEARTBEATS, pm.STREAKS):
             d.pop(self.SID, None)
+        getattr(pm, "_REMOTE_BEATS", set()).discard(self.SID)
         pm.STREAKS.pop(self.sender, None)
         if self.reg.exists():
             self.reg.unlink()
@@ -482,11 +492,119 @@ class InDoubtRecipientGone(_PrivateMaildir, unittest.TestCase):
         self.assertEqual(pm._doubt_read(self.SID), [], "answered taken: retired")
         self.assertEqual(self._in_new(), [])
 
+    def _beat(self, age=0.0):
+        """`self.SID` heartbeats through the real handler (the listing the harness serves decides local or remote),
+        and the beat is then aged by `age` seconds: its beats have stopped since."""
+        local = pm._record_heartbeat(self.SID, "api")
+        if self.SID in pm.HEARTBEATS:
+            pm.HEARTBEATS[self.SID] = ("api", time.time() - age)
+        return local
+
+    def _released_lines(self):
+        return [ln for ln in self.logged if "released" in ln and self.SID in ln]
+
     def test_a_remote_peer_whose_heartbeat_lapsed_is_released(self):
-        pm.HEARTBEATS[self.SID] = ("api", time.time() - pm.HEARTBEAT_TTL - 5)
+        self.assertFalse(self._beat(age=pm.HEARTBEAT_TTL + 5), "not in the kernel's list, no local record: remote")
         pm._retry_pending()
         self.assertEqual(self._in_new(), [self.mid])
         self.assertTrue(any("released" in ln and "heartbeat has lapsed" in ln for ln in self.logged), self.logged)
+
+    def test_a_remote_peer_that_beat_while_the_list_did_not_answer_is_still_a_remote_peer(self):
+        # no local registry record for it: the kernel owns no such session, whatever the listing said
+        self.answered = False
+        self.assertFalse(self._beat(age=pm.HEARTBEAT_TTL + 5))
+        pm._retry_pending()
+        self.assertEqual(self._in_new(), [self.mid])
+        self.assertTrue(any("heartbeat has lapsed" in ln for ln in self._released_lines()), self.logged)
+
+    def _local_record(self):
+        self.reg.parent.mkdir(parents=True, exist_ok=True)
+        self.reg.write_text(json.dumps({"sid": self.SID, "alive": True}))
+
+    def test_a_local_sessions_beat_filed_while_the_list_was_slow_does_not_make_it_a_remote_peer(self):
+        # review of round two: a local session's first beat is filed as presence whenever the kernel's session list
+        # takes over 6 s, and the release read ANY id ever filed there as a remote peer. Under a slow kernel its held
+        # chunk was released on the first unanswered pass, skipping DOUBT_GONE_GRACE, the log naming a heartbeat
+        self._local_record()
+        self.answered = False                                  # the list is too slow to answer
+        self.assertFalse(self._beat(age=pm.HEARTBEAT_TTL + 5), "an unanswered listing never says local")
+        pm._retry_pending()
+        self.assertEqual(pm._doubt_read(self.SID), [[self.mid]],
+                         "a local session unlisted by a list that did not answer waits the grace: before the fix it "
+                         "was released at once as a remote peer whose heartbeat had lapsed")
+        self.assertEqual(self._in_new(), [])
+        self._run_out_the_bound()
+        pm._retry_pending()
+        self.assertEqual(self._in_new(), [self.mid], "past the grace it is released")
+        lines = self._released_lines()
+        self.assertTrue(lines and all("did not answer" in ln and "heartbeat" not in ln for ln in lines),
+                        "and the log names the true reason: %r" % (self.logged,))
+
+    def test_a_local_sessions_beat_does_not_turn_a_listing_blink_into_a_release(self):
+        # the answered list drops the session for a pass while its registry record reads alive: a blink, which waits
+        self._local_record()
+        self.answered = False
+        self._beat(age=pm.HEARTBEAT_TTL + 5)
+        self.answered = True                                   # the list answers now, without it
+        pm._retry_pending()
+        self.assertEqual(pm._doubt_read(self.SID), [[self.mid]],
+                         "its durable record reads alive: before the fix the stale beat released it as a remote peer")
+        self.assertEqual(self._released_lines(), [])
+
+    def test_the_release_never_reads_presence_as_a_remote_peer(self):
+        # the decision itself, with the beat still in the table: a local session (its registry record on disk) is
+        # judged by the local rules whatever presence says; only a beat marked remote reads as a remote peer
+        self._local_record()
+        pm.HEARTBEATS[self.SID] = ("api", time.time() - pm.HEARTBEAT_TTL - 5)
+        self.assertEqual(pm._doubt_gone_why(self.SID, False), "", "unanswered: wait the grace")
+        self.assertEqual(pm._doubt_gone_why(self.SID, True), "", "answered without it, record alive: a blink")
+        self.reg.unlink()
+        self.answered = True
+        self.assertFalse(self._beat(age=pm.HEARTBEAT_TTL + 5), "no local record now: a remote peer's beat")
+        self.assertIn("heartbeat has lapsed", pm._doubt_gone_why(self.SID, True))
+
+    def test_a_lapsed_heartbeat_is_dropped_and_a_released_peer_forgotten(self):
+        other = _fresh_sid("55555555-6666-7777-8888-")
+        pm.HEARTBEATS[other] = ("web", time.time() - pm.HEARTBEAT_TTL - 5)
+        self.addCleanup(pm.HEARTBEATS.pop, other, None)
+        self._beat(age=pm.HEARTBEAT_TTL + 5)                   # a remote peer holding a chunk in doubt
+        pm._retry_pending()
+        self.assertNotIn(other, pm.HEARTBEATS, "a lapsed beat leaves the table: before the fix nothing removed one")
+        self.assertEqual(self._in_new(), [self.mid], "the peer's chunk is released, with its reason")
+        self.assertTrue(any("heartbeat has lapsed" in ln for ln in self._released_lines()), self.logged)
+        pm._retry_pending()
+        self.assertNotIn(self.SID, pm.HEARTBEATS)
+        self.assertNotIn(self.SID, getattr(pm, "_REMOTE_BEATS", set()),
+                         "nothing held for it any more: the peer is forgotten too")
+
+    def test_a_hold_a_sends_own_push_settles_clears_the_gone_clock(self):
+        # review of round two: the clock was cleared only by a release and by the retry pass seeing the recipient
+        # listed, so a hold settled by a send's or a wake's own push kept its old start, and the NEXT hold was released
+        # on its first unlisted pass, the grace long spent
+        self.answered = False
+        pm._retry_pending()                                    # unlisted, unanswered: the wait starts
+        self.assertIn(self.SID, self._gone_since())
+        self._run_out_the_bound()                              # ... and runs past the grace
+        self.assertTrue(pm._push(self.SID, {"id": self.SID, "state": "idle"}),
+                        "the recipient is live to a send's own push, which settles the hold (answered taken)")
+        self.assertEqual(pm._doubt_read(self.SID), [])
+        self.assertNotIn(self.SID, self._gone_since(), "settled: the clock goes with the hold")
+        self.resp = pm.NO_ANSWER
+        second = pm.deliver(self.SID, "web", self.sender, "a second invented note", kind="coordinate")
+        pm._push(self.SID, {"id": self.SID, "state": "idle"})
+        self.assertEqual(pm._doubt_read(self.SID), [[second]], "a new hold")
+        pm._retry_pending()                                    # its first unlisted pass
+        self.assertEqual(pm._doubt_read(self.SID), [[second]],
+                         "the new hold waits its own grace: before the fix it was released at once on the old clock")
+        self.assertEqual(self._in_new(), [])
+
+    def test_a_hold_the_kernel_hands_back_clears_the_gone_clock(self):
+        self.answered = False
+        pm._retry_pending()
+        self.assertIn(self.SID, self._gone_since())
+        self.assertEqual(pm.restore(self.SID, self.mid), pm.RESTORED)   # a teardown stranded the banner: handed back
+        self.assertEqual(pm._doubt_read(self.SID), [])
+        self.assertNotIn(self.SID, self._gone_since(), "the hold is settled, whatever path settled it")
 
     def test_with_the_push_switched_off_the_chunk_goes_back_for_the_drain(self):
         # romp-postal-nopush: _push returns before it looks at a chunk in doubt, so nothing would ever re-post it, and
@@ -635,6 +753,68 @@ class KernelDeliverIsSafeToRepeat(_SdkWorld, unittest.TestCase):
         self.assertTrue(self.be.deliver(TO, b))
         self.assertEqual(self.sess.pending(), [b], "one copy")
         self.assertIn(MID1, (sb.read_reg(self.be.state_dir, TO) or {}).get("postalTaken") or [])
+
+    def _repost_then(self, b, outcome):
+        """A bus hook that puts the mail back and re-posts `b` at once (the re-post lands while the kernel still holds
+        the stranded banner), then gives the kernel `outcome`: an exception to raise, or an answer to return."""
+        def hook(sid, mids):
+            self.assertTrue(self.be.deliver(TO, b))
+            if isinstance(outcome, BaseException):
+                raise outcome
+            return outcome
+        return hook
+
+    def test_a_bus_that_re_posts_and_then_answers_too_late_leaves_one_copy(self):
+        # review of round two: the real hook (_bus_restore_mail) waits 5 s and RAISES on a read timeout. A bus that had
+        # already put the mail back and re-posted it by then had its re-post queued as new mail (the ids forgotten),
+        # and the kernel, reading the raise as "not taken back", re-headed the banner too: two copies
+        b = _banner(MID1, MID2)
+        self.be.deliver(TO, b)
+        self.be.postal_restore = self._repost_then(b, TimeoutError("timed out"))
+        self._strand(b)
+        self.assertEqual((self.copies(MID1), self.copies(MID2)), (1, 1),
+                         "the bus's re-post is the one copy: before the fix the banner was re-headed beside it")
+        self.assertTrue(self.be.deliver(TO, b), "a later repeat is answered taken")
+        self.assertEqual(self.copies(MID1), 1)
+        self.assertTrue(any("re-post" in ln and MID1 in ln and "not re-headed" in ln for ln in self.klog), self.klog)
+
+    def test_a_bus_that_re_posts_and_then_gives_no_answer_leaves_one_copy(self):
+        b = _banner(MID1)
+        self.be.deliver(TO, b)
+        self.be.postal_restore = self._repost_then(b, None)
+        self._strand(b)
+        self.assertEqual(self.copies(MID1), 1)
+
+    def test_a_bus_that_answers_too_late_and_re_posts_after_leaves_one_copy(self):
+        # the other order: the kernel re-heads first, taking the ids again, so the late re-post is a repeat
+        b = _banner(MID1)
+        self.be.deliver(TO, b)
+
+        def hook(sid, mids):
+            raise TimeoutError("timed out")
+        self.be.postal_restore = hook
+        self._strand(b)
+        self.assertEqual(self.copies(MID1), 1, "re-headed")
+        self.assertTrue(self.be.deliver(TO, b), "the bus's late re-post")
+        self.assertEqual(self.copies(MID1), 1, "answered taken, not queued")
+
+    def test_a_re_post_carrying_part_of_a_banner_still_re_heads_the_rest(self):
+        # a re-post that carries only some of a stranded banner's ids cannot stand for the rest: the banner is
+        # re-headed whole (it cannot be split), a message twice before one never
+        b = _banner(MID1, MID2)
+        self.be.deliver(TO, b)
+        self.be.postal_restore = self._repost_then(_banner(MID1), TimeoutError("timed out"))
+        self._strand(b)
+        self.assertEqual(self.copies(MID2), 1, "MID2 rides the re-headed banner: never lost")
+
+    def test_a_banner_the_bus_takes_back_leaves_nothing_in_hand(self):
+        # a take-back that succeeds settles the banner: a later strand of a banner with the same ids starts clean
+        b = _banner(MID1)
+        self.be.deliver(TO, b)
+        self.be.postal_restore = self._repost_then(b, {MID1})
+        self._strand(b)
+        self.assertEqual(self.copies(MID1), 1)
+        self.assertEqual(getattr(self.sess, "_postal_inhand", {}), {}, "nothing left marked in hand")
 
     def test_a_kernel_death_between_the_writes_never_leaves_an_id_taken_without_its_banner(self):
         # the first cut wrote the taken ids and the queue in two registry writes: a kernel that died between them came

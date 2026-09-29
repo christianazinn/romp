@@ -161,6 +161,70 @@ class UsageLogPrune(unittest.TestCase):
                 getattr(jd, "_USAGE_KEPT", {}).pop(str(jd.USAGE), None)
                 jd.USAGE, jd._USAGE_PRUNE_BYTES = saved_usage, saved_cap
 
+    def test_a_prune_whose_write_fails_backs_off_and_says_so_once(self):
+        # review of round two: when the prune's rewrite failed (disk full, quota, a read-only mount) the broad except
+        # recorded nothing, so every judge call read and parsed the whole file again only to fail again: the storm the
+        # kept size ended came back. Now the failure records a back-off (the next attempt waits for the file to grow a
+        # tenth), removes its half-written copy, and says so once. Whole-file reads are counted at Path.read_text.
+        import contextlib
+        import errno
+        import io
+        import time as _time
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as td:
+            saved_usage, saved_cap = jd.USAGE, jd._USAGE_PRUNE_BYTES
+            real_replace, real_read, reads = os.replace, Path.read_text, []
+            full = [True]                                  # the disk is full until the test frees it
+
+            def replace(src, dst, *a, **k):
+                if Path(dst) == jd.USAGE and full[0]:
+                    raise OSError(errno.ENOSPC, "No space left on device")
+                return real_replace(src, dst, *a, **k)
+
+            def read_text(self, *a, **k):
+                if self == jd.USAGE:
+                    reads.append(1)
+                return real_read(self, *a, **k)
+            try:
+                jd.USAGE = Path(td) / "judge-usage.jsonl"
+                now = int(_time.time())
+                jd.USAGE.write_text("".join(json.dumps({"t": now - 60 * i, "judge": "captioner", "pad": "x" * 300})
+                                            + "\n" for i in range(400)))   # ~140KB: the 20 calls below add ~4%
+                jd._USAGE_PRUNE_BYTES = 10                     # force the trigger
+                call = lambda: jd._log_judge_usage("captioner", "fast", "test-model", None, {"usage": {}})
+                err = io.StringIO()
+                with mock.patch.object(jd.os, "replace", replace), mock.patch.object(Path, "read_text", read_text), \
+                        contextlib.redirect_stderr(err):
+                    for _ in range(20):
+                        call()
+                    self.assertEqual(len(reads), 1,
+                                     "one failed attempt, then a back-off: before the fix every call re-read the file")
+                    said = [ln for ln in err.getvalue().splitlines() if "could not be pruned" in ln]
+                    self.assertEqual(len(said), 1, "said once: %r" % (err.getvalue(),))
+                    self.assertIn("No space left on device", said[0], "the line names the cause")
+                    self.assertFalse((Path(td) / "judge-usage.jsonl.tmp").exists(),
+                                     "the half-written copy does not stay behind to fill the disk further")
+                    with open(jd.USAGE, "a") as f:             # grows a tenth past the failed attempt
+                        f.write("".join(json.dumps({"t": now, "judge": "planner", "pad": "x" * 64}) + "\n"
+                                        for _ in range(jd.USAGE.stat().st_size // 700)))
+                    call()
+                    self.assertEqual(len(reads), 2, "past the back-off it tries once more")
+                    self.assertEqual(len([ln for ln in err.getvalue().splitlines() if "could not be pruned" in ln]), 1,
+                                     "a second failure in the same spell is not said again")
+                    with open(jd.USAGE, "a") as f:
+                        f.write("".join(json.dumps({"t": now, "judge": "planner", "pad": "x" * 64}) + "\n"
+                                        for _ in range(jd.USAGE.stat().st_size // 700)))
+                    full[0] = False                            # the disk frees
+                    call()
+                    self.assertEqual(len(reads), 3)
+                    self.assertTrue((Path(td) / "judge-usage.jsonl.kept").is_file(), "it pruned, and wrote it down")
+                    self.assertIn("pruned to the newest 31 days", err.getvalue())
+            finally:
+                getattr(jd, "_USAGE_KEPT", {}).pop(str(jd.USAGE), None)
+                getattr(jd, "_USAGE_RETRY_AT", {}).pop(str(jd.USAGE), None)
+                getattr(jd, "_USAGE_FAIL_SAID", set()).discard(str(jd.USAGE))
+                jd.USAGE, jd._USAGE_PRUNE_BYTES = saved_usage, saved_cap
+
     def test_healthy_log_untouched(self):
         with tempfile.TemporaryDirectory() as td:
             saved_usage = jd.USAGE

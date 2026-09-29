@@ -1570,6 +1570,12 @@ _USAGE_PRUNE_GROWTH = 1.5                # prune again only once the file has gr
                                          # last prune kept: a rewrite can never re-fire on the next call, and
                                          # the rewrites are paid once per third of the file's growth
 _USAGE_KEPT = {}                         # str(USAGE) -> bytes the last prune in this process kept
+_USAGE_RETRY_GROWTH = 1.1                # a prune that FAILED tries again once the file has grown a tenth past the
+                                         # size it failed at: before, the failure recorded nothing, and every judge
+                                         # call re-read and re-parsed the whole file only to fail again (disk full,
+                                         # quota, a read-only mount: review of 2026-09-29)
+_USAGE_RETRY_AT = {}                     # str(USAGE) -> the size a failed prune waits for (this process)
+_USAGE_FAIL_SAID = set()                 # str(USAGE) whose failing prune has been said, once per spell of failures
 _USAGE_RETAIN_S = 31 * 86400             # matches the kernel reader's widest consumer window
                                          # (_JUDGE_USAGE_RETAIN, the 30-day analytics view + slack)
 
@@ -1599,11 +1605,22 @@ def _prune_usage_log():
     re-reads cleanly. Best-effort and racy by design: an append from a concurrent judge process during the rewrite
     window can be lost — this is telemetry whose consumers read a bounded window, and a rewrite is rare by
     construction. The prune says what it did (one stderr line), never silently, and says so too when the kept size
-    could not be written down (the next process may then prune once at the floor)."""
+    could not be written down (the next process may then prune once at the floor).
+
+    A prune that FAILS once it has begun reading (the read, the temp file's write, the rename: a full disk, a quota, a
+    read-only mount) removes its half-written temp file, and waits for the file to grow a tenth past the size it failed
+    at before it reads the file again (_USAGE_RETRY_AT); the first failure of a spell says so in one stderr line, and a
+    prune that lands ends the spell. Before, the failure recorded nothing, and every judge call re-read and re-parsed
+    the whole file (review of 2026-09-29)."""
+    key = str(USAGE)
     try:
         size = USAGE.stat().st_size
-        if size <= _USAGE_PRUNE_BYTES or size <= _usage_prune_trigger(size):
+        if size <= _USAGE_PRUNE_BYTES or size <= _USAGE_RETRY_AT.get(key, 0) or size <= _usage_prune_trigger(size):
             return
+    except Exception:
+        return
+    tmp = USAGE.with_name(USAGE.name + ".tmp")
+    try:
         parsed = []
         for ln in USAGE.read_text(errors="replace").splitlines():
             try:
@@ -1614,11 +1631,29 @@ def _prune_usage_log():
                 parsed.append((o.get("t") or 0, ln))
         floor = max((t for t, _ in parsed), default=0) - _USAGE_RETAIN_S
         keep = [ln for t, ln in parsed if t >= floor]
-        tmp = USAGE.with_name(USAGE.name + ".tmp")
         data = ("\n".join(keep) + ("\n" if keep else "")).encode("utf-8")
         tmp.write_bytes(data)
         os.replace(tmp, USAGE)
-        _USAGE_KEPT[str(USAGE)] = len(data)
+    except Exception as e:
+        _USAGE_RETRY_AT[key] = int(size * _USAGE_RETRY_GROWTH)
+        try:
+            tmp.unlink()                         # a half-written copy on a full disk only fills it further
+        except OSError:
+            pass
+        if key not in _USAGE_FAIL_SAID:
+            _USAGE_FAIL_SAID.add(key)
+            try:
+                sys.stderr.write("romp-judge: judge-usage.jsonl (%dMB) could not be pruned (%s: %s); it is left as it "
+                                 "was, and the next attempt waits until it passes %dMB\n"
+                                 % (size // (1024 * 1024), type(e).__name__, e,
+                                    _USAGE_RETRY_AT[key] // (1024 * 1024)))
+            except Exception:
+                pass
+        return
+    _USAGE_RETRY_AT.pop(key, None)
+    _USAGE_FAIL_SAID.discard(key)
+    try:
+        _USAGE_KEPT[key] = len(data)
         note = ""
         try:
             side = _usage_kept_path()

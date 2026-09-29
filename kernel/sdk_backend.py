@@ -5765,6 +5765,10 @@ class SdkSession:
         # /deliver it got no answer for) is recognised and not queued twice, across a kernel restart too (2026-09-29).
         self._postal_taken: list = [m for m in (reg.get("postalTaken") or [])
                                     if isinstance(m, str) and m][-POSTAL_TAKEN_KEEP:]
+        # The postal ids of a stranded banner this session is handing back to the bus RIGHT NOW (_return_stranded_mail):
+        # id -> True once a re-post carrying it has been queued (enqueue_postal) while the banner was still in hand.
+        # Memory only, and empty between hand-backs.
+        self._postal_inhand: dict = {}
         self._fed_meta: list = []
         self._landed_qid: dict = {}
         # A /clear the CLI has TAKEN is tracked by the IDENTITY of its optimistic echo (the taken copy's qid),
@@ -5998,7 +6002,11 @@ class SdkSession:
         one write and queued the banner in another: a kernel death between the two writes, or an enqueue that
         raised while a racing re-post read the ids as taken, answered "taken" for a banner no queue held, and the
         bus retired the mail on that answer (review of 2026-09-29). Two posts of one banner racing each other queue
-        it once."""
+        it once.
+
+        An id of a stranded banner this session is handing back to the bus at this moment (_postal_inhand) is marked
+        as re-posted in the same hold, so the hand-back, deciding under the same lock whether to re-head the banner,
+        sees the bus's copy already queued and does not queue a second."""
         mids = [m for m in (mids or []) if isinstance(m, str) and m]
         with self._lock:
             seen = [m for m in mids if m in self._postal_taken]
@@ -6006,19 +6014,29 @@ class SdkSession:
                 return seen
             self._q_append(text)
             self._take_postal_locked(mids)
+            for m in mids:
+                if m in self._postal_inhand:
+                    self._postal_inhand[m] = True
             loop, wake = self.loop, self._input_wake
         self._persist_queue(taken=bool(mids))
         if loop is not None and wake is not None:
             loop.call_soon_threadsafe(wake.set)
         return seen
 
-    def forget_postal(self, mids) -> None:
+    def forget_postal(self, mids, in_hand=False) -> None:
         """Drop `mids` from the taken ids: the banner carrying them goes back to the bus (a teardown stranded it,
         _return_stranded_mail), so the bus's re-delivery of them is new mail to queue, not a repeat. Called BEFORE
         the bus is asked to take them back: the bus re-posts the moment it has them, and a re-post that met the ids
-        still taken was answered taken and never queued (review of 2026-09-29)."""
+        still taken was answered taken and never queued (review of 2026-09-29).
+
+        `in_hand`: in the same hold, mark the ids as a banner still held here while the bus is asked
+        (_postal_inhand), so a re-post of them queued meanwhile is seen by the hand-back's own decision
+        (_settle_handback), never re-headed beside."""
         drop = {m for m in (mids or []) if isinstance(m, str)}
         with self._lock:
+            if in_hand:
+                for m in drop:
+                    self._postal_inhand[m] = False
             kept = [m for m in self._postal_taken if m not in drop]
             if len(kept) == len(self._postal_taken):
                 return
@@ -6546,74 +6564,101 @@ class SdkSession:
         rule it out: a banner _text_landed FINDS in the transcript (the CLI wrote its user record before the
         teardown) is left where it is, since the resumed conversation carries it and a put-back would deliver the
         same mail twice; a False or None answer proceeds, a miss being no proof of loss. Never raises; one log line
-        per banner names its ids and their fate."""
+        per banner names its ids and their fate. The re-head is decided against the bus's own re-post, by id, in one
+        hold of the session lock (_settle_handback): a hook that raised after the bus had acted leaves one copy."""
         mail = [(t, postal_mids(t)) for t in stranded if isinstance(t, str)]
         mail = [(t, mids) for t, mids in mail if mids]
         if not mail:
             return
         hook = getattr(self.backend, "postal_restore", None)
-        rehead = []
-        for text, mids in mail:
-            # Landed before the teardown? A stream error or timeout can tear the client down AFTER the CLI wrote
-            # the banner's user record; the resumed conversation then carries it, and a put-back would deliver the
-            # same mail twice. True is definitive (the banner keys to itself, markers included, under
-            # echo_text_key); False or None proceeds, a miss being no proof of loss (the abandoned client may
-            # still have been flushing the record). Review fix, 2026-09-12.
-            seen = self.backend._text_landed(self.sid, text)
-            if seen is True:
-                self.backend._log("stranded mail (%s): a banner fed to the abandoned client landed in the transcript "
-                                  "before the teardown; the resumed conversation carries it, not handed back (%s)"
-                                  % (self.name, ", ".join(mids)))
-                continue
-            back, why, held_by_bus = None, "no bus hook is installed", set()
-            if callable(hook):
-                # Forget the ids BEFORE the bus has them back: its put-back wakes the session and re-posts at once,
-                # and a re-post that met the ids still taken was answered taken and never queued, the mail lost
-                # (review of 2026-09-29). A banner the bus then does not take back is re-headed below and its ids
-                # are taken again with it.
-                self.forget_postal(mids)
-                try:
-                    res = hook(self.sid, list(mids))
-                    if res is None:
-                        why = "the bus gave no answer"
-                    else:
-                        back = set(res)
-                        held_by_bus = set(getattr(res, "held", ()) or ())   # ids the bus holds under an unreadable cur/ (2026-09-14)
-                except Exception as e:
-                    why = "the bus could not be asked (%r)" % (e,)
-            if back is None:
-                rehead.append((text, mids))
-                self.backend._log("stranded mail (%s): a banner fed to the abandoned client never resulted, and %s; "
-                                  "re-heading it (%s) so the new client is fed it"
-                                  % (self.name, why, ", ".join(mids)), problem=True)
-                continue
-            gone = [m for m in mids if m not in back]
-            if len(gone) == len(mids):
-                # The bus put back NONE of them. Nothing removes a live session's cur/ file (recall reads new/
-                # only; the orphan sweep skips live boxes and touches new/ only), so this bus never held them:
-                # a session whose maildir sits on another host's bus (the wake-router forwarded the banner
-                # here). The banner text is the last copy of the mail; re-head it, the no-answer path.
-                rehead.append((text, mids))
-                self.backend._log("stranded mail (%s): a banner fed to the abandoned client never resulted, and the "
-                                  "bus holds none of its ids (%s); re-heading it so the new client is fed it"
-                                  % (self.name, ", ".join(mids)), problem=True)
-                continue
-            put_back = [m for m in mids if m in back and m not in held_by_bus]
-            held_here = [m for m in mids if m in held_by_bus]
-            self.backend._log("stranded mail (%s): a banner fed to the abandoned client never resulted%s%s%s"
-                              % (self.name,
-                                 ("; handed back to the bus by id for re-delivery (%s)" % ", ".join(put_back)) if put_back else "",
-                                 ("; held by the bus under a PENDING fault (its cur/ cannot be read; the sender's receipt reads "
-                                  "pending, the bus's retry puts them back once it reads): %s" % ", ".join(held_here)) if held_here else "",
-                                 ("; no longer in the bus's box, not re-fed: %s" % ", ".join(gone)) if gone else ""),
-                              problem=bool(held_here))
-        if rehead:
-            texts = [t for t, _ in rehead]
-            with self._lock:
+        rehead = []                                     # (text, mids, why): the banners the bus did not take back
+        try:
+            for text, mids in mail:
+                # Landed before the teardown? A stream error or timeout can tear the client down AFTER the CLI wrote
+                # the banner's user record; the resumed conversation then carries it, and a put-back would deliver the
+                # same mail twice. True is definitive (the banner keys to itself, markers included, under
+                # echo_text_key); False or None proceeds, a miss being no proof of loss (the abandoned client may
+                # still have been flushing the record). Review fix, 2026-09-12.
+                seen = self.backend._text_landed(self.sid, text)
+                if seen is True:
+                    self.backend._log("stranded mail (%s): a banner fed to the abandoned client landed in the "
+                                      "transcript before the teardown; the resumed conversation carries it, not handed "
+                                      "back (%s)" % (self.name, ", ".join(mids)))
+                    continue
+                back, why, held_by_bus = None, "no bus hook is installed", set()
+                if callable(hook):
+                    # Forget the ids BEFORE the bus has them back: its put-back wakes the session and re-posts at once,
+                    # and a re-post that met the ids still taken was answered taken and never queued, the mail lost
+                    # (review of 2026-09-29). The ids are held IN HAND meanwhile (same hold): a re-post of them that is
+                    # queued before the hand-back settles is seen there, so a hook that raises or gives no answer
+                    # AFTER the bus acted (the real one waits 5 s and raises on a read timeout) never has the banner
+                    # re-headed beside the bus's copy (review of round two, 2026-09-29).
+                    self.forget_postal(mids, in_hand=True)
+                    try:
+                        res = hook(self.sid, list(mids))
+                        if res is None:
+                            why = "the bus gave no answer"
+                        else:
+                            back = set(res)
+                            held_by_bus = set(getattr(res, "held", ()) or ())   # ids the bus holds under an unreadable cur/ (2026-09-14)
+                    except Exception as e:
+                        why = "the bus could not be asked (%r)" % (e,)
+                if back is None:
+                    rehead.append((text, mids, why))
+                    continue
+                gone = [m for m in mids if m not in back]
+                if len(gone) == len(mids):
+                    # The bus put back NONE of them. Nothing removes a live session's cur/ file (recall reads new/
+                    # only; the orphan sweep skips live boxes and touches new/ only), so this bus never held them:
+                    # a session whose maildir sits on another host's bus (the wake-router forwarded the banner
+                    # here). The banner text is the last copy of the mail; re-head it, the no-answer path.
+                    rehead.append((text, mids, "the bus holds none of its ids"))
+                    continue
+                put_back = [m for m in mids if m in back and m not in held_by_bus]
+                held_here = [m for m in mids if m in held_by_bus]
+                self.backend._log("stranded mail (%s): a banner fed to the abandoned client never resulted%s%s%s"
+                                  % (self.name,
+                                     ("; handed back to the bus by id for re-delivery (%s)" % ", ".join(put_back)) if put_back else "",
+                                     ("; held by the bus under a PENDING fault (its cur/ cannot be read; the sender's receipt reads "
+                                      "pending, the bus's retry puts them back once it reads): %s" % ", ".join(held_here)) if held_here else "",
+                                     ("; no longer in the bus's box, not re-fed: %s" % ", ".join(gone)) if gone else ""),
+                                  problem=bool(held_here))
+        finally:
+            self._settle_handback(rehead, [m for _, mids in mail for m in mids])
+
+    def _settle_handback(self, rehead, handed) -> None:
+        """Re-head the stranded banners the bus did not take back (`rehead`: (text, mids, why)), and end the hand-back
+        of every id in `handed`. ONE hold of self._lock decides and queues, the same lock enqueue_postal marks a re-post
+        under: a banner whose every id a re-post has queued meanwhile (_postal_inhand True) is NOT re-headed, since the
+        bus acted before its answer failed and its copy is in the queue (before, both were queued: review of round two,
+        2026-09-29); any other is re-headed whole under its own ids, which are taken again in the same hold, so a re-post
+        that arrives after this is a repeat and is not queued. A re-post carrying only some of a banner's ids does not
+        stand for the rest: the banner cannot be split, and a message twice beats one never. One log line per banner."""
+        texts, lines = [], []
+        with self._lock:
+            for text, mids, why in rehead:
+                reposted = [m for m in mids if self._postal_inhand.pop(m, False)]
+                if len(reposted) == len(mids):
+                    lines.append(("stranded mail (%s): a banner fed to the abandoned client never resulted, and %s, but "
+                                  "the bus's re-post of it was queued meanwhile (%s); not re-headed, so the session gets "
+                                  "one copy" % (self.name, why, ", ".join(mids)), False))
+                    continue
+                texts.append(text)
+                self._take_postal_locked(mids)           # queued again: taken mail, in the hold that queues it
+                lines.append(("stranded mail (%s): a banner fed to the abandoned client never resulted, and %s; "
+                              "re-heading it (%s) so the new client is fed it%s"
+                              % (self.name, why, ", ".join(mids),
+                                 ("; the bus's re-post carried only %s of it, so %s ride%s it twice"
+                                  % (len(reposted), ", ".join(reposted), "s" if len(reposted) == 1 else "")) if reposted else ""),
+                              True))
+            if texts:
                 self._q_prepend(texts, self._unfeed_locked(texts))   # back at the head under their own ids
-                for _, mids in rehead:
-                    self._take_postal_locked(mids)       # queued again: taken mail, in the hold that queues it
+            for m in handed:
+                self._postal_inhand.pop(m, None)         # the hand-back is over, taken back or re-headed
+        if texts:
             self._persist_queue(taken=True)
+        for line, problem in lines:
+            self.backend._log(line, problem=problem)
 
     # ---- async internals (run inside the quarantined loop) ----
 
