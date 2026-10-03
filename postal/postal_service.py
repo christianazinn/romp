@@ -36,6 +36,7 @@
 # everything with ~/.claude/romp-postal-off.
 
 import base64
+import contextlib
 import errno
 import fcntl
 import hashlib
@@ -2627,6 +2628,33 @@ _DOUBT_BUSY = set()              # sids whose in-doubt chunks one thread is re-p
 _DOUBT_FAULT_SAID = set()        # sids whose record could not be read, said once per spell
 _DOUBT_GONE_SINCE = {}           # sid -> when the retry pass first found an in-doubt recipient unlisted (this process)
 
+# One push per recipient at a time (review of 2026-10-03). _push runs on a thread per send, per wake and on the retry
+# pass, and its steps (settle the chunks in doubt, claim, post, record a chunk in doubt) are one unit: a second push
+# that claimed and posted while the first was still waiting on an answer, before that chunk was recorded in doubt, had
+# the kernel take its banner first. The kernel keeps only the banner it took last whole in its taken list, so taking
+# the small one trimmed the list back to the cap and cut the big banner's oldest ids, and that banner's re-post was
+# queued whole a second time. Under this lock a second push starts only once the first has recorded its chunk in
+# doubt, and its first act is to settle it. A lock is held per recipient only while a push holds or awaits it.
+_PUSH_LOCKS = {}                 # sid -> [lock, how many pushes hold or await it]
+_PUSH_LOCKS_GUARD = threading.Lock()
+
+
+@contextlib.contextmanager
+def _push_lock(sid):
+    """Hold `sid`'s push lock for the body, waiting for a push to `sid` already under way. The entry goes when the
+    last push holding or awaiting it is done, so the table stays as small as the pushes in flight."""
+    with _PUSH_LOCKS_GUARD:
+        ent = _PUSH_LOCKS.setdefault(sid, [threading.Lock(), 0])
+        ent[1] += 1
+    try:
+        with ent[0]:
+            yield
+    finally:
+        with _PUSH_LOCKS_GUARD:
+            ent[1] -= 1
+            if not ent[1] and _PUSH_LOCKS.get(sid) is ent:
+                del _PUSH_LOCKS[sid]
+
 
 def _doubt_read(sid):
     """The in-doubt chunks recorded for `sid`, oldest first, each a list of message ids ([] when none)."""
@@ -2861,7 +2889,9 @@ def _push(sid, agent):
     A chunk that was SENT and got no answer within DELIVER_TIMEOUT is not restored (2026-09-29): the kernel may have
     queued it, and restoring it had the drain and the retry deliver it again, a growing banner every half minute
     under a slow kernel. It stays claimed and is recorded in doubt (the in-doubt notes above _push); every later
-    _push for the recipient re-posts it first and claims nothing new until the kernel has answered for it."""
+    _push for the recipient re-posts it first and claims nothing new until the kernel has answered for it. A push to a
+    recipient waits for one already under way to it (_push_lock), so no second push claims and posts between a chunk's
+    post and its in-doubt record (review of 2026-10-03)."""
     if _push_disabled() or not agent:
         return False
     if os.environ.get("ROMP_SESSIONS_FILE"):                  # test seam: no live kernel → leave it for the drain (don't churn the maildir)
@@ -2872,65 +2902,66 @@ def _push(sid, agent):
     if not agent.get("remote") and agent.get("state", "") not in ("waiting", "idle", "working"):
         return False                                          # a permission ask / unknown state → drain later
     try:
-        proceed, relanded = _resolve_in_doubt(sid, agent)
-        if not proceed:
-            return False                                      # a chunk still in doubt, or just refused: claim nothing on top
-        res = _drain(sid)                                     # claim mail (guarded + consuming)
-        if res.get("unreadable"):
-            _say_inbox_unreadable_once(sid, res["unreadable"])   # the box cannot be listed: skipped, said once, retried next pass
-            return False
-        msgs = res.get("messages", [])
-        if not msgs:
-            return bool(relanded)                             # nothing new (or loop-guard paused)
-        reply_tool = agent.get("backend") == "codex"      # a Codex recipient replies through its send_message tool
-        chunks, oversize = _push_chunks(sid, msgs, reply_tool)
-        for m in oversize:
-            _bounce_oversize(sid, m, reply_tool)
-        landed, held, cause, doubt, unanswered = 0, [], "", [], False
-        for i, chunk in enumerate(chunks):
-            resp = _kernel_post("/deliver", {"id": sid, "text": format_push(chunk, reply_tool)},
-                                timeout=DELIVER_TIMEOUT, no_answer=NO_ANSWER)
-            if resp and resp.get("injected"):
-                landed += len(chunk)
-                continue
-            if resp is NO_ANSWER:
-                # SENT, and no answer in time: the kernel may well have queued it (a slow kernel finishes the
-                # request after we stop waiting). Putting it back here is what delivered one message thirty-odd
-                # times (2026-09-29): hold the claim in cur/, no unexec, and let the retry pass re-post this same
-                # chunk until the kernel answers for it. The chunks after it were never sent, so they go back.
-                doubt = [m.get("id", "") for m in chunk if _safe_id(m.get("id", ""))]
-                if _doubt_add(sid, doubt):
-                    unanswered = True
-                    held = [m for c in chunks[i + 1:] for m in c]
+        with _push_lock(sid):                                 # one push per recipient at a time (_PUSH_LOCKS)
+            proceed, relanded = _resolve_in_doubt(sid, agent)
+            if not proceed:
+                return False                                      # a chunk still in doubt, or just refused: claim nothing on top
+            res = _drain(sid)                                     # claim mail (guarded + consuming)
+            if res.get("unreadable"):
+                _say_inbox_unreadable_once(sid, res["unreadable"])   # the box cannot be listed: skipped, said once, retried next pass
+                return False
+            msgs = res.get("messages", [])
+            if not msgs:
+                return bool(relanded)                             # nothing new (or loop-guard paused)
+            reply_tool = agent.get("backend") == "codex"      # a Codex recipient replies through its send_message tool
+            chunks, oversize = _push_chunks(sid, msgs, reply_tool)
+            for m in oversize:
+                _bounce_oversize(sid, m, reply_tool)
+            landed, held, cause, doubt, unanswered = 0, [], "", [], False
+            for i, chunk in enumerate(chunks):
+                resp = _kernel_post("/deliver", {"id": sid, "text": format_push(chunk, reply_tool)},
+                                    timeout=DELIVER_TIMEOUT, no_answer=NO_ANSWER)
+                if resp and resp.get("injected"):
+                    landed += len(chunk)
+                    continue
+                if resp is NO_ANSWER:
+                    # SENT, and no answer in time: the kernel may well have queued it (a slow kernel finishes the
+                    # request after we stop waiting). Putting it back here is what delivered one message thirty-odd
+                    # times (2026-09-29): hold the claim in cur/, no unexec, and let the retry pass re-post this same
+                    # chunk until the kernel answers for it. The chunks after it were never sent, so they go back.
+                    doubt = [m.get("id", "") for m in chunk if _safe_id(m.get("id", ""))]
+                    if _doubt_add(sid, doubt):
+                        unanswered = True
+                        held = [m for c in chunks[i + 1:] for m in c]
+                        break
+                    cause, doubt = "no answer in %d s, and the in-doubt record could not be written" % DELIVER_TIMEOUT, []
+                    held = [m for c in chunks[i:] for m in c]
                     break
-                cause, doubt = "no answer in %d s, and the in-doubt record could not be written" % DELIVER_TIMEOUT, []
+                if resp is None:
+                    cause = "kernel unreachable"
+                elif resp.get("status"):
+                    cause = "kernel answered HTTP %s" % resp["status"]   # the reason is in _kernel_post's line
+                else:
+                    cause = "not injected"                        # the session did not take the wake (not live/resumable, or mailbox off)
                 held = [m for c in chunks[i:] for m in c]
                 break
-            if resp is None:
-                cause = "kernel unreachable"
-            elif resp.get("status"):
-                cause = "kernel answered HTTP %s" % resp["status"]   # the reason is in _kernel_post's line
-            else:
-                cause = "not injected"                        # the session did not take the wake (not live/resumable, or mailbox off)
-            held = [m for c in chunks[i:] for m in c]
-            break
-        if unanswered:
-            _log("push to %s: no answer from the kernel in %d s for %d msg(s); held as claimed (in doubt, the kernel may "
-                 "have queued them) for the retry pass to re-post under the same ids%s%s"
-                 % (sid, DELIVER_TIMEOUT, len(doubt), (" after %d landed" % landed) if landed else "",
-                    ("; %d not yet sent" % len(held)) if held else ""))
-        if not held:
-            return bool(landed) and not unanswered
-        # Not injected → UNCLAIM: put each message back under its ORIGINAL id (restore), so a
-        # deferred push doesn't mint a second identity for the same message. Only if the file is
-        # gone (recalled/swept mid-push) do we fall back to a re-send, which costs a new id but
-        # never loses the mail.
-        unknown = _put_back(sid, held)
-        _log("push to %s deferred (%s); %d msg(s) restored for the drain backstop%s%s"
-             % (sid, cause or "an earlier chunk is in doubt", len(held) - unknown,
-                (" after %d landed" % landed) if landed else "",
-                ("; %d could not be answered for (cur/ unreadable), held for the retry loop" % unknown) if unknown else ""))
-        return False
+            if unanswered:
+                _log("push to %s: no answer from the kernel in %d s for %d msg(s); held as claimed (in doubt, the kernel may "
+                     "have queued them) for the retry pass to re-post under the same ids%s%s"
+                     % (sid, DELIVER_TIMEOUT, len(doubt), (" after %d landed" % landed) if landed else "",
+                        ("; %d not yet sent" % len(held)) if held else ""))
+            if not held:
+                return bool(landed) and not unanswered
+            # Not injected → UNCLAIM: put each message back under its ORIGINAL id (restore), so a
+            # deferred push doesn't mint a second identity for the same message. Only if the file is
+            # gone (recalled/swept mid-push) do we fall back to a re-send, which costs a new id but
+            # never loses the mail.
+            unknown = _put_back(sid, held)
+            _log("push to %s deferred (%s); %d msg(s) restored for the drain backstop%s%s"
+                 % (sid, cause or "an earlier chunk is in doubt", len(held) - unknown,
+                    (" after %d landed" % landed) if landed else "",
+                    ("; %d could not be answered for (cur/ unreadable), held for the retry loop" % unknown) if unknown else ""))
+            return False
     except Exception as e:
         _log("push error for %s: %s" % (sid, e))
         return False

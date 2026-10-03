@@ -717,6 +717,60 @@ class KernelDeliverIsSafeToRepeat(_SdkWorld, unittest.TestCase):
         self.assertEqual(reg["postalTaken"][-1], "1700%06d.000000.TESTHOST" % (sb.POSTAL_TAKEN_KEEP + 19),
                          "the newest ids are kept")
 
+    # The bus bounds a chunk by its BYTES (_PUSH_MAX_BYTES, 900 KiB), never by how many messages it carries, so a
+    # recipient back from a long absence gets its whole parked box in one banner: about 380 messages of 2 KB each fit.
+    # A taken list cut at POSTAL_TAKEN_KEEP inside that banner kept only its last 256 ids, so the bus's re-post of the
+    # same chunk (no answer within its wait, a slow kernel) met ids it did not know, and the banner was queued whole a
+    # second time: every message in the box delivered twice (2026-10-03).
+    _BIG = sb.POSTAL_TAKEN_KEEP + 44
+    _BODY = ("a synthetic status line for the test, about the size of a peer's note. " * 30)[:2000]
+
+    def _big_box(self, n=_BIG, first=0):
+        """A banner of `n` messages that the bus's own chunker sends as ONE chunk -> (ids, banner)."""
+        mids = ["1701%06d.000000.TESTHOST" % i for i in range(first, first + n)]
+        msgs = [{"from": "web", "from_id": SENDER, "body": self._BODY, "id": m, "date": ""} for m in mids]
+        chunks, oversize = pm._push_chunks(TO, msgs)
+        self.assertEqual((len(chunks), len(oversize)), (1, 0), "the bus sends this box as one banner")
+        return mids, pm.format_push(msgs)
+
+    def test_a_banner_carrying_more_ids_than_the_cap_is_still_a_repeat(self):
+        mids, b = self._big_box()
+        self.assertTrue(self.be.deliver(TO, b))
+        self.assertTrue(self.be.deliver(TO, b), "the bus re-posts the chunk it got no answer for")
+        self.assertEqual(self.copies(mids[0]), 1, "one copy: before the fix the cap cut the banner's own ids and the "
+                                                  "re-post was queued whole again")
+        self.assertFalse(any("queued whole" in ln for ln in self.klog), self.klog)
+
+    def test_a_banner_carrying_more_ids_than_the_cap_is_a_repeat_across_a_kernel_restart(self):
+        mids, b = self._big_box()
+        self.assertTrue(self.be.deliver(TO, b))
+        self.sess = self._new_session()                       # the restarted kernel seeds from the registry
+        self.assertTrue(self.be.deliver(TO, b))
+        self.assertEqual(self.copies(mids[0]), 1, "the registry carried every id of the banner, and the restart "
+                                                  "loaded them all (before, it loaded the last 256)")
+
+    def test_a_banner_that_carries_an_id_taken_long_ago_keeps_that_id_too(self):
+        # an id already on the list sat at its OLD end, where the trim after the banner's new ids cut it first; the
+        # re-post of that banner then met one unknown id and was queued whole again
+        old = "1700000000.000000.TESTHOST"
+        self.be.deliver(TO, _banner(old))
+        for i in range(1, sb.POSTAL_TAKEN_KEEP):
+            self.be.deliver(TO, _banner("1700%06d.000000.TESTHOST" % i))
+        mixed = _banner(old, *["1702%06d.000000.TESTHOST" % i for i in range(10)])
+        self.assertTrue(self.be.deliver(TO, mixed))           # queued whole and said: one id was taken already
+        self.assertTrue(self.be.deliver(TO, mixed), "the bus re-posts it")
+        self.assertEqual(sum(1 for t in self.sess.pending() if t == mixed), 1)
+
+    def test_after_a_big_banner_the_list_falls_back_to_the_cap(self):
+        self.be.deliver(TO, self._big_box()[1])
+        self.assertEqual(len(self.sess._postal_taken), self._BIG, "the banner just taken is kept whole")
+        for i in range(3):
+            self.be.deliver(TO, _banner("1703%06d.000000.TESTHOST" % i))
+        reg = sb.read_reg(self.be.state_dir, TO) or {}
+        self.assertEqual(len(reg.get("postalTaken") or []), sb.POSTAL_TAKEN_KEEP, "and the bound holds once the "
+                                                                                  "next banner is taken")
+        self.assertEqual(reg["postalTaken"][-1], "1703000002.000000.TESTHOST")
+
     def _strand(self, b):
         """`b` fed to a client that a teardown then abandoned: the loop top's reconcile finds it stranded."""
         self.sess._pending.clear()
@@ -843,6 +897,104 @@ class KernelDeliverIsSafeToRepeat(_SdkWorld, unittest.TestCase):
         self.sess._reconcile_stranded()
         self.assertTrue(self.be.deliver(TO, b), "the bus re-delivers the mail it was handed back")
         self.assertEqual(self.sess.pending(), [b], "queued again: a forgotten id is not a repeat")
+
+
+class ConcurrentPushesToOneRecipient(_SdkWorld, unittest.TestCase):
+    """Two bus pushes to ONE recipient never interleave (review of 2026-10-03).
+
+    The kernel keeps the banner it took last whole in its taken list, past the cap if need be, and falls back to the
+    cap when it takes the next one. A push runs on a thread per send (and per wake, and on the retry pass), so before
+    this fix a second push could claim and post new mail while the first was still waiting on an answer for a big
+    banner, before it had recorded that banner in doubt: the kernel took the small banner, trimmed the list back to
+    the cap and cut the big banner's oldest ids, and the retry pass's re-post of the big banner then read as new mail
+    and was queued whole a second time. Each recipient's whole push (resolve the chunks in doubt, claim, post, record)
+    now holds one lock per recipient, so a second push starts only after the first has recorded its chunk in doubt,
+    and its first act is to settle that chunk.
+
+    The interleaving is pinned with events, never sleeps: the fake kernel queues the big banner and then holds its
+    answer until the second push has either posted (before the fix) or is waiting on the recipient's lock (after)."""
+
+    _BIG = sb.POSTAL_TAKEN_KEEP + 44
+    _BODY = ("a synthetic status line about the size of a short peer note. " * 4)[:240]
+
+    def setUp(self):
+        self._make_backend(_fresh_sid())
+        self._seam = os.environ.pop("ROMP_SESSIONS_FILE", None)   # not a seam test: let _push actually post
+        self.saved = (pm._push_disabled, pm._log, pm._kernel_post, getattr(pm, "_push_lock", None))
+        pm._push_disabled = lambda: False
+        self.logged = []
+        pm._log = self.logged.append
+        self.posts = []
+        self.big_taken = threading.Event()      # the kernel has queued the big banner, its answer not yet sent
+        self.progress = threading.Event()       # the second push posted, or is waiting on the recipient's lock
+        self.held = [False]
+        self.second = None                      # the second push's thread
+        pm._kernel_post = self._fake_post
+        real_lock = self.saved[3]
+        if real_lock is not None:
+            def watched(sid, _real=real_lock):
+                if threading.current_thread() is self.second:
+                    self.progress.set()         # entering the lock: it blocks there until the first push is done
+                return _real(sid)
+            pm._push_lock = watched
+        pm.STREAKS.pop(self.to, None)
+
+    def tearDown(self):
+        if self._seam is not None:
+            os.environ["ROMP_SESSIONS_FILE"] = self._seam
+        pm._push_disabled, pm._log, pm._kernel_post = self.saved[:3]
+        if self.saved[3] is not None:
+            pm._push_lock = self.saved[3]
+        pm.STREAKS.pop(self.to, None)
+        self._drop_backend()
+
+    def _fake_post(self, path, body, timeout=2, no_answer=None):
+        """The kernel's /deliver: queue the banner on the real backend, then answer. The FIRST post (the big banner)
+        is queued and its answer withheld until the second push has made its move; the bus's wait then runs out
+        (`no_answer`), as it does against a slow kernel that has already queued the banner."""
+        self.assertEqual(path, "/deliver")
+        self.posts.append(sb.postal_mids(body["text"]))
+        injected = bool(self.be.deliver(body["id"], body["text"]))
+        if not self.held[0]:
+            self.held[0] = True
+            self.big_taken.set()
+            if not self.progress.wait(10):
+                raise AssertionError("the second push neither posted nor waited on the recipient's lock")
+            return no_answer
+        self.progress.set()                     # a post by the second push (before the fix, while the first waits)
+        return {"ok": True, "injected": injected}
+
+    def _copies(self, mids):
+        """How many queued banners carry each id in `mids`, as a set of counts."""
+        q = self.sess.pending()
+        return {sum(1 for t in q if ("<!-- romp-msg-id: %s -->" % m) in t) for m in mids}
+
+    def test_a_push_that_overlaps_a_big_banner_in_doubt_cannot_get_it_queued_twice(self):
+        agent = {"id": self.to, "state": "idle"}
+        big = [pm.deliver(self.to, "web", SENDER, "%s %d" % (self._BODY, i), kind="coordinate")
+               for i in range(self._BIG)]
+        first = threading.Thread(target=pm._push, args=(self.to, agent), daemon=True)
+        first.start()
+        self.assertTrue(self.big_taken.wait(10), "the first push never posted the big banner")
+        self.assertEqual([sorted(p) for p in self.posts], [sorted(big)], "the whole box went over as one banner, more ids than the cap")
+        late = pm.deliver(self.to, "web", SENDER, "a note sent while the big banner awaits its answer",
+                          kind="coordinate")
+        self.second = threading.Thread(target=pm._push, args=(self.to, agent), daemon=True)
+        self.second.start()
+        first.join(10)
+        self.second.join(10)
+        self.assertFalse(first.is_alive() or self.second.is_alive(), "a push never finished")
+        pm._push(self.to, agent)                # the retry pass: re-posts whatever is still in doubt
+        self.assertEqual(self._copies(big), {1},
+                         "every message of the big banner is queued once: before the fix the second push's banner "
+                         "trimmed the taken list back to the cap before the big banner's re-post arrived, and the "
+                         "re-post was queued whole a second time (posts: %r)" % ([len(p) for p in self.posts],))
+        self.assertEqual(self._copies([late]), {1})
+        self.assertEqual(pm._doubt_read(self.to), [], "nothing is left in doubt")
+        self.assertEqual(pm.read_box(self.to, consume=False), [])
+        self.assertEqual([len(p) for p in self.posts], [self._BIG, self._BIG, 1],
+                         "the big banner, its re-post settling the doubt, and only then the late note")
+        self.assertEqual(getattr(pm, "_PUSH_LOCKS", {}), {}, "no per-recipient lock outlives its pushes")
 
 
 if __name__ == "__main__":

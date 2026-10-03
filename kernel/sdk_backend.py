@@ -3501,7 +3501,8 @@ _POSTAL_MID_RE = getattr(_em, "POSTAL_RE", None) or re.compile(r"<!--\s*romp-msg
 
 # How many postal message ids a session remembers as TAKEN (SdkBackend.deliver), newest kept. The bus re-posts a chunk
 # whose /deliver it got no answer for within seconds to minutes, so a few hundred ids cover it with room to spare;
-# the list rides the session's registry, so it outlives a kernel restart (2026-09-29).
+# the list rides the session's registry, so it outlives a kernel restart (2026-09-29). One banner can carry more ids
+# than this (a chunk is bounded by bytes, not count), and the banner just taken is kept whole (_take_postal_locked).
 POSTAL_TAKEN_KEEP = 256
 
 
@@ -5763,8 +5764,9 @@ class SdkSession:
         # The postal message ids this session has TAKEN (SdkBackend.deliver queued a banner carrying them), newest last,
         # bounded at POSTAL_TAKEN_KEEP and mirrored to reg['postalTaken'], so a repeat of a banner (the bus re-posting a
         # /deliver it got no answer for) is recognised and not queued twice, across a kernel restart too (2026-09-29).
-        self._postal_taken: list = [m for m in (reg.get("postalTaken") or [])
-                                    if isinstance(m, str) and m][-POSTAL_TAKEN_KEEP:]
+        # Loaded as written: the one writer (_take_postal_locked) already bounds it, and keeps the last banner's ids
+        # whole even past the cap, so a cut here would forget part of a banner the bus may still re-post (2026-10-03).
+        self._postal_taken: list = [m for m in (reg.get("postalTaken") or []) if isinstance(m, str) and m]
         # The postal ids of a stranded banner this session is handing back to the bus RIGHT NOW (_return_stranded_mail):
         # id -> True once a re-post carrying it has been queued (enqueue_postal) while the banner was still in hand.
         # Memory only, and empty between hand-backs.
@@ -6045,9 +6047,20 @@ class SdkSession:
 
     def _take_postal_locked(self, mids) -> None:
         """Record `mids` as taken, newest last, bounded at POSTAL_TAKEN_KEEP. Under self._lock, in the same hold as the
-        queue entry that carries them; the caller's registry write is _persist_queue(taken=True)."""
-        self._postal_taken.extend(m for m in mids if m not in self._postal_taken)
-        del self._postal_taken[:-POSTAL_TAKEN_KEEP]
+        queue entry that carries them; the caller's registry write is _persist_queue(taken=True).
+
+        The ids just taken are kept WHOLE, the bound notwithstanding, and an id already on the list moves to the newest
+        end with them. The bus bounds a chunk by its bytes (_PUSH_MAX_BYTES), not by how many messages it carries, so a
+        recipient back from a long absence gets its whole parked box in one banner, and one banner can carry more ids
+        than the cap. A trim that cut the banner's own ids (or an older id it carried, sitting at the old end) made the
+        bus's re-post of that chunk read as new mail, and the banner was queued whole a second time (2026-10-03). The
+        list falls back to the cap when the next banner is taken."""
+        batch = list(dict.fromkeys(mids))
+        if not batch:
+            return
+        fresh = set(batch)
+        kept = [m for m in self._postal_taken if m not in fresh] + batch
+        self._postal_taken = kept[-max(POSTAL_TAKEN_KEEP, len(batch)):]
 
     def enqueue(self, text: str, qid: str | None = None, qts: int | None = None, paths: list | None = None):
         """Deliver a user turn (called from the kernel thread). Held in self._pending —
@@ -6634,7 +6647,7 @@ class SdkSession:
         2026-09-29); any other is re-headed whole under its own ids, which are taken again in the same hold, so a re-post
         that arrives after this is a repeat and is not queued. A re-post carrying only some of a banner's ids does not
         stand for the rest: the banner cannot be split, and a message twice beats one never. One log line per banner."""
-        texts, lines = [], []
+        texts, lines, taken = [], [], []
         with self._lock:
             for text, mids, why in rehead:
                 reposted = [m for m in mids if self._postal_inhand.pop(m, False)]
@@ -6644,7 +6657,7 @@ class SdkSession:
                                   "one copy" % (self.name, why, ", ".join(mids)), False))
                     continue
                 texts.append(text)
-                self._take_postal_locked(mids)           # queued again: taken mail, in the hold that queues it
+                taken.extend(mids)                       # taken again below, with the banners it is re-headed beside
                 lines.append(("stranded mail (%s): a banner fed to the abandoned client never resulted, and %s; "
                               "re-heading it (%s) so the new client is fed it%s"
                               % (self.name, why, ", ".join(mids),
@@ -6653,6 +6666,8 @@ class SdkSession:
                               True))
             if texts:
                 self._q_prepend(texts, self._unfeed_locked(texts))   # back at the head under their own ids
+                self._take_postal_locked(taken)   # queued again: taken mail, in the hold that queues it, as ONE
+                #                                    batch so the trim cuts none of them
             for m in handed:
                 self._postal_inhand.pop(m, None)         # the hand-back is over, taken back or re-headed
         if texts:
