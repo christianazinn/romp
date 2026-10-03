@@ -6477,6 +6477,7 @@ class SdkSession:
         elif seen:
             self.backend._log("sdk %s: the CLI exited after taking the last fed text; nothing to re-feed"
                               % self.sid[:8])
+            self.backend._report_postal_take(self.sid, postal_mids(u.get("text") or ""), "landed before the CLI exited")
         else:
             self.backend._log("sdk %s: the CLI exited while it held a fed text and the transcript could not "
                               "be read (%s): the text's echo is flagged, not re-fed on doubt"
@@ -6597,6 +6598,7 @@ class SdkSession:
                     self.backend._log("stranded mail (%s): a banner fed to the abandoned client landed in the "
                                       "transcript before the teardown; the resumed conversation carries it, not handed "
                                       "back (%s)" % (self.name, ", ".join(mids)))
+                    self.backend._report_postal_take(self.sid, mids, "landed before the teardown")
                     continue
                 back, why, held_by_bus = None, "no bus hook is installed", set()
                 if callable(hook):
@@ -8752,6 +8754,8 @@ class SdkSession:
             # result frame is read against the state the text was fed into.
             _took = self._untaken
             self._untaken = None
+            # a postal banner the CLI has now taken: the model has the mail, and the sender's read stamp is due (2026-10-03)
+            self.backend._report_postal_take(self.sid, postal_mids((_took or {}).get("text") or ""), "taken")
             # a /clear the CLI has now TAKEN: record its echo's identity so it retires on THIS copy's own
             # boundary (the flip it causes, or its own turn's settle), never by text and never before the CLI
             # takes it (a still-queued or fed-but-untaken /clear is left owed, so an unplanned death flags it).
@@ -11018,6 +11022,11 @@ class SdkBackend:
         #                                    raises when the bus could not be asked. Consulted ONLY by a resumable
         #                                    reconnect that stranded a fed postal banner (_return_stranded_mail,
         #                                    2026-09-12); None (a stand-in, an older kernel) → the banner is re-headed
+        self.postal_taken = None           # kernel-installed: (sid, [mid, ...]) -> None, telling the bus the CLI TOOK a banner
+        #                                    carrying those ids, so it writes the sender's read stamp now (kernel.
+        #                                    _bus_report_take → the bus's POST /seen, 2026-10-03); raises when the bus could not
+        #                                    be told. None (a stand-in, an older kernel) → /deliver does not promise takes
+        #                                    (reports_postal_takes), so the bus stamps at its answer as before
         self._notify = notify              # notify(app, msg) -> push to clients (kernel._send_to_app)
         self._poke_cb = poke               # wake the kernel's producer/judges (optional)
         self._owns_memo: dict = {}         # sid -> ((reg mtime_ns, size), owns?) — see owns()
@@ -15510,6 +15519,29 @@ class SdkBackend:
         True only once the CLI parents mid-turn breadcrumbs at the turn's tail AND that refresh waits out
         inflight>0 (review of PR #923, 2026-09-04; verified against the installed binary, not the docs)."""
         return False
+
+    def reports_postal_takes(self, sid: str) -> bool:
+        """True when the kernel installed the take reporter (postal_taken): every banner this backend queues is reported
+        to the bus at the CLI's take (_report_postal_take), so the bus holds the read stamp until then (2026-10-03)."""
+        return callable(getattr(self, "postal_taken", None))
+
+    def _report_postal_take(self, sid: str, mids, why: str) -> None:
+        """Tell the bus that `sid`'s CLI has TAKEN the banner carrying `mids` (`why` names the event, for the log): the
+        bus writes the read stamp the sender's receipt reads (its /seen). Off-thread, since the take is seen on the
+        session's event loop and the bus answers over a socket; a report that fails is logged, and the next take
+        settles it (the bus stamps every id queued before a reported one). Never raises."""
+        hook = getattr(self, "postal_taken", None)
+        mids = [m for m in (mids or []) if isinstance(m, str) and m]
+        if not (callable(hook) and mids):
+            return
+
+        def run():
+            try:
+                hook(sid, list(mids))
+            except Exception as e:
+                self._log("postal take (%s): the bus could not be told the CLI took %s (%s, %r); the read stamp waits "
+                          "for the next take" % (sid[:8], ", ".join(mids), why, e), problem=True)
+        threading.Thread(target=run, name="postal-take", daemon=True).start()
 
     def busy(self, sid: str) -> "bool | None":
         """Authoritative in-flight signal (see SessionBackend.busy): a turn is running (inflight>0) OR one is

@@ -220,7 +220,7 @@ class SlowKernelDoesNotRedeliver(_SdkWorld, unittest.TestCase):
                          "drain or retry claimed it again")
         self.assertEqual(pm._drain(self.to)["messages"], [],
                          "the session's Stop-hook drain does not feed it a second time")
-        self.assertEqual(_timeline(mid), ["sent", "exec"], "no unexec row: the claim is not rolled back")
+        self.assertEqual(_timeline(mid), ["sent"], "no unexec row: the claim is not rolled back; no exec row: not read until the take (2026-10-03)")
         self.assertTrue((pm.MAILROOT / self.to / "cur" / mid).is_file())
         self.assertTrue(any("no answer" in ln and self.to in ln for ln in self.logged),
                         "the log names the missing answer, never 'kernel unreachable': %r" % (self.logged,))
@@ -292,7 +292,7 @@ class InDoubtResolution(unittest.TestCase):
         self._answer(pm.NO_ANSWER)
         self.assertFalse(pm._push(self.SID, {"id": self.SID, "state": "idle"}))
         self.assertEqual(pm._doubt_read(self.SID), [[self.mid]])
-        self.assertEqual(_timeline(self.mid), ["sent", "exec"])
+        self.assertEqual(_timeline(self.mid), ["sent"])
 
     def test_a_refused_connect_on_the_re_post_keeps_holding_it(self):
         # the first post may have landed; a kernel that is down now (mid-restart) says nothing about it
@@ -300,7 +300,7 @@ class InDoubtResolution(unittest.TestCase):
         self.assertFalse(pm._push(self.SID, {"id": self.SID, "state": "idle"}))
         self.assertEqual(pm._doubt_read(self.SID), [[self.mid]])
         self.assertEqual(pm.read_box(self.SID, consume=False), [], "never put back while the outcome is unknown")
-        self.assertEqual(_timeline(self.mid), ["sent", "exec"])
+        self.assertEqual(_timeline(self.mid), ["sent"])
 
     def test_an_answer_that_it_was_taken_retires_it(self):
         self._answer({"ok": True, "injected": True})
@@ -315,7 +315,7 @@ class InDoubtResolution(unittest.TestCase):
         self.assertEqual(pm._doubt_read(self.SID), [])
         self.assertEqual([m["id"] for m in pm.read_box(self.SID, consume=False)], [self.mid],
                          "an ANSWERED not-taken is the old roll-back: back in new/ under its own id")
-        self.assertEqual(_timeline(self.mid), ["sent", "exec", "unexec"])
+        self.assertEqual(_timeline(self.mid), ["sent", "unexec"])
 
     def test_a_message_restored_meanwhile_leaves_the_record(self):
         # the kernel handed it back (a teardown stranded the banner): restore() moves it to new/ and the doubt drops it
@@ -336,7 +336,7 @@ class InDoubtResolution(unittest.TestCase):
         finally:
             pm._doubt_add = saved
         self.assertEqual([m["id"] for m in pm.read_box(self.SID, consume=False)], [mid])
-        self.assertEqual(_timeline(mid), ["sent", "exec", "unexec"])
+        self.assertEqual(_timeline(mid), ["sent", "unexec"])
         self.assertTrue(any("could not be written" in ln for ln in self.logged), self.logged)
 
     def test_the_record_survives_a_bus_restart(self):
@@ -428,8 +428,8 @@ class InDoubtRecipientGone(_PrivateMaildir, unittest.TestCase):
         self.assertEqual(self._in_new(), [self.mid],
                          "back in new/ under its own id: before the fix it stayed claimed in cur/ for good")
         self.assertEqual(pm._doubt_read(self.SID), [], "the record is gone")
-        self.assertEqual(_timeline(self.mid), ["sent", "exec", "unexec"],
-                         "the exec row is retracted, so the sender's receipt reads pending, not read")
+        self.assertEqual(_timeline(self.mid), ["sent", "unexec"],
+                         "put back with an unexec row (the push claims without a read stamp since 2026-10-03), so the receipt reads pending")
         self.assertTrue(any("released" in ln and self.SID in ln and "no longer carries" in ln for ln in self.logged),
                         "said in the log, with the reason: %r" % (self.logged,))
         self.assertEqual(self._posted_to(self.SID), [], "nothing posted to a recipient that is not live")
@@ -614,7 +614,7 @@ class InDoubtRecipientGone(_PrivateMaildir, unittest.TestCase):
         pm._retry_pending()
         self.assertEqual(self._in_new(), [self.mid], "back in new/, where the drain reads")
         self.assertEqual(pm._doubt_read(self.SID), [])
-        self.assertEqual(_timeline(self.mid), ["sent", "exec", "unexec"])
+        self.assertEqual(_timeline(self.mid), ["sent", "unexec"])
         self.assertEqual(self.posted, [], "no push while it is switched off")
         self.assertTrue(any("released" in ln and "switched off" in ln for ln in self.logged), self.logged)
         self.assertEqual(pm._drain(self.SID)["messages"][0]["id"], self.mid, "the drain gets it")

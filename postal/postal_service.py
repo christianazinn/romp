@@ -79,7 +79,9 @@ MAILHELD = STATE / "mail-held"         # <sid>: one message id per line, claimed
 MAILDOUBT = STATE / "mail-in-doubt"   # <sid>: one /deliver chunk per line (its message ids), claimed into cur/ and POSTed, with no
 #                                        answer from the kernel in time: it may well have been queued, so it is neither put back
 #                                        nor retired; the retry pass re-posts the same chunk until the kernel answers (2026-09-29)
-WARNED = STATE / "warned-undelivered"  # marker per msg-id we've already warned a sender is STILL UNDELIVERED (one-time)
+MAILAWAIT = STATE / "mail-await-take"  # <sid>: one message id per line, oldest first: mail the live push handed to a kernel that
+#                                        reports the CLI's TAKE, whose read stamp waits for that report (_stamp_read, 2026-10-03)
+WARNED =STATE / "warned-undelivered"  # marker per msg-id we've already warned a sender is STILL UNDELIVERED (one-time)
 LOG = STATE / "server.log"
 PIDFILE = STATE / "server.pid"
 PORTFILE = STATE / "postal-port"        # {"port", "pid"}: the port this bus BOUND, written after the bind and removed on a clean
@@ -926,9 +928,15 @@ def _say_inbox_unreadable_once(sid, why):
         _log("%s; skipped until it can be listed" % why)
 
 
-def read_box(sid, consume):
+def read_box(sid, consume, stamp=True):
     """The unread mail of `sid`'s box, oldest first (consume: claimed into cur/). Raises InboxUnreadable when new/ exists
-    and cannot be listed; the callers answer the fault (never an empty inbox, which the client would read as no mail)."""
+    and cannot be listed; the callers answer the fault (never an empty inbox, which the client would read as no mail).
+
+    `stamp` (with consume): write the read stamp (_stamp_row) at the claim. True for the callers that hand the mail
+    straight to the model: the session's own inbox read and its turn-end drain. The live push passes False (2026-10-03):
+    its claim only hands the banner to the kernel, which queues it behind whatever the session already holds, and a
+    session in a long tool call or behind a queue of earlier texts reads it minutes to hours later, while the sender's
+    receipt already said "read". The push stamps when the kernel reports the CLI took the banner (_stamp_read)."""
     if not _safe_id(sid):            # reject traversal in the id from /inbox, /drain
         return []
     if _postal_off(sid):             # isolated: hold mail — don't deliver while the mailbox is off (it waits in new/)
@@ -970,14 +978,21 @@ def read_box(sid, consume):
                 # so no exec row and no entry; the rest of the box is served (an unguarded rename
                 # here raised out of the whole read, and /inbox and /drain answered nothing).
                 continue
-            _tl_append("messages.jsonl", {"t": int(time.time()), "ev": "exec", "id": f.name})
-            _queue_read_receipt(meta, dmid=f.name)   # cross-host mail: the sender's host learns it was read
-            #   dmid = THIS host's delivery mid — the id the recipient's transcript markers carry, so the
-            #   sender's timeline can join the connector to the true process turn (the user 2026-08-06)
+            if stamp:
+                _stamp_row(meta, f.name)
         out.append(_mail_row(meta, body, f.name))
     if consume:
         _mark_pending(sid)         # cleared the box -> drop the marker (no-op if more arrived)
     return out
+
+
+def _stamp_row(meta, mid):
+    """The read stamp for one message: its exec row (every receipt reader's "read"), and for mail that came over the
+    peer bus the read receipt queued back to the sender's host. `meta` is the message file's headers."""
+    _tl_append("messages.jsonl", {"t": int(time.time()), "ev": "exec", "id": mid})
+    _queue_read_receipt(meta, dmid=mid)   # cross-host mail: the sender's host learns it was read
+    #   dmid = THIS host's delivery mid — the id the recipient's transcript markers carry, so the
+    #   sender's timeline can join the connector to the true process turn (the user 2026-08-06)
 
 
 def _mail_parts(text):
@@ -1050,6 +1065,7 @@ def restore(sid, mid):
     _queue_read_receipt(meta, unread=True)   # cross-host: retract the read the claim implied
     _mark_pending(sid)                   # new/ is non-empty again -> raise the marker
     _doubt_forget(sid, mid)              # back in new/: no longer a claim whose delivery is in doubt
+    _await_forget(sid, mid)              # ...nor one whose read stamp waits for the CLI's take
     return RESTORED
 
 def restore_stranded(data):
@@ -1223,6 +1239,8 @@ def format_receipts(recs):
                 st = "parked for %s · id %s" % (r["parked"], r.get("id", "?"))
         elif r.get("relayed"):                 # landed on the peer host; its read receipt hasn't come back
             st = "delivered %s (not read yet) · id %s" % (_hhmm_epoch(r["relayed"]), r.get("id", "?"))
+        elif r.get("queued"):                  # handed to the session, which has not taken it yet (_stamp_read)
+            st = "waiting in the session's queue (not read yet) · id %s" % r.get("id", "?")
         else:                                  # still unread -> recallable; show the id to target it
             st = "pending (not read yet) · id %s" % r.get("id", "?")
         out.append("  → %-18s sent %s · %s%s" % (r.get("to", "?"), _hhmm_epoch(r["sent"]), st,
@@ -2130,7 +2148,8 @@ def _relay_marker_sent_row(from_id, marker):
 def _sent_receipts(mid):
     """[{to, id, sent, exec, recalled}] for messages SENT by `mid`, joined by id,
     oldest first. exec is None until the recipient reads it; recalled is set if the
-    sender later unsent it (so it shows 'recalled', not a permanent 'pending')."""
+    sender later unsent it (so it shows 'recalled', not a permanent 'pending'); queued (additive)
+    when the live push handed it to the session and its take is not yet reported (_stamp_read)."""
     log = TLDIR / "messages.jsonl"
     if not mid or not log.exists():
         return []
@@ -2169,11 +2188,23 @@ def _sent_receipts(mid):
             listing.append(local_agents(threads=True))
         return _name_for_id(sid, rows=listing[0])
 
+    waiting = {}                                 # recipient sid -> the ids its await-take record holds, read at first need
+
+    def _queued(i, e):
+        tid = e.get("to_id", "")
+        if execs.get(i) or not _safe_id(tid):
+            return False
+        if tid not in waiting:
+            waiting[tid] = set(_await_read(tid))
+        return i in waiting[tid]
+
     def _row(i, e):
         h, rec = _parked(i, e)
         r = {"to": e.get("toName") or _name(e.get("to_id", "")), "id": i, "sent": e["t"],
              "exec": execs.get(i), "recalled": recalls.get(i),
              "relayed": relays.get(i), "bounced": bounced.get(i), "parked": h}
+        if _queued(i, e):
+            r["queued"] = True                       # additive: handed to the session, its take not yet reported
         if e.get("relayed"):
             r["onBehalf"] = True                     # romp sent it on this session's behalf (T334): the receipt says so
         if r["bounced"]:
@@ -2193,7 +2224,8 @@ def _sent_receipts(mid):
     out = [_row(i, e) for i, e in sent.items()]
     return sorted(out, key=lambda r: r["sent"])
 
-def _drain(sid):
+def _drain(sid, stamp=True):
+    # `stamp`: read_box's (the live push passes False and stamps at the CLI's take, _stamp_read).
     # Loop guard: cap rapid auto-deliveries so two chatty agents can't volley
     # forever. Over the cap -> pause (don't consume); after a quiet window the
     # streak resets and delivery resumes.
@@ -2208,7 +2240,7 @@ def _drain(sid):
             if count > MAX:
                 return {"messages": [], "paused": True}
             STREAKS[sid] = (count, now)
-            return {"messages": read_box(sid, consume=True), "paused": False}
+            return {"messages": read_box(sid, consume=True, stamp=stamp), "paused": False}
         except InboxUnreadable as e:
             # the box cannot be listed: a fault the caller can show (the /drain handler answers 503 with it, the push
             # skips the box with one line), never an empty drain
@@ -2567,7 +2599,8 @@ def _bounce_oversize(sid, m, reply_tool=False):
             _say_refused_once("oversize bounce", "the note for %s" % mid, e)
             return
         _refusal_over("oversize bounce")
-        # The drain's claim stamped an exec row ("the recipient read it"); the message was returned, not
+        # The push's claim writes no exec row any more (its stamp waits for the take, _stamp_read), but a row
+        # written by an older bus for this claim would say "the recipient read it"; the message was returned, not
         # read. Retract it the way restore() does, so the sender's receipt (check_sent, `romp mail sent`)
         # reads bounced and not read: every ledger reader drops an exec a later unexec retracts. Here,
         # after the note has landed, so the refused arm above (restore writes its own unexec) never doubles it.
@@ -2596,6 +2629,7 @@ def _put_back(sid, msgs):
     read is held for the retry loop. Returns how many were held that way."""
     unknown = 0
     for m in msgs:
+        _await_forget(sid, m.get("id", ""))          # not handed over after all: no take will come for this id
         r = restore(sid, m.get("id", ""))
         if r == RESTORE_MISSING:                     # gone from cur/: a re-send is the only way to keep the mail
             deliver(sid, m.get("from", "?"), m.get("from_id", ""), m.get("body", ""),
@@ -2610,7 +2644,7 @@ def _put_back(sid, msgs):
 # ── in-doubt chunks (2026-09-29) ──
 # A /deliver that was SENT and got no answer within DELIVER_TIMEOUT has an unknown outcome: the kernel finishes a
 # request after the bus stops waiting, so a slow kernel usually HAS queued the banner. The chunk's message ids are
-# recorded here (one line per chunk, oldest first) and the mail stays claimed in cur/ with its exec row; the next
+# recorded here (one line per chunk, oldest first) and the mail stays claimed in cur/ (its read stamp still waiting); the next
 # _push for that recipient (the retry pass's, every RETRY_INTERVAL) re-posts the SAME chunk before it claims anything
 # new, and the kernel recognises a repeat by message id (SdkBackend.deliver). An answer settles it: taken retires the
 # record, an answered not-taken or a refusal puts the mail back for the drain (the old roll-back). A connect that is
@@ -2786,6 +2820,17 @@ def _resolve_in_doubt(sid, agent):
             _doubt_drop(sid, mids)
             if resp.get("injected"):
                 landed += len(msgs)
+                ids = [m["id"] for m in msgs]
+                # An id still recorded waits for the take, which a kernel that reports takes will report. One no longer
+                # recorded was either never recorded (nothing will report it: stamped at the answer, as before) or
+                # already READ: the kernel had queued the chunk despite the late answer, the CLI took it, and the take
+                # was reported before this re-post, which the kernel then answered as a repeat. That one is not stamped
+                # again: a second exec row would move the sender's "read" time to now and send a second receipt.
+                waiting = set(_await_read(sid)) if resp.get("reportsTake") else set()
+                due = [m for m in ids if m not in waiting]
+                if due:
+                    read = _read_already(due)
+                    _stamp_read(sid, [m for m in due if m not in read])
                 _log("push to %s: the kernel answered for %d msg(s) held in doubt: taken" % (sid, len(msgs)))
                 continue
             cause = ("kernel answered HTTP %s" % resp["status"]) if resp.get("status") else "not injected"
@@ -2868,6 +2913,155 @@ def _doubt_gone_why(sid, answered):
     return ""
 
 
+# ── read stamps that wait for the CLI's take (2026-10-03) ──
+# The live push claims mail (new/ -> cur/) and hands the banner to the kernel, which QUEUES it: an SDK session feeds it
+# to the CLI one text at a time, and the CLI reads a text fed mid-turn only at its next tool boundary. A session in a
+# long shell command, or behind a queue of earlier texts, reads the banner minutes to hours after the claim, and the
+# claim used to write the read stamp, so the sender's receipt said "read" all that time (a session that read its mail
+# almost four hours after the stamp). Now a kernel that reports takes answers /deliver with reportsTake, the push
+# records the banner's ids here, oldest first, and stamps nothing; the kernel's report (POST /seen, taken_report)
+# writes the stamp at the moment the CLI took the text. A kernel or backend that does not report takes (an older
+# kernel, a Codex session, a wake forwarded to another host) is stamped when it answers, as before.
+# The CLI takes its queue in order, so a report for one id also stamps every id recorded before it: a take the kernel
+# could not see (a kernel restarted while a host-kept CLI held the banner, a report that never arrived) is settled by
+# the next one. An id leaves the record when it is stamped or put back (restore, _hold_claim).
+_AWAIT_LOCK = threading.Lock()   # every read-modify-write of a record
+_AWAIT_FAULT_SAID = set()        # sids whose record could not be read, said once per spell
+
+
+def _await_read(sid):
+    """The ids recorded for `sid` as waiting for the take, oldest first ([] when none or unreadable, said once)."""
+    if not _safe_id(sid):
+        return []
+    try:
+        text = (MAILAWAIT / sid).read_text()
+    except FileNotFoundError:
+        _AWAIT_FAULT_SAID.discard(sid)
+        return []
+    except OSError as e:
+        if sid not in _AWAIT_FAULT_SAID:
+            _AWAIT_FAULT_SAID.add(sid)
+            _log("await-take record for %s cannot be read (%s); its claims stay unstamped until it reads"
+                 % (sid, type(e).__name__))
+        return []
+    _AWAIT_FAULT_SAID.discard(sid)
+    return [x for x in text.split() if _safe_id(x)]
+
+
+def _await_write_locked(sid, mids):
+    """Replace `sid`'s record with `mids` (atomic rename; empty removes it). Under _AWAIT_LOCK. True iff it landed."""
+    p = MAILAWAIT / sid
+    try:
+        if not mids:
+            try:
+                p.unlink()
+            except FileNotFoundError:
+                pass
+            return True
+        MAILAWAIT.mkdir(parents=True, exist_ok=True)
+        tmp = MAILAWAIT / (".%s.tmp" % sid)          # a leading dot: never read back as a sid (_safe_id refuses it)
+        tmp.write_text("".join(m + "\n" for m in mids))
+        os.replace(tmp, p)
+        return True
+    except OSError as e:
+        _log("await-take record for %s could not be written (%s)" % (sid, e))
+        return False
+
+
+def _await_add(sid, mids):
+    """Record `mids` as waiting for the CLI's take, after anything recorded already. False when the record could not be
+    written: no report could find them, so the caller stamps at the kernel's answer instead (the old stamp)."""
+    mids = [m for m in mids if _safe_id(m)]
+    if not (_safe_id(sid) and mids):
+        return False
+    with _AWAIT_LOCK:
+        have = _await_read(sid)
+        return _await_write_locked(sid, have + [m for m in mids if m not in have])
+
+
+def _await_forget(sid, mid):
+    """`mid` was put back or held (restore, _hold_claim): it no longer waits for a take."""
+    if not (_safe_id(sid) and (MAILAWAIT / sid).exists()):
+        return
+    with _AWAIT_LOCK:
+        have = _await_read(sid)
+        if mid in have:
+            _await_write_locked(sid, [m for m in have if m != mid])
+
+
+def _read_already(mids):
+    """The ids among `mids` whose receipt reads "read" now: the ledger's last exec or unexec row for the id is an exec,
+    the same fold _sent_receipts makes. Read only on the in-doubt answer, a rare path. An unreadable ledger reads as
+    none read (the stamp is then written, a message stamped twice beating one never)."""
+    want, state = set(mids), {}
+    try:
+        with open(TLDIR / "messages.jsonl", errors="replace") as f:
+            for line in f:
+                if '"exec"' not in line and '"unexec"' not in line:
+                    continue
+                try:
+                    e = json.loads(line)
+                except ValueError:
+                    continue
+                i = e.get("id")
+                if i in want and e.get("ev") in ("exec", "unexec"):
+                    state[i] = e.get("ev") == "exec"
+    except OSError:
+        return set()
+    return {i for i, read in state.items() if read}
+
+
+def _stamp_read(sid, mids):
+    """Write the read stamp (_stamp_row) for each of `mids` still claimed in `sid`'s cur/, and drop them from the
+    await-take record. Returns the ids stamped. A message gone from cur/ (recalled, put back) is not stamped."""
+    stamped = []
+    with _AWAIT_LOCK:
+        for mid in mids:
+            if not (_safe_id(sid) and _safe_id(mid)):
+                continue
+            try:
+                head = (MAILROOT / sid / "cur" / mid).read_text(errors="replace").partition("\n\n")[0]
+            except FileNotFoundError:
+                continue
+            except OSError:
+                head = ""                            # claimed, its headers unreadable: stamped, no cross-host receipt
+            meta = {}
+            for ln in head.splitlines():
+                k, _, v = ln.partition(": ")
+                meta[k.lower()] = v
+            _stamp_row(meta, mid)
+            stamped.append(mid)
+        have = _await_read(sid)
+        if have:
+            kept = [m for m in have if m not in mids]
+            if kept != have:
+                _await_write_locked(sid, kept)
+    return stamped
+
+
+def taken_report(data):
+    """POST /seen {id, mids} — the kernel reporting that `id`'s CLI has TAKEN a banner carrying `mids` (the model has
+    it now): write the read stamp for each of them still waiting, and for every id recorded before the last of them
+    (the CLI takes its queue in order, so those were taken too, their own report missed). Ids not waiting (stamped
+    already, or never deferred) are left alone. Answers {ok, stamped: [...]}; 400 for a malformed ask."""
+    sid = str(data.get("id") or "")
+    mids = data.get("mids")
+    if not sid or not _safe_id(sid) or not isinstance(mids, list) or not mids \
+            or not all(isinstance(m, str) and m for m in mids):
+        return {"ok": False, "error": "id and a list of message ids required"}, 400
+    have = _await_read(sid)
+    last = max((have.index(m) for m in mids if m in have), default=-1)
+    if last < 0:
+        return {"ok": True, "stamped": []}, 200
+    due = have[:last + 1]
+    stamped = _stamp_read(sid, due)
+    earlier = [m for m in stamped if m not in mids]
+    if earlier:
+        _log("read stamp for %s: the CLI took %s, so %d message(s) queued before it were taken too and are stamped "
+             "read now (their own take was not reported): %s" % (sid, ", ".join(mids), len(earlier), ", ".join(earlier)))
+    return {"ok": True, "stamped": stamped}, 200
+
+
 def _push(sid, agent):
     """Live-deliver pending mail to a session by WAKING it through the kernel (POST /deliver) — the kernel
     enqueues the banner as the session's next turn. Coarse-skip a clearly not-ready local session (not
@@ -2906,7 +3100,7 @@ def _push(sid, agent):
             proceed, relanded = _resolve_in_doubt(sid, agent)
             if not proceed:
                 return False                                      # a chunk still in doubt, or just refused: claim nothing on top
-            res = _drain(sid)                                     # claim mail (guarded + consuming)
+            res = _drain(sid, stamp=False)                        # claim mail (guarded + consuming); read stamp at the take
             if res.get("unreadable"):
                 _say_inbox_unreadable_once(sid, res["unreadable"])   # the box cannot be listed: skipped, said once, retried next pass
                 return False
@@ -2919,10 +3113,15 @@ def _push(sid, agent):
                 _bounce_oversize(sid, m, reply_tool)
             landed, held, cause, doubt, unanswered = 0, [], "", [], False
             for i, chunk in enumerate(chunks):
+                ids = [m.get("id", "") for m in chunk if _safe_id(m.get("id", ""))]
+                # recorded BEFORE the post: the CLI can take the banner, and the kernel report it, before the answer is back
+                awaited = _await_add(sid, ids)
                 resp = _kernel_post("/deliver", {"id": sid, "text": format_push(chunk, reply_tool)},
                                     timeout=DELIVER_TIMEOUT, no_answer=NO_ANSWER)
                 if resp and resp.get("injected"):
                     landed += len(chunk)
+                    if not (awaited and resp.get("reportsTake")):
+                        _stamp_read(sid, ids)                     # nothing will report the take: stamped at the answer, as before
                     continue
                 if resp is NO_ANSWER:
                     # SENT, and no answer in time: the kernel may well have queued it (a slow kernel finishes the
@@ -3445,6 +3644,9 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/restore":                   # the kernel handing back fed-and-lost mail by id (restore_stranded)
             payload, status = restore_stranded(data)
             return self._send(payload, status)
+        if u.path == "/seen":                      # the kernel reporting the CLI TOOK a banner: the read stamp (taken_report)
+            payload, status = taken_report(data)
+            return self._send(payload, status)
         self._send({"error": "not found"}, 404)
 
 def _token_mark():
@@ -3613,6 +3815,7 @@ def _hold_claim(sid, mid):
                 f.write(mid + "\n")
     except OSError as e:
         _log("held claim %s for %s: the marker could not be written (%s); the claim stands in cur/ unrecorded" % (mid, sid, e))
+    _await_forget(sid, mid)              # the retry loop puts it back; a take report no longer stamps it
     _tl_append("messages.jsonl", {"t": int(time.time()), "ev": "unexec", "id": mid})
 
 
