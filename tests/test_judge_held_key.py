@@ -275,9 +275,10 @@ class TheSourceTheJudgesUse(unittest.TestCase):
             self.assertEqual(cred.helper_ttl_if_set(), 900.0)
 
     def test_the_judges_holder_reads_the_users_helper_into_the_key_variable(self):
+        # by name, not identity: another test module may re-execute the credentials module into the same object
         self.assertEqual(jd._KEY_SOURCE.env_name, "ANTHROPIC_API_KEY")
-        self.assertIs(jd._KEY_SOURCE.command_fn, cred.child_key_helper)
-        self.assertIs(jd._KEY_SOURCE.max_age_fn, cred.helper_ttl_if_set)
+        self.assertEqual(jd._KEY_SOURCE.command_fn.__name__, "child_key_helper")
+        self.assertEqual(jd._KEY_SOURCE.max_age_fn.__name__, "helper_ttl_if_set")
 
 
 class JudgeSpawnsShareTheHeldKey(unittest.TestCase):
