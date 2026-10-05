@@ -3518,6 +3518,21 @@ def postal_mids(text) -> list[str]:
     return out
 
 
+# Peer mail queued behind a running turn is fed as ONE text (SdkSession._join_queued_mail_locked, 2026-10-05): the
+# banners at the head of the queue, back to back, joined by a blank line. The joined text is bounded by the size the
+# bus already allows ONE banner (postal_service._PUSH_MAX_BYTES), so it is never larger than a banner can be; a banner
+# past the bound waits at the head for the next step.
+MAIL_JOIN_MAX_BYTES = 900 * 1024
+MAIL_JOIN_SEP = "\n\n"
+
+
+def _is_mail_copy(text, meta) -> bool:
+    """Is this queued copy a bus banner? It carries postal markers (postal_mids) and no echo id: SdkBackend.deliver
+    queues mail id-less (enqueue_postal), while a send the person typed carries its echo's id, so a typed message that
+    merely quotes a marker is never taken for mail."""
+    return isinstance(text, str) and not (isinstance(meta, dict) and meta.get("qid")) and bool(postal_mids(text))
+
+
 # A CLI that cannot even START says so on the way out — and the ONE cause that reliably does this is the
 # account being out of usage: `claude` refuses the handshake and exits with the limit in its own words
 # ("You've hit your session limit · resets 1:10pm (America/Los_Angeles)"). romp used to swallow that
@@ -5923,6 +5938,39 @@ class SdkSession:
         if loop is not None and wake is not None:
             loop.call_soon_threadsafe(wake.set)
 
+    def _join_queued_mail_locked(self, text, meta):
+        """The text to feed for the head copy just popped (`text`, `meta`): itself, or, when it is a bus banner, itself
+        joined with every banner queued directly behind it, which leave the queue in the same hold (under self._lock).
+
+        The feeder hands the CLI one text and holds the next until the CLI takes it (_untaken), and the CLI takes a text
+        sent mid-turn only at a tool boundary, so N banners queued during a long turn took N tool steps to arrive and a
+        busy session read its mail many minutes late (2026-10-05). A bus banner already carries several messages when the
+        bus has several ready (postal_service.format_push), so banners queued back to back are fed as one, a blank line
+        between them, and the session reads all of them at its next step. The joined text carries every banner's
+        `romp-msg-id` markers, and every id reading downstream works from the fed text: the take report
+        (_report_postal_take at the take), the stranded hand-back (_return_stranded_mail) and its re-head
+        (_settle_handback), which re-heads the joined text whole under all of its ids. Mail has no echo id, so no fed
+        ledger entry is owed for the banners joined in.
+
+        Only adjacent banners at the head are joined: a mail banner is never joined with a text that is not one (a typed
+        send, a notice), nothing is reordered, and queued sends stay one message each (test_queued_sends_not_fused). The
+        join stops before the joined text would pass MAIL_JOIN_MAX_BYTES; the rest wait at the head."""
+        if not _is_mail_copy(text, meta):
+            return text
+        parts, size = [text], len(text.encode("utf-8", "replace"))
+        while self._pending:
+            nxt = self._pending[0]
+            nmeta = self._pending_meta[0] if self._pending_meta else None
+            if not _is_mail_copy(nxt, nmeta):
+                break
+            add = len(MAIL_JOIN_SEP) + len(nxt.encode("utf-8", "replace"))
+            if size + add > MAIL_JOIN_MAX_BYTES:
+                break
+            self._q_pop(0)
+            parts.append(nxt)
+            size += add
+        return MAIL_JOIN_SEP.join(parts)
+
     def _pop_for_feed_locked(self, idx: int = 0):
         """The copy at `idx` (the feed slot, the head) leaves for the CLI (the input generator, under
         self._lock): its identity moves to the fed ledger, where the landing is paired with it. Returns (text, meta)."""
@@ -7552,6 +7600,10 @@ class SdkSession:
                     blocked = blocked or (self.inflight == 0 and self.backend.drain_holding())
                     fi = 0 if (self._pending and not blocked) else -1
                     item, _meta = self._pop_for_feed_locked(fi) if fi >= 0 else (None, None)
+                    if item is not None:
+                        # peer mail queued back to back goes in as ONE text, so the session reads all of it at its
+                        # next step rather than one banner per tool step (_join_queued_mail_locked, 2026-10-05)
+                        item = self._join_queued_mail_locked(item, _meta)
                     # starting from idle, not mid-turn. inflight counts the CLI's own turns too (a turn frame
                     # at inflight 0 raises it, _on_message), so a text fed while the CLI runs a turn romp did
                     # not feed (the drain of a mid-turn text, a notification-started turn) is mid-turn here
