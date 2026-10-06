@@ -18829,7 +18829,7 @@ def _comments_frame(sid, live_map=None):
                 # LOST — a reconnect with it in flight; the popover shows "never delivered") owes nothing.
                 user_atoms = _echo_landing_atoms(turns, live)          # (stamp, its texts) from the oldest echo's send up, built once
                 def _landed(e):
-                    keys = set(sb.echo_keys(e.get("_echo_text")))     # the plain key and, for a slash send, its words
+                    keys = set(sb.echo_lookup_keys(e))     # the plain key, for a slash send its words, for a joined part the joined text's
                     since = float(e.get("t") or 0)                     # the send's own stamp: the record the CLI writes for
                     return any(t >= since and not keys.isdisjoint(texts) for t, texts in user_atoms)   # it is at or after it
                 floor = _human_turn_floor({"turns": turns}) if turns else 0
@@ -40193,6 +40193,13 @@ def _echo_landed_in(text, tx_texts):
     return any(k in tx_texts for k in sb.echo_keys(text))
 
 
+def _echo_atom_landed_in(a, tx_texts):
+    """_echo_landed_in for a live echo ATOM: under its own text's keys and, for a send fed inside a joined text (the
+    SDK backend's `_joined_text` stamp, SdkSession._join_queued_locked), that text's keys too (sb.echo_lookup_keys),
+    since the CLI writes one record for the joined text and none of the part's own."""
+    return any(k in tx_texts for k in sb.echo_lookup_keys(a))
+
+
 def _human_turn_floor(session):
     """The newest GENUINE-HUMAN user atom's timestamp in the parsed session, or 0. The one event that says
     "the transcript has moved past anything typed before this": read by sdk_backend.prune_live (to retire
@@ -40424,7 +40431,7 @@ def _merge_live_atoms(session, sid, shown_texts=(), live=None):
     # scan read the record off the transcript — the prune just retired it, and painting it once more would
     # show a delivered message as a pending bubble for one build)
     fresh = [a for a in live if a.get("uuid") not in tx_uuids
-             and not (a.get("_echo_text") and (a.get("_landed") or _echo_landed_in(a["_echo_text"], hide)))]
+             and not (a.get("_echo_text") and (a.get("_landed") or _echo_atom_landed_in(a, hide)))]
     if not fresh:
         return session
     # Reopen the turn ONLY for genuine live ASSISTANT work (a streaming reply), never for a lone input echo.
@@ -40461,7 +40468,7 @@ def _merge_live_atoms(session, sid, shown_texts=(), live=None):
         # (_pending_ledger, the settle's "still owed" read); read only when a candidate exists.
         p = _path_of(sid)
         owed = {sb.echo_text_key(t) for t in shown_texts if t} | {sb.echo_text_key(t) for t in (_pending_ledger(p) if p else ())}
-        stale = [a for a in stale if not _echo_landed_in(a["_echo_text"], owed)]
+        stale = [a for a in stale if not _echo_atom_landed_in(a, owed)]   # a joined part is owed with its joined text
     placed = ()
     if stale:
         # `placed` is what the chat fold keys its sealed prefix on (build_session, the "echo" refold): a placed
@@ -41629,6 +41636,16 @@ def build_session(sid, now, live_map=None, path_override=None, tail_cap_t=None, 
                                     _qs = be.qids_for_landing(sid, a.get("uuid"), _tblocks, a.get("t"))
                                 except Exception:
                                     _qs = []
+                                # a block that landed a JOINED text (several queued sends fed as one, the backend's
+                                # _join_queued_locked) answers with the list of their ids: a one-block record ships
+                                # them all as qids, so the chat retires each copy by its id; in a record of several
+                                # blocks such a block keeps its first id in its place, so qids still align with blocks
+                                if len(_tblocks) == 1 and _qs and isinstance(_qs[0], list):
+                                    _ids = [q for q in _qs[0] if q]
+                                    if len(_ids) > 1:
+                                        ev["qids"] = _ids
+                                    _qs = [_ids[0] if len(_ids) == 1 else None]   # one id rides as the plain qid below
+                                _qs = [(q[0] if q else None) if isinstance(q, list) else q for q in _qs]
                                 if len(_tblocks) > 1 and any(_qs):
                                     ev["qids"] = list(_qs)
                                 elif len(_tblocks) == 1 and _qs and _qs[0]:

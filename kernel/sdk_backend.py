@@ -135,6 +135,7 @@ command_text_key = _keys.command_text_key
 # under its own name.
 _em = sys.modules.get("romp_event_model") or load_source("romp_event_model_echo", _HERE / "event_model.py")
 echo_keys = _keys.echo_keys                  # both keys of a text, the "either key" rule written once
+echo_lookup_keys = _keys.echo_lookup_keys    # …and, for an echo fed inside a joined text, that text's keys too
 
 
 def _bin_on_path_env(environ) -> dict:
@@ -3518,8 +3519,9 @@ def postal_mids(text) -> list[str]:
     return out
 
 
-# Peer mail queued behind a running turn is fed as ONE text (SdkSession._join_queued_mail_locked, 2026-10-05): the
-# banners at the head of the queue, back to back, joined by a blank line. The joined text is bounded by the size the
+# Peer mail and tagged machine sends queued behind a running turn are fed as ONE text (SdkSession._join_queued_locked;
+# mail 2026-10-05, tagged sends 2026-10-06): the joinable copies at the head of the queue, back to back, joined by a
+# blank line. The joined text is bounded by the size the
 # bus already allows ONE banner (postal_service._PUSH_MAX_BYTES), so it is never larger than a banner can be; a banner
 # past the bound waits at the head for the next step.
 MAIL_JOIN_MAX_BYTES = 900 * 1024
@@ -3531,6 +3533,25 @@ def _is_mail_copy(text, meta) -> bool:
     queues mail id-less (enqueue_postal), while a send the person typed carries its echo's id, so a typed message that
     merely quotes a marker is never taken for mail."""
     return isinstance(text, str) and not (isinstance(meta, dict) and meta.get("qid")) and bool(postal_mids(text))
+
+
+def _is_tagged_send(text, meta) -> bool:
+    """Is this queued copy a TAGGED machine send? It carries the `<!-- romp-tag: <label> -->` marker (`romp send --tag`,
+    the event model's MSG_TAG_RE, the one reading of the marker) and is not the person's: never a line marked fromUser
+    (the chat page's relay of what they typed; the kernel refuses the two together, and this refuses them again), and
+    never a slash command, tagged or not (a command is the CLI's to run on its own, not words to read)."""
+    if not isinstance(text, str) or not _em.MSG_TAG_RE.search(text):
+        return False
+    if isinstance(meta, dict) and meta.get("fromUser"):
+        return False
+    return not (command_text_key(text) or _is_compact_cmd(text) or _is_clear_cmd(text))
+
+
+def _is_joinable_copy(text, meta) -> bool:
+    """May this queued copy ride in one text with its neighbours (SdkSession._join_queued_locked)? Peer mail and tagged
+    machine sends may; the person's own messages (any untagged send, a fromUser chat line), slash commands, romp's untagged
+    notices and anything id-less and unmarked may not."""
+    return _is_mail_copy(text, meta) or _is_tagged_send(text, meta)
 
 
 # A CLI that cannot even START says so on the way out — and the ONE cause that reliably does this is the
@@ -5938,38 +5959,90 @@ class SdkSession:
         if loop is not None and wake is not None:
             loop.call_soon_threadsafe(wake.set)
 
-    def _join_queued_mail_locked(self, text, meta):
-        """The text to feed for the head copy just popped (`text`, `meta`): itself, or, when it is a bus banner, itself
-        joined with every banner queued directly behind it, which leave the queue in the same hold (under self._lock).
+    def _join_queued_locked(self, text, meta):
+        """(text to feed, joined send ids) for the head copy just popped (`text`, `meta`): itself and None, or, when it is
+        JOINABLE (_is_joinable_copy: a bus banner or a tagged machine send), itself joined with every joinable copy queued
+        directly behind it, which leave the queue in the same hold (under self._lock), and the echo ids of the sends among
+        them (None when no part carries one).
 
         The feeder hands the CLI one text and holds the next until the CLI takes it (_untaken), and the CLI takes a text
-        sent mid-turn only at a tool boundary, so N banners queued during a long turn took N tool steps to arrive and a
-        busy session read its mail many minutes late (2026-10-05). A bus banner already carries several messages when the
-        bus has several ready (postal_service.format_push), so banners queued back to back are fed as one, a blank line
-        between them, and the session reads all of them at its next step. The joined text carries every banner's
-        `romp-msg-id` markers, and every id reading downstream works from the fed text: the take report
-        (_report_postal_take at the take), the stranded hand-back (_return_stranded_mail) and its re-head
-        (_settle_handback), which re-heads the joined text whole under all of its ids. Mail has no echo id, so no fed
-        ledger entry is owed for the banners joined in.
+        sent mid-turn only at a tool boundary, so N queued texts took N tool steps to arrive. Banners were joined first
+        (2026-10-05); a tagged send still went alone and split the mail around it, and on 2026-10-06 one busy session's
+        queue held 38 copies (its own watcher's tagged lines and peer mail, an order among them) and an order sent 40
+        minutes earlier had not reached it. So mail and tagged sends queued back to back are fed as one text, a blank line
+        between them, and the session reads all of them at its next step.
 
-        Only adjacent banners at the head are joined: a mail banner is never joined with a text that is not one (a typed
-        send, a notice), nothing is reordered, and queued sends stay one message each (test_queued_sends_not_fused). The
-        join stops before the joined text would pass MAIL_JOIN_MAX_BYTES; the rest wait at the head."""
-        if not _is_mail_copy(text, meta):
-            return text
-        parts, size = [text], len(text.encode("utf-8", "replace"))
+        The join stops at the first copy that is not joinable: the person's own messages (an untagged send, a chat line
+        marked fromUser), slash commands, romp's untagged notices, anything id-less and unmarked; a head that is not
+        joinable goes alone. Nothing is reordered, and two of the person's sends are never one message (their pending
+        bubbles pair by their own texts: test_queued_sends_not_fused). The join stops before the joined text would pass
+        MAIL_JOIN_MAX_BYTES; the rest wait at the head.
+
+        Ids. Mail ids ride the joined text's markers, read from the fed text at the take (_report_postal_take), the
+        hand-back and the re-head, as for one banner. A joined SEND keeps its echo id through the fed ledger: the head's
+        own entry (_pop_for_feed_locked) gives way to ONE entry for the joined text, carrying every send part's id
+        (`qids`, in order) and every part with its queue identity (`parts`). So the joined text's landing pairs once and
+        names every id (qids_for_landing), and a teardown that re-heads it puts every part back under its own identity
+        (_unfeed_parts_locked). The parts' echoes are stamped with the joined text by the caller, outside this lock
+        (SdkBackend._stamp_joined_echoes), so each retires on the joined text's record. A join of mail alone writes no
+        entry, as before: mail has no echo, and the joined banner re-heads whole under all of its ids."""
+        if not _is_joinable_copy(text, meta):
+            return text, None
+        parts, size = [(text, meta)], len(text.encode("utf-8", "replace"))
         while self._pending:
             nxt = self._pending[0]
             nmeta = self._pending_meta[0] if self._pending_meta else None
-            if not _is_mail_copy(nxt, nmeta):
+            if not _is_joinable_copy(nxt, nmeta):
                 break
             add = len(MAIL_JOIN_SEP) + len(nxt.encode("utf-8", "replace"))
             if size + add > MAIL_JOIN_MAX_BYTES:
                 break
             self._q_pop(0)
-            parts.append(nxt)
+            parts.append((nxt, nmeta))
             size += add
-        return MAIL_JOIN_SEP.join(parts)
+        if len(parts) == 1:
+            return text, None
+        joined = MAIL_JOIN_SEP.join(t for t, _ in parts)
+        qids = [m["qid"] for _, m in parts if isinstance(m, dict) and m.get("qid")]
+        if not qids:
+            return joined, None
+        head_qid = meta.get("qid") if isinstance(meta, dict) else None
+        if head_qid:                                   # the head's own entry, just written by the pop, gives way
+            for j in range(len(self._fed_meta) - 1, -1, -1):
+                if self._fed_meta[j].get("qid") == head_qid and self._fed_meta[j].get("text") == text:
+                    del self._fed_meta[j]
+                    break
+        first = next(m for _, m in parts if isinstance(m, dict) and m.get("qid"))
+        self._fed_meta.append({"qid": qids[0], "qts": first.get("qts"), "text": joined, "t": int(time.time()),
+                               "qids": qids, "parts": [(t, dict(m) if isinstance(m, dict) else None) for t, m in parts]})
+        del self._fed_meta[:-64]
+        return joined, qids
+
+    def _unfeed_parts_locked(self, items):
+        """(texts, metas) to re-head for the fed `items` (under self._lock): _unfeed_locked's reading, except that a
+        JOINED text with a fed ledger entry (_join_queued_locked) comes apart into its parts, each under its own queue
+        identity, so every send goes back with its echo id and every banner as the mail it was; the next feed joins them
+        again. A text with no joined entry (any other copy, a join of mail alone) is re-headed as before."""
+        texts, metas = [], []
+        for t in items:
+            k = echo_text_key(t)
+            j = next((i for i, f in enumerate(self._fed_meta) if f.get("parts") and echo_text_key(f.get("text", "")) == k),
+                     None)
+            if j is None:
+                texts.append(t)
+                metas.extend(self._unfeed_locked([t]))
+                continue
+            for pt, pm in self._fed_meta.pop(j)["parts"]:
+                texts.append(pt)
+                metas.append(dict(pm) if isinstance(pm, dict) else None)
+        return texts, metas
+
+    def _joined_entry(self, text):
+        """The fed ledger's JOINED entry for the fed `text` (_join_queued_locked), or None; a copy, read under the lock."""
+        k = echo_text_key(text)
+        with self._lock:
+            f = next((f for f in self._fed_meta if f.get("parts") and echo_text_key(f.get("text", "")) == k), None)
+            return dict(f) if f else None
 
     def _pop_for_feed_locked(self, idx: int = 0):
         """The copy at `idx` (the feed slot, the head) leaves for the CLI (the input generator, under
@@ -6023,7 +6096,10 @@ class SdkSession:
                         continue
                     if t is not None and float(t) < f["t"] - 2:
                         continue                           # stamped before the feed: not this copy's landing
-                    hit = self._fed_meta.pop(i)["qid"]
+                    f = self._fed_meta.pop(i)
+                    # a JOINED text (_join_queued_locked) lands as one block carrying every joined send: its answer
+                    # is the LIST of their ids, in order, which the kernel ships as the record's qids
+                    hit = list(f["qids"]) if f.get("qids") else f["qid"]
                     break
                 hits.append(hit)
             self._landed_qid[uuid_] = hits
@@ -6033,14 +6109,25 @@ class SdkSession:
             return list(hits)
 
     def qid_for_landing(self, uuid_: str, text: str, t=None):
-        """qids_for_landing for a one-block record."""
-        return self.qids_for_landing(uuid_, [text], t)[0]
+        """qids_for_landing for a one-block record (a joined text answers with its first id)."""
+        q = self.qids_for_landing(uuid_, [text], t)[0]
+        return (q[0] if q else None) if isinstance(q, list) else q
 
     def forget_fed(self, qid: str):
         """A fed copy the CLI dropped for good (its echo marked never delivered) leaves the fed ledger: its
-        landing will never come, and a later same-text landing must not be paired with it."""
+        landing will never come, and a later same-text landing must not be paired with it. A joined entry
+        (_join_queued_locked) loses that one id and keeps the others, which still land with the joined text."""
         with self._lock:
-            self._fed_meta = [f for f in self._fed_meta if f.get("qid") != qid]
+            out = []
+            for f in self._fed_meta:
+                if f.get("qids") and qid in f["qids"]:
+                    rest = [q for q in f["qids"] if q != qid]
+                    if rest:
+                        out.append(dict(f, qids=rest, qid=rest[0]))
+                    continue
+                if f.get("qid") != qid:
+                    out.append(f)
+            self._fed_meta = out
 
     def enqueue_postal(self, text: str, mids) -> list:
         """Queue the bus banner `text` unless this session has taken every one of its postal message ids `mids`
@@ -6507,7 +6594,7 @@ class SdkSession:
             seen = None
         if seen is False or (seen is None and not self.resume_sid):
             with self._lock:
-                self._q_prepend([item], self._unfeed_locked([item]))   # back at the head under its own id
+                self._q_prepend(*self._unfeed_parts_locked([item]))   # back at the head under its own id (a joined text: each part under its own)
             self._persist_queue()
             if seen is False:
                 self.backend._log("sdk %s: the CLI exited while it still held a fed text (never landed): back "
@@ -6589,7 +6676,7 @@ class SdkSession:
         self.backend.retire_live_work(self.sid)    # the abandoned turn's stream is gone with its client
         if stranded and not self.resume_sid:
             with self._lock:
-                self._q_prepend(stranded, self._unfeed_locked(stranded))   # back at the head under their own ids
+                self._q_prepend(*self._unfeed_parts_locked(stranded))   # back at the head under their own ids (joined texts in parts)
             self._persist_queue()                  # the fresh inputs() drains _pending on its first pass
         elif stranded:
             # Peer mail FIRST (2026-09-12): a bus banner has no echo for the flag path below to flip
@@ -6599,9 +6686,39 @@ class SdkSession:
             # sessions vanished that way in twenty minutes, each fed to a client that a model-pin rebuild tore
             # down before the turn resulted, every sender told "delivered". The banner names its messages; hand
             # them back to the bus by id — _return_stranded_mail. Everything else fed keeps the flag path.
+            # A JOINED text with sends in it comes apart first (_split_stranded_joins), unless it landed whole.
+            stranded = self._split_stranded_joins(stranded)
             self._return_stranded_mail(stranded)
             self.backend._mark_dropped_echoes(self.sid, self.pending_meta() or self.pending(), refeed=False)
         self.backend._poke()
+
+    def _split_stranded_joins(self, stranded) -> list:
+        """The resumable teardown's reading of each stranded JOINED text that carries sends (_join_queued_locked): one
+        that LANDED before the teardown (the transcript scan finds its record) stays whole, its sends' echoes are marked
+        landed (SdkBackend._land_joined_echoes) so the flag path below leaves them alone, and _return_stranded_mail
+        finds it landed and reports its mail taken; one that did not comes apart into its parts, so each banner is handed
+        back to the bus on its own and each send takes the flag path under its own echo id, as a lone stranded copy does.
+        Any other text passes through."""
+        out = []
+        for t in stranded:
+            entry = self._joined_entry(t) if isinstance(t, str) else None
+            if entry is None:
+                out.append(t)
+                continue
+            try:
+                seen = self.backend._text_landed(self.sid, t)
+            except Exception:
+                seen = None
+            if seen is True:
+                land = getattr(self.backend, "_land_joined_echoes", None)
+                if land is not None:
+                    land(self.sid, entry.get("qids") or [])
+                out.append(t)
+                continue
+            with self._lock:
+                texts, _metas = self._unfeed_parts_locked([t])
+            out.extend(texts)
+        return out
 
     def _return_stranded_mail(self, stranded) -> None:
         """Hand every POSTAL banner in `stranded` (fed to the abandoned client, never resulted) back to the bus by
@@ -7600,10 +7717,11 @@ class SdkSession:
                     blocked = blocked or (self.inflight == 0 and self.backend.drain_holding())
                     fi = 0 if (self._pending and not blocked) else -1
                     item, _meta = self._pop_for_feed_locked(fi) if fi >= 0 else (None, None)
+                    _joined_qids = None
                     if item is not None:
-                        # peer mail queued back to back goes in as ONE text, so the session reads all of it at its
-                        # next step rather than one banner per tool step (_join_queued_mail_locked, 2026-10-05)
-                        item = self._join_queued_mail_locked(item, _meta)
+                        # peer mail and tagged machine sends queued back to back go in as ONE text, so the session
+                        # reads all of them at its next step rather than one per tool step (_join_queued_locked)
+                        item, _joined_qids = self._join_queued_locked(item, _meta)
                     # starting from idle, not mid-turn. inflight counts the CLI's own turns too (a turn frame
                     # at inflight 0 raises it, _on_message), so a text fed while the CLI runs a turn romp did
                     # not feed (the drain of a mid-turn text, a notification-started turn) is mid-turn here
@@ -7625,6 +7743,12 @@ class SdkSession:
                 if item is None:
                     await self._input_wake.wait()   # idle, or holding behind a wedged turn → wait for a change
                     continue
+                if _joined_qids:
+                    # each joined send's echo learns the text it rides in, so it retires on that text's record (outside
+                    # self._lock: the live tail has its own lock, never taken inside this one)
+                    stamp = getattr(self.backend, "_stamp_joined_echoes", None)   # a stand-in backend in tests has none
+                    if stamp is not None:
+                        stamp(self.sid, _joined_qids, item)
                 off, fsid = self.backend._transcript_mark(self.sid)
                 if self._untaken is not None:
                     self._untaken["off"], self._untaken["fsid"] = off, fsid
@@ -14832,6 +14956,44 @@ class SdkBackend:
         self._wake_push()
         return True
 
+    def _stamp_joined_echoes(self, sid: str, qids, joined: str) -> None:
+        """Each send in `qids` was just fed inside the JOINED text `joined` (SdkSession._join_queued_locked): its echo
+        carries that text (`_joined_text`, mirrored to the reg as `joined` across a restart), and every reader that asks
+        whether an echo landed or is still owed asks under that text too (echo_lookup_keys: prune_live, settle_echoes,
+        the boot scan in _mark_dropped_echoes, and the kernel's chat build). The CLI writes ONE record for the joined text,
+        so without this each part's echo waited for a record of its own text that never comes, and a later turn flagged
+        it never delivered. A later join overwrites the stamp; a stale one is harmless, since a record of an old joined
+        text at or after the send means the send was delivered in it."""
+        changed = False
+        with self._live_lock:
+            d = self._live.get(sid) or {}
+            for q in qids or ():
+                a = d.get(q)
+                if a is not None and a.get("_echo_text") and not a.get("command"):
+                    a["_joined_text"] = joined
+                    changed = True
+            if changed:
+                self._touch_live(sid)
+        if changed:
+            self._persist_echoes(sid)
+
+    def _land_joined_echoes(self, sid: str, qids) -> None:
+        """The echoes of the sends in `qids` LANDED, inside a joined text whose record the transcript scan found
+        (SdkSession._split_stranded_joins at a teardown): the verdict `_landed` (the boot scan's, mirrored to the reg),
+        so the flag path leaves them alone and prune_live retires them."""
+        changed = False
+        with self._live_lock:
+            d = self._live.get(sid) or {}
+            for q in qids or ():
+                a = d.get(q)
+                if a is not None and a.get("_echo_text") and not a.get("command") and not a.get("_landed"):
+                    a["_landed"] = True
+                    changed = True
+            if changed:
+                self._touch_live(sid)
+        if changed:
+            self._persist_echoes(sid)
+
     def _transcript_mark(self, sid: str):
         """(byte size, fsid) of the sid's current transcript at this instant — the send-time mark an echo
         carries as _echo_off / _echo_fsid (mirrored as off / fsid), so _text_landed can start its scan
@@ -14882,6 +15044,8 @@ class SdkBackend:
                     e["fsid"] = str(a.get("_echo_fsid") or "")
                 if a.get("_landed"):
                     e["landed"] = True            # the boot/spawn scan found its record: prune_live retires it
+                if isinstance(a.get("_joined_text"), str) and a["_joined_text"]:
+                    e["joined"] = a["_joined_text"]   # the joined text it was fed in (_stamp_joined_echoes): its landing too
                 for flag in ("stale", "refused"):
                     if a.get(flag):
                         e[flag] = True            # WHY it was dropped (the age line / the prompt gate), for the chat
@@ -14949,6 +15113,8 @@ class SdkBackend:
                     atom["_echo_off"], atom["_echo_fsid"] = e["off"], str(e.get("fsid") or "")
                 if e.get("landed"):
                     atom["_landed"] = True           # already adjudicated landed: never re-scanned, never flagged
+                if isinstance(e.get("joined"), str) and e["joined"]:
+                    atom["_joined_text"] = e["joined"]   # fed inside a joined text: it lands with that text's record
                 self._stash_live(reg["sid"], key, atom)
             if self._live.get(reg["sid"]) and not self._lease_survives(reg["sid"]):
                 # a CLI that survived under its host still holds the sends the previous kernel handed it: nothing is
@@ -15057,8 +15223,14 @@ class SdkBackend:
                 if REDELIVER_MAX_AGE_S > 0 and t0 and now - t0 > REDELIVER_MAX_AGE_S:
                     stale.append(a)
                     continue
-                seen = self._text_landed(sid, a["_echo_text"], a.get("t"),
-                                         a.get("_echo_off"), a.get("_echo_fsid"))
+                seen = None
+                if isinstance(a.get("_joined_text"), str) and a["_joined_text"]:
+                    # fed inside a joined text (_join_queued_locked): its record is the joined text's, so a found joined
+                    # text is this send landed; a miss falls through to its own text (it may have been re-fed alone)
+                    seen = self._text_landed(sid, a["_joined_text"], a.get("t"), a.get("_echo_off"), a.get("_echo_fsid"))
+                if seen is not True:
+                    seen = self._text_landed(sid, a["_echo_text"], a.get("t"),
+                                             a.get("_echo_off"), a.get("_echo_fsid"))
                 if seen is False:
                     # A send the transcript has OUTRUN is flagged, not re-fed (2026-09-11): a later human
                     # message landed after it, and the composer's messages travel one channel in order, so
@@ -17592,7 +17764,7 @@ class SdkBackend:
         def _by_text(a, et):
             # the plain key and, for a slash send, its words (echo_keys): the CLI records the send as a
             # wrapper whose parsed atom reads "/name args", and the kernel keys that atom both ways
-            keys = echo_keys(et)
+            keys = echo_lookup_keys(a)        # …and, for a send fed inside a joined text, that text's key too
             if not keys:
                 return False
             if text_t is None:
@@ -17685,7 +17857,7 @@ class SdkBackend:
         owed.discard("")
         flagged = []
         for a in cands:
-            if _echo_queued_in(a, own) or any(k in owed for k in echo_keys(a["_echo_text"])):
+            if _echo_queued_in(a, own) or any(k in owed for k in echo_lookup_keys(a)):   # a joined part is owed with its joined text
                 continue                               # still owed somewhere → waiting, not lost
             a["dropped"] = True
             flagged.append(a)
