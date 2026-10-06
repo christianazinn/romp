@@ -729,6 +729,21 @@ def _is_compact_cmd(text: str) -> bool:
     return t == "/compact" or t.startswith("/compact ")
 
 
+# A queued slash command, as the kernel reads one (_SLASH_CMD_RE in kernel.py): a slash, a name, then a space or the end.
+# A path ("/tmp/x.log has the trace") is a message, not a command.
+_QUEUED_SLASH_RE = re.compile(r"^/[A-Za-z0-9][\w:-]*(\s|$)")
+
+
+def from_user_may_pass(text, meta) -> bool:
+    """Whether a text marked as the person's own words (`romp send --from-user`, meta["fromUser"]) may queue ahead of this
+    queued copy (SdkSession._q_insert_from_user_locked). Everything may be passed except two kinds: an earlier marked
+    text, so the person's lines keep their own order, and a slash command, since a /clear run after the marked text
+    would wipe it from the conversation (2026-10-06)."""
+    if isinstance(meta, dict) and meta.get("fromUser") is True:
+        return False
+    return not _QUEUED_SLASH_RE.match((text if isinstance(text, str) else "").strip())
+
+
 def _is_clear_cmd(text: str) -> bool:
     """True if `text` is a /clear invocation. Drives the authoritative SdkSession._clearing bracket, the
     chat's live "clearing" indicator — without it the stretch between the /clear delivery and the CLI
@@ -5358,6 +5373,8 @@ def queue_meta_from_reg(reg: dict) -> list:
         out = {"qid": m["qid"], "qts": m.get("qts")}
         if isinstance(m.get("paths"), list) and m["paths"]:
             out["paths"] = [str(x) for x in m["paths"] if isinstance(x, str)]   # the attachment list survives a restart with the copy (T373 fold)
+        if m.get("fromUser") is True:
+            out["fromUser"] = True              # the person's own words stay ahead of peer and machine sends across a restart
         return out
 
     # the mirror lists EVERY position (text alone for an id-less copy): align the mirrored run as one block of the
@@ -5880,6 +5897,22 @@ class SdkSession:
         self._pending.append(text)
         self._pending_meta.append(meta if isinstance(meta, dict) and meta.get("qid") else None)
 
+    def _q_insert_from_user_locked(self, text: str, meta):
+        """Queue a text marked as the person's own words (`romp send --from-user`, the chat page's relay; under self._lock)
+        ahead of everything it may pass (from_user_may_pass): just behind the last queued copy that is an earlier marked
+        text or a slash command, else at the head. So it goes ahead of peer mail, tagged and untagged sends and romp's
+        notices, keeps the person's lines in their own order, never lands ahead of a queued /clear, and moves nothing
+        else. The text already handed to the CLI has left _pending (_pop_for_feed_locked), so it is never passed. The
+        person's lines waited up to 12 minutes behind 17 to 25 queued peer messages before this (2026-10-06)."""
+        if len(self._pending_meta) != len(self._pending):   # identities out of step: append, as before, rather than misread one
+            self._q_append(text, meta)
+            return
+        at = len(self._pending)
+        while at > 0 and from_user_may_pass(self._pending[at - 1], self._pending_meta[at - 1]):
+            at -= 1
+        self._pending.insert(at, text)
+        self._pending_meta.insert(at, meta)
+
     def _q_prepend(self, texts, metas=None):
         texts = list(texts)
         self._pending[0:0] = texts
@@ -5898,7 +5931,8 @@ class SdkSession:
                 if echo_text_key(f.get("text", "")) == k:
                     hit = self._fed_meta.pop(j)
                     break
-            metas.append({"qid": hit["qid"], "qts": hit.get("qts")} if hit else None)
+            metas.append({"qid": hit["qid"], "qts": hit.get("qts"), **({"fromUser": True} if hit.get("fromUser") is True else {})}
+                         if hit else None)          # a re-headed marked copy stays the person's (2026-10-06)
         return metas
 
     def _q_pop(self, idx: int):
@@ -5928,7 +5962,8 @@ class SdkSession:
         self._lock): its identity moves to the fed ledger, where the landing is paired with it. Returns (text, meta)."""
         text, meta = self._q_pop(idx)
         if meta and meta.get("qid"):
-            self._fed_meta.append({"qid": meta["qid"], "qts": meta.get("qts"), "text": text, "t": int(time.time())})
+            self._fed_meta.append({"qid": meta["qid"], "qts": meta.get("qts"), "text": text, "t": int(time.time()),
+                                   **({"fromUser": True} if meta.get("fromUser") is True else {})})
             del self._fed_meta[:-64]                       # bounded: a landing is paired within a turn or two
         # A /clear's echo is tracked at the TAKE, not here at the feed: the copy sits in self._untaken until the
         # CLI demonstrably takes it (_untaken_taken), and only then is its qid recorded for retirement (round
@@ -6062,18 +6097,25 @@ class SdkSession:
         kept = [m for m in self._postal_taken if m not in fresh] + batch
         self._postal_taken = kept[-max(POSTAL_TAKEN_KEEP, len(batch)):]
 
-    def enqueue(self, text: str, qid: str | None = None, qts: int | None = None, paths: list | None = None):
+    def enqueue(self, text: str, qid: str | None = None, qts: int | None = None, paths: list | None = None,
+                from_user: bool = False):
         """Deliver a user turn (called from the kernel thread). Held in self._pending —
         VISIBLE to pending_queued — until the input generator releases it at turn end. Works
         before the loop is ready too (the generator drains _pending on its first pass). `qid`/`qts`:
-        the copy's identity (send() mints them; a caller without one queues an id-less copy)."""
+        the copy's identity (send() mints them; a caller without one queues an id-less copy).
+        `from_user`: `romp send --from-user`, the person's own words; kept beside the id and queued ahead of
+        peer and machine sends (_q_insert_from_user_locked, 2026-10-06). It needs an id to ride on."""
         with self._lock:
             if qid:
                 self._fed_meta = [f for f in self._fed_meta if f.get("qid") != qid]   # back in the queue: not fed (a re-delivery)
             meta = {"qid": qid, "qts": qts} if qid else None
             if meta is not None and paths:
                 meta["paths"] = [str(x) for x in paths if isinstance(x, str) and x]   # the attachments the send carried, beside its id (T373 fold)
-            self._q_append(text, meta)
+            if meta is not None and from_user is True:
+                meta["fromUser"] = True
+                self._q_insert_from_user_locked(text, meta)
+            else:
+                self._q_append(text, meta)
             loop, wake = self.loop, self._input_wake
         self._persist_queue()
         if loop is not None and wake is not None:
@@ -6206,7 +6248,8 @@ class SdkSession:
                 snap = list(self._pending)
                 metas = list(self._pending_meta)
                 extra = {"postalTaken": list(self._postal_taken)} if taken else {}
-            qmeta = [{"text": t, "qid": m["qid"], "qts": m.get("qts"), **({"paths": m["paths"]} if m.get("paths") else {})} if isinstance(m, dict) and m.get("qid") else {"text": t}
+            qmeta = [{"text": t, "qid": m["qid"], "qts": m.get("qts"), **({"paths": m["paths"]} if m.get("paths") else {}),
+                      **({"fromUser": True} if m.get("fromUser") is True else {})} if isinstance(m, dict) and m.get("qid") else {"text": t}
                      for t, m in zip(snap, metas)]        # every position, so the restore aligns the run as a block
             try:
                 self.backend._update_reg(self.sid, queue=snap, queueMeta=qmeta, **extra)
@@ -14705,8 +14748,13 @@ class SdkBackend:
                         or getattr(s, "_untaken", None) is not None   # held behind a fed text the CLI has not taken
                         or (s._rewind_to and not getattr(s, "_rewind_armed", False)))
 
-    def send(self, sid: str, text: str, qid: str | None = None, user: bool = False, paths: list | None = None) -> bool:
-        """`user`: the text is a message the USER typed (the composer, the phone, an untagged `romp send`, a comment
+    def send(self, sid: str, text: str, qid: str | None = None, user: bool = False, paths: list | None = None,
+             from_user: bool = False) -> bool:
+        """`from_user`: `romp send --from-user`, the person's own words relayed by the chat page (2026-10-06); the queued
+        copy wears it and goes ahead of peer and machine sends (SdkSession._q_insert_from_user_locked). Nothing else
+        changes: `user` stays the stand-down's word.
+
+        `user`: the text is a message the USER typed (the composer, the phone, an untagged `romp send`, a comment
         reply or merge, a parked user send replayed, a compact click), the one word that retries a stood-down
         attach (T315). Romp's own automatic messages (the default: the nudge, the awaiting backstop, the debt
         reminder, the auto retry, a watch notice, a tagged `romp send`) are QUEUED while the stand-down holds:
@@ -14749,7 +14797,8 @@ class SdkBackend:
         # writes the real user atom.
         key = qid or "echo:" + uuid.uuid4().hex
         try:
-            s.enqueue(text, qid=key, qts=int(time.time() * 1000), paths=paths or None)
+            s.enqueue(text, qid=key, qts=int(time.time() * 1000), paths=paths or None,
+                      **({"from_user": True} if from_user is True else {}))   # only when set: a stand-in that takes ids keeps them
         except TypeError:                                    # a stand-in session that takes the text alone: an id-less copy
             s.enqueue(text)
         # optimistic input echo: show the user's own message INSTANTLY (neither the transcript nor the

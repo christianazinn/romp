@@ -26673,17 +26673,19 @@ def _restore_notice_archive(item_ids):
     return faults
 
 
-def _deliver_text(sid, text, plain=False):
+def _deliver_text(sid, text, plain=False, from_user=False):
     """Deliver `text` to session `sid` the way POST /send does, for every caller of that door (the route, a notice card's /send
     action): (ok, error, queued). The postal-isolation gate, the remote forward over the session's tunnel, a typed /model,
     /effort or /fast through the setters, else the composer's own park-or-send. `plain` skips the typed-command routing: the
-    text is a MESSAGE whatever its first character (a notice card's stored action, which must never reach a setter)."""
+    text is a MESSAGE whatever its first character (a notice card's stored action, which must never reach a setter).
+    `from_user`: the body's "fromUser" (`romp send --from-user`, the chat page's relay of the person's own words,
+    _parse_send_body) rides to the queued copy, which then queues ahead of peer and machine sends (2026-10-06)."""
     if _postal_shaped(text) and _postal_isolated(sid):
         return False, ("isolation: the target session's mailbox is OFF — agent mail is refused on every route; the refusal is "
                        "final (the user can toggle its mailbox back on)"), False
     r = _host_for_sid(sid)
     if r is not None:
-        res = _remote_forward(r, "/send", {"id": sid, "text": text})
+        res = _remote_forward(r, "/send", {"id": sid, "text": text, **({"fromUser": True} if from_user else {})})
         if res is None:
             return False, ("the remote kernel for this session (%s) isn't answering — message not delivered" % r.get("host", "?")), False
         if isinstance(res, dict) and res.get("ok") is False:
@@ -26703,7 +26705,7 @@ def _deliver_text(sid, text, plain=False):
                 return False, "no running backend owns %s — the command was not delivered" % sid, False
             return False, str(meta["refused"]), False   # the route's words: a Codex refusal (2026-09-19)
         return True, "", bool(meta.get("queued"))
-    res = _send_or_park(be, sid, text, user="<!-- romp-tag: " not in text)
+    res = _send_or_park(be, sid, text, user="<!-- romp-tag: " not in text or bool(from_user), from_user=bool(from_user))
     if res is None:
         return False, "no running backend owns %s — the message was not delivered" % sid, False
     return True, "", bool(res)
@@ -30228,7 +30230,12 @@ def _parse_send_body(raw):
     posing it as the user's typed words or dressing it as romp's own. A malformed tag
     fails the WHOLE parse (loud, per the fail-loudly rule): the caller asked for an
     identity the kernel can't honor, and delivering the text anyway would silently
-    misattribute it."""
+    misattribute it.
+
+    Optional "fromUser": true alone, which `romp send --from-user` sets (the chat page relays the
+    person's own words with it, 2026-10-06). The queued copy wears it and goes ahead of peer and
+    machine sends (SdkSession._q_insert_from_user_locked). Any other value fails the parse, as a
+    bad tag does, and so does a tag beside it: a tag says machine-sent, the marker says the person's."""
     try:
         body = json.loads(raw or b"{}")
     except Exception:
@@ -30244,6 +30251,10 @@ def _parse_send_body(raw):
         if not isinstance(tag, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]{0,23}", tag):
             return None
         text = text + "\n\n<!-- romp-tag: " + tag + " -->"
+    if "fromUser" in body:
+        if body["fromUser"] is not True or tag is not None:
+            return None
+        return {"who": who, "text": text, "fromUser": True}
     return {"who": who, "text": text}
 
 
@@ -38358,6 +38369,13 @@ def _op_user(op) -> bool:
     return op[0] in ("send", "command") and len(op) > 4 and op[4] is True
 
 
+def _op_from_user(op) -> bool:
+    """Whether a parked send carries the person's-own-words marker (its seventh slot, _send_or_park; `romp send
+    --from-user`, 2026-10-06), so the drained copy still queues ahead of peer and machine sends. Length-guarded like
+    every reader of an optional slot; a parked command carries none (a slash command never jumps the queue)."""
+    return op[0] == "send" and len(op) > 6 and op[6] is True
+
+
 def _op_qid(op):
     """The press-time id a parked send or command carries (its fourth slot, _send_or_park), or None: a kernel-
     parked op (a re-delivery, a nudge, a three-slot record from a mirror written before the slot existed) has
@@ -38408,7 +38426,7 @@ def _user_send(be, sid, text):
     return be.send(sid, text)
 
 
-def _send_with_id(be, sid, text, qid=None, user=False, paths=None):
+def _send_with_id(be, sid, text, qid=None, user=False, paths=None, from_user=False):
     """be.send, with the copy's press-time id when one rode and the backend's send takes it (_takes_qid:
     SdkBackend, whose queued copy and echo then wear the id the chat's bubble already has). A send that takes
     no id (Codex; a stand-in) gets the text alone, as before. `user`: a message the user typed (the composer, the phone, a user's `romp send`, a parked
@@ -38420,6 +38438,8 @@ def _send_with_id(be, sid, text, qid=None, user=False, paths=None):
         kw["user"] = True
     if paths and _takes_kw(be.send, "paths"):
         kw["paths"] = list(paths)                          # the attachment list, beside the copy's id (T373 fold)
+    if from_user and _takes_kw(be.send, "from_user"):
+        kw["from_user"] = True                             # the person's own words: queued ahead of peer and machine sends (2026-10-06)
     return be.send(sid, text, **kw)
 
 
@@ -38441,11 +38461,13 @@ def _op_paths(op):
     return list(op[5]) if op[0] == "send" and len(op) > 5 and isinstance(op[5], (list, tuple)) else []
 
 
-def _send_or_park(be, sid, text, echo=None, qid=None, user=False, paths=None):
+def _send_or_park(be, sid, text, echo=None, qid=None, user=False, paths=None, from_user=False):
     """`user` (T315): the text is the USER's (the composer, the phone, an untagged `romp send`, a typed command),
     handed to the backend as its word to retry a stood-down attach and remembered on a parked op's fifth slot for the
     replay; a machine caller (a watch notice, a nudge, a tagged `romp send`) passes nothing and is queued behind a
-    stand-down instead. Classified by the caller that knows who speaks, never by the route.
+    stand-down instead. Classified by the caller that knows who speaks, never by the route. `from_user`: `romp send
+    --from-user`, the person's own words relayed by the chat page (2026-10-06), kept on a parked send's seventh slot
+    (_op_from_user) and handed to a send that takes it, whose queued copy then goes ahead of peer and machine sends.
 
     Deliver `text` now — or PARK it in the sid's FIFO. Park when: (a) the session is COMPACTING (the user
     2026-07-02: a mid-compaction send's live-tail echo opened a turn that KILLED the 'compacting' cue — a
@@ -38514,6 +38536,8 @@ def _send_or_park(be, sid, text, echo=None, qid=None, user=False, paths=None):
         op = op + (None,) * (4 - len(op)) + (True,)     # the fifth slot: the user's words (_op_user); the fourth stays the id or None
     if paths and not cmd:
         op = op + (None,) * (5 - len(op)) + (list(paths),)   # the sixth slot: the attachments the trailing line named (_op_paths, T373 fold)
+    if from_user and not cmd:
+        op = op + (None,) * (6 - len(op)) + (True,)          # the seventh slot: the person's own words (_op_from_user), kept across the park
     if _compacting_now(sid) or _pending_ops.get(sid) or _limit_hold(sid):
         return True if _park_op(sid, op) else None       # None: the park was refused, the session is ending (2026-09-21)
     if _working_now(sid) and (cmd or not _forwards_sends(be)):
@@ -38523,7 +38547,7 @@ def _send_or_park(be, sid, text, echo=None, qid=None, user=False, paths=None):
         return True
     if parked is None:
         return None                                      # refused at the park: the session is ending; nothing is handed over
-    if _send_with_id(be, sid, text, qid, user=user, paths=paths) is False:
+    if _send_with_id(be, sid, text, qid, user=user, paths=paths, from_user=from_user) is False:
         return None                                      # refused by the backend: not parked, not delivered
     return False
 
@@ -39173,7 +39197,8 @@ def _deliver_send_batch(be, sid, run):
         return
     if _forwards_sends(be):
         for op in run:
-            if _send_with_id(be, sid, op[1], _op_qid(op), user=_op_user(op), paths=_op_paths(op) or None) is False:   # under the id the press minted, with its attachment list
+            if _send_with_id(be, sid, op[1], _op_qid(op), user=_op_user(op), paths=_op_paths(op) or None,
+                             from_user=_op_from_user(op)) is False:   # under the id the press minted, with its attachment list and marker
                 _hand_back_refused_send(be, sid, op)
         return
     merged = "\n\n".join(op[1] for op in run)          # one message, blank-line separated between turns
@@ -72248,7 +72273,7 @@ class Handler(BaseHTTPRequestHandler):
                 # user 2026-07-10), the remote forward over the session's tunnel, a typed setter command, else the
                 # composer's own park-or-send. `queued` says which arm it took (the /compact route's shape): a sender that
                 # IS the target's open turn read 'ok' otherwise and could not know the command waits (2026-09-03).
-                ok, err, queued = _deliver_text(sid, body["text"])
+                ok, err, queued = _deliver_text(sid, body["text"], from_user=bool(body.get("fromUser")))
                 if not ok:
                     if err.startswith("no running backend owns "):
                         err = err.replace(sid, body.get("who") or sid, 1)
