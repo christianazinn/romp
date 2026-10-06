@@ -829,6 +829,29 @@ through to `install.sh`:
   and follows to every connected machine like the other judge settings; its
   Default option clears the setting back to the variable, else 6.
 
+### Captions and gists without a CLI process per call
+
+The captioner and the gister, the two highest-volume judges, call the
+Messages API straight from the judge process when the call bills the API key
+the judges hold and the Indexing model is a Haiku. They reuse one connection
+per worker thread instead of starting `claude -p` for each call, which saves
+about a core-second per call. The request keeps the CLI's model, max tokens
+(32,000), thinking setting (off) and the judge's own prompts. It leaves out
+the CLI's boilerplate around them: its billing and agent lines and its
+working-directory, model and date reminders. Usage rows keep their fields,
+with the API's token counts, and carry `"route": "api"`.
+
+Every other call still starts the CLI: other judges, login-billed calls, a
+key the CLI resolves itself, models other than Haiku, and a box whose
+environment sets a proxy, `ANTHROPIC_CUSTOM_HEADERS`, Bedrock or Vertex (said
+once on the kernel's stderr). Rate limits and overloads get up to three
+retries with backoff inside the same two-minute call alarm.
+
+- `ROMP_JUDGE_DIRECT_API=off` puts the captioner and gister back on the CLI.
+  It is read on every call.
+- `scripts/judge_direct_api_bench.py` measures both roads against a local
+  stand-in API, with a dummy key and synthetic captions.
+
 ### Fast mode for the judges
 
 - **Fast mode** (a checkbox beside each of the gear's judge model pickers:
