@@ -33914,6 +33914,46 @@ def _POSTAL_UNRESOLVED_RESET():
     _POSTAL_UNRESOLVED["suppressed"] = 0
 
 
+# One bus banner as the bus pushes it (postal_service.format_push): a rule line of 44 '#', the '## 📬 from …' head, a rule
+# line, then the message(s), through the reply hint that closes every banner.
+_PUSH_BANNER_RE = re.compile(r"(?ms)^#{44}\n## \U0001F4EC from [^\n]*\n#{44}\n.*?^\(to reply, only if substantive: [^\n]*\)[ \t]*$")
+
+
+def _mail_cards_keeping_tagged_lines(ev, cards):
+    """The events a fully resolved user record `ev` hydrates to, given its `cards` (one per id, in text order): the cards
+    alone, as ever, unless the record is a JOINED feed of peer mail and tagged machine lines (the SDK backend's
+    _join_queued_locked feeds them as one text, so the CLI writes one record). Replacing that record with its cards hid
+    every tagged line in it (2026-10-06). So when the text outside its complete banners (_PUSH_BANNER_RE) carries a
+    `romp-tag` marker and no message id, that remaining text stays as one entry, a copy of the record (its uuid, its
+    sends' ids, its tag) whose md is the remaining pieces joined by a blank line, placed where its first piece sat among
+    the cards. Anything else (mail alone, mail beside untagged text, an id outside a banner) keeps the cards alone, so
+    every record that rendered before renders the same. Per event, with no state across events, so a hydration of A + B
+    still equals hydrate(A) + hydrate(B) (the chat fold's commit relies on it)."""
+    text = ev.get("md") or ""
+    spans = [m.span() for m in _PUSH_BANNER_RE.finditer(text)]
+    if not spans:
+        return cards
+    seq, pos = [], 0
+    for a, b in spans:
+        seq.append(("text", text[pos:a]))
+        seq.append(("mail", len(em.POSTAL_RE.findall(text[a:b]))))
+        pos = b
+    seq.append(("text", text[pos:]))
+    residue = "\n\n".join(c.strip() for k, c in seq if k == "text" and c.strip())
+    if not residue or not em.MSG_TAG_RE.search(residue) or em.POSTAL_RE.search(residue):
+        return cards
+    out, placed, ci = [], False, 0
+    for k, c in seq:
+        if k == "mail":
+            out.extend(cards[ci:ci + c])
+            ci += c
+        elif c.strip() and not placed:
+            out.append(dict(ev, md=residue))
+            placed = True
+    out.extend(cards[ci:])                       # belt: every id sits inside a banner, so nothing is left here
+    return out
+
+
 def _hydrate_postal(events, index, sid=None, captions=None):
     """Replace postal traffic with clean cards: a send_message tool (or `romp mail send` Bash) → an
     OUTGOING card; a user event (or a MAIL READER's output — see _reads_mail) carrying romp-msg-id
@@ -34013,7 +34053,9 @@ def _hydrate_postal(events, index, sid=None, captions=None):
                         card["peerHost"] = rec["fromHost"]
                     cards.append(card)
             if len(cards) == len(ids):                   # all-or-nothing: a partial log never half-renders
-                out.extend(cards); continue
+                # a user record holding mail AND tagged machine lines (a joined feed) keeps its lines visible
+                out.extend(_mail_cards_keeping_tagged_lines(ev, cards) if ev.get("kind") == "user" else cards)
+                continue
             # NOT every id resolved. The turn still passes through unhydrated — a half-rendered card run
             # would be worse — but it must not also lose the ids, which is what made a timeline message
             # arc click land nowhere: the arc draws from the message log, the click carries the message
