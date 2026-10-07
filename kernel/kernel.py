@@ -41836,6 +41836,7 @@ def build_session(sid, now, live_map=None, path_override=None, tail_cap_t=None, 
                                     _qs = be.qids_for_landing(sid, a.get("uuid"), _tblocks, a.get("t"))
                                 except Exception:
                                     _qs = []
+                                _qs = list(_qs or [])   # a backend without the ledger pairing answers None (as before: no qid)
                                 # a block that landed a JOINED text (several queued sends fed as one, the backend's
                                 # _join_queued_locked) answers with the list of their ids: a one-block record ships
                                 # them all as qids, so the chat retires each copy by its id; in a record of several
