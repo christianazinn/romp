@@ -391,6 +391,8 @@ def _run(em, paths, ckpt, cycles, label, max_rss_gb, seed):
     disk = sum(os.path.getsize(p) for p in paths)
     out = {"label": label, "files": n, "diskBytes": disk, "cycles": cycles, "rows": rows, "walks": scen_rows,
            "recordCount": sum(len(em._JSONL_CACHE[p][4]) for p in paths if p in em._JSONL_CACHE),
+           "skeletonBytes": (em.record_cache_stats().get("tailOnly") or {}).get("skeletonBytes"),
+           "skeletons": (em.record_cache_stats().get("tailOnly") or {}).get("skeletons"),
            "tailBytes": getattr(em, "_TAIL_BYTES", None), "tailRecords": getattr(em, "_TAIL_RECORDS", None)}
     print(json.dumps(out))
 
@@ -465,7 +467,8 @@ def summarize(files, live_gib, live_cache_gb, live_rss_gb):
         print("EXTRAPOLATION (not a measurement) to %.1f GiB of live transcripts in 23 files:" % live_gib)
         before_w = live_gib * GIB * 3.0
         live_records = live_gib * GIB / per_rec
-        skel_b = 608                                       # the walk skeleton of each older record (600 bytes and its pointer)
+        ra = runs["after"]                                 # the walk skeleton of each older record: the run's own measure (each
+        skel_b = (ra["skeletonBytes"] / ra["skeletons"] + 8) if ra.get("skeletons") else 1000   #  skeleton by what it holds)
         after_w = 23 * tb * 3.0 + live_records * (20 + skel_b)   # offsets (16 bytes), a CRC (4) and a skeleton a record
         print("  cache weight whole (3 bytes a file byte): %.1f GB (tonight's measured cache: %.1f GB in 59 entries)" % (before_w / 1e9, live_cache_gb))
         print("  cache weight tail-only: 23 windows of %d MiB x 3 + %.1f M records x %d B of index and skeleton = %.2f GB" % (

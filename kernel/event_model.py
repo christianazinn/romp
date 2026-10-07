@@ -791,9 +791,9 @@ def _entry_weight(ent) -> int:
         if type(recs) is _TailRecords:                    # tail-only (2026-10-07): the window's bytes, plus the offsets and CRCs
             held = max(0, size - recs.hot_offset())       #  of every record (20 bytes a record, held as they are, not decoded)
             offs, crcs = recs.offs, recs.crcs
-            sk = recs.skel                                #  and the walk skeletons of the records before the window (_skel)
+            sk = recs.skel                                #  and the walk skeletons of the records before the window (_skel), each
             return int(held * RECORD_CACHE_RESIDENT_PER_FILE_BYTE) + len(offs) * offs.itemsize + len(crcs) * crcs.itemsize \
-                + (min(len(sk), recs.ncold) * (_SKEL_BYTES_PER_RECORD + 8) if sk is not None else 0)
+                + (min(len(sk), recs.ncold) * 8 + int(recs.skel_bytes) if sk is not None else 0)   #  by what it holds
         if base <= 0:
             held = size
         else:
@@ -901,6 +901,8 @@ def record_cache_stats() -> dict:
                "countCap": _JSONL_CACHE_MAX, **_RECORD_CACHE_STATS, "keptWhole": len(_DROP_KEPT)}
         tails = [e for e in _JSONL_CACHE.values() if type(e[4]) is _TailRecords]   # 2026-10-07: the entries held tail-only
         out["tailOnly"] = {"entries": len(tails), "windowBytes": sum(max(0, int(e[1]) - e[4].hot_offset()) for e in tails),
+                           "skeletonBytes": sum(int(e[4].skel_bytes) for e in tails if e[4].skel is not None),
+                           "skeletons": sum(min(len(e[4].skel), e[4].ncold) for e in tails if e[4].skel is not None),
                            "fileBytes": sum(int(e[1]) for e in tails), "tailBytes": _TAIL_BYTES, "tailRecords": _TAIL_RECORDS}
     out["coldReads"] = cold_read_stats()
     with _JSONL_CACHE_LOCK:
@@ -2173,10 +2175,12 @@ class _TailRecords:
     Deliberately not a list subclass: the C json encoder and other C fast paths read a list subclass's storage directly,
     which here would be the window alone, a silent truncation. A caller that needs a real list fails loudly instead.
     Immutable once built, like every list the reader serves (the reader builds a new one per append)."""
-    __slots__ = ("path", "offs", "ncold", "hot", "guard_off", "guard", "crcs", "ident", "skel", "gen", "__weakref__")
+    __slots__ = ("path", "offs", "ncold", "hot", "guard_off", "guard", "crcs", "ident", "skel", "skel_bytes", "gen",
+                 "__weakref__")
 
     def __init__(self, path, offs, ncold, hot, guard_off, guard, crcs, ident):
         self.skel = None                                  # the walk skeletons of records 0..ncold (see _skel), or None
+        self.skel_bytes = 0                               # what those skeletons hold (_skel_bytes, summed as they are built)
         self.gen = None                                   # the reader's generation for the entry (set by the reader): _refuse drops
         #                                                   the cached entry of the same generation, the lineage that indexed it
         self.path = path
@@ -2513,8 +2517,36 @@ def _skel_bare(r):
     return s
 
 
-_SKEL_BYTES_PER_RECORD = 600      # a skeleton's measured weight (581 bytes a record over the synthetic transcript mix the tests
-#                                   write, 2026-10-07): what _entry_weight adds per record before the window
+def _skel_val_bytes(v):
+    """The memory a skeleton's field value holds that nothing else does once the decoded record is freed: a shared word
+    (_skel_word), a shared bare skeleton and the singletons hold nothing; a string by its length (a user record's text
+    counts in full); a skeleton, list or dict by its own size plus its contents'."""
+    t = type(v)
+    if v is None or t is bool:
+        return 0
+    if t is str:
+        return 0 if _SKEL_WORDS.get(v) is v else sys.getsizeof(v)
+    if t is _SkelRec and _SKEL_BARE.get(dict.get(v, "type")) is v:
+        return 0
+    if isinstance(v, dict):
+        n = sys.getsizeof(v)
+        for x in dict.values(v):
+            n += _skel_val_bytes(x)
+        return n
+    if t is list:
+        n = sys.getsizeof(v)
+        for x in v:
+            n += _skel_val_bytes(x)
+        return n
+    return sys.getsizeof(v)
+
+
+def _skel_bytes(s):
+    """One skeleton's own weight once its decoded record is freed (_skel_val_bytes): the containers it built and the strings
+    it keeps (ids, parent links, the timestamp, the message and tool ids, a user record's text). A review measured the first
+    flat charge (600 bytes a record, taken while the decoded records were still alive) at 25 to 40 percent under what the
+    skeletons hold alone, and without bound for a long user text (2026-10-07)."""
+    return _skel_val_bytes(s)
 
 
 def _skel(r):
@@ -2613,26 +2645,33 @@ def _skel_entry(old, ncold_combined, hot_combined, dropped_skel, dropped_n, scan
         if osk is None or len(osk) < oc:
             return None
         out = osk if len(osk) == oc else osk[:oc]
+        nbytes = int(old.skel_bytes)                      # the earlier entry's skeletons 0..oc, summed when it was built
     else:
         oc, oh = 0, (old or [])
         out = []
+        nbytes = 0
     if len(out) > want:                                   # (never: a window only moves forward) a fresh prefix, the old list kept
-        return out[:want]
+        out = out[:want]
+        final.skel_bytes = sum(_skel_bytes(x) for x in out)
+        return out
     i = len(out)
     while i < want:
         if i < oc + len(oh):
-            out.append(_skel(oh[i - oc]))
+            sk = _skel(oh[i - oc])
         elif i < scan_start + dropped_n:
             k = i - scan_start
             if dropped_skel is None or k >= len(dropped_skel):
                 return None
-            out.append(dropped_skel[k])
+            sk = dropped_skel[k]
         else:
             j = i - ncold_combined
             if j < 0 or j >= len(hot_combined):
                 return None
-            out.append(_skel(hot_combined[j]))
+            sk = _skel(hot_combined[j])
+        nbytes += _skel_bytes(sk)
+        out.append(sk)
         i += 1
+    final.skel_bytes = nbytes
     return out
 
 

@@ -201,7 +201,7 @@ class LargeTranscriptHoldsItsTail(Base):
             window = size - got.hot_offset()
             self.assertLessEqual(window, 32 * MIB + 400 * 1024, "the window is the last 32 MiB (plus at most one record)")
             stats = em.record_cache_stats()
-            skel = (getattr(em, "_SKEL_BYTES_PER_RECORD", 0) + 8) * count   # the walk skeleton of each older record (review fix)
+            skel = 8 * count + int(getattr(got, "skel_bytes", 0) or 0)   # the walk skeleton of each older record, by what it holds
             self.assertLess(stats["bytes"], int(3 * (32 * MIB + 400 * 1024)) + 20 * count + skel + 1,
                             "the cache weighs the window, the index and the skeletons, not the file: %d" % stats["bytes"])
             self.assertLess(held - base_now, 160 * MIB,
@@ -1043,3 +1043,80 @@ class SkeletonsStayOutOfTheCollectorsWalk(Base):
             recs = em._read_jsonl_entry(path)[4]
             self.assertEqual([i for i, s in enumerate(recs.skel[:recs.ncold]) if gc.is_tracked(s)], [])
             self.assertFalse(gc.is_tracked(recs.skel))
+
+
+def _counted_skeleton_bytes(skels):
+    """What the cache counts for these skeletons (and their list's pointers): each skeleton by what it holds, or, on a tree
+    with the first flat charge, that charge."""
+    fn = getattr(em, "_skel_bytes", None)
+    if fn is not None:
+        return sum(fn(s) for s in skels) + 8 * len(skels)
+    return len(skels) * (getattr(em, "_SKEL_BYTES_PER_RECORD", 0) + 8)
+
+
+def _weight_mix(n, rnd, prompt_words=300):
+    """Synthetic records of every skeleton shape: the coding-session mix, long typed prompts, queued prompts and a compaction
+    boundary with its preserved segment (invented text, placeholder ids)."""
+    out = []
+    for i in range(n):
+        r = _rec(i, rnd)
+        if i % 10 == 4:
+            r["message"]["content"] = " ".join(rnd.choice(WORDS) for _ in range(prompt_words))
+        if i % 50 == 7:
+            r = {"type": "attachment", "uuid": r["uuid"], "parentUuid": r["parentUuid"], "timestamp": r["timestamp"],
+                 "attachment": {"type": "queued_command", "prompt": " ".join(rnd.choice(WORDS) for _ in range(40))}}
+        if i % 200 == 99:
+            r = {"type": "system", "subtype": "compact_boundary", "uuid": r["uuid"], "parentUuid": None,
+                 "logicalParentUuid": r["parentUuid"], "timestamp": r["timestamp"],
+                 "compactMetadata": {"trigger": "auto", "preTokens": 9000,
+                                     "preservedSegment": {"headUuid": r["parentUuid"], "anchorUuid": r["parentUuid"],
+                                                          "tailUuid": r["parentUuid"]}}}
+        out.append(r)
+    return out
+
+
+class SkeletonWeightIsWhatSkeletonsHold(Base):
+    """The cache counts each skeleton by what it holds once its decoded record is freed (review find, 2026-10-07): the first
+    flat charge, 600 bytes a record, was measured while the records were still alive, and the skeletons alone held 25 to 40
+    percent more (ids, parent links, timestamps, message and tool ids, a user record's text), without bound for a long user
+    text. The counted figure must stay within about 10 percent of tracemalloc's, measured after the records are freed."""
+
+    def test_the_counted_weight_is_within_ten_percent_of_tracemalloc_after_the_records_are_freed(self):
+        import gc
+        for prompt_words in (12, 300, 2000):
+            with self.subTest(prompt_words=prompt_words):
+                lines = [json.dumps(r) for r in _weight_mix(20000, random.Random(prompt_words), prompt_words)]
+                gc.collect()
+                tracemalloc.start()
+                try:
+                    b0, _ = tracemalloc.get_traced_memory()
+                    recs = [json.loads(l) for l in lines]        # decoded the way the scan decodes them
+                    skels = [em._skel(r) for r in recs]
+                    del recs                                       # the records leave memory: what stays is the skeletons
+                    gc.collect()
+                    held = tracemalloc.get_traced_memory()[0] - b0
+                finally:
+                    tracemalloc.stop()
+                counted = _counted_skeleton_bytes(skels)
+                self.assertLess(abs(counted - held) / held, 0.10,
+                                "counted %d bytes for %d skeletons, tracemalloc holds %d (%.0f against %.0f a record)"
+                                % (counted, len(skels), held, counted / len(skels), held / len(skels)))
+
+    def test_a_tail_only_entrys_weight_carries_its_skeletons_and_a_long_prompt_by_its_length(self):
+        with knobs(32 * 1024, 4, roots=[str(self.proj)]):
+            path = self.leaf()
+            rnd = random.Random(3)
+            recs = _weight_mix(3000, rnd)
+            recs[100] = dict(recs[100], type="user", message={"role": "user", "content": "q" * 1000000})   # a pasted megabyte
+            Path(path).write_text("".join(json.dumps(r) + "\n" for r in recs))
+            ent = em._read_jsonl_entry(path)
+            t = ent[4]
+            self.assertTrue(_tail(t) and t.ncold > 200)
+            held = max(0, ent[1] - t.hot_offset())
+            base = int(held * em.RECORD_CACHE_RESIDENT_PER_FILE_BYTE) + len(t.offs) * t.offs.itemsize + len(t.crcs) * t.crcs.itemsize
+            skel_term = em._entry_weight(ent) - base
+            self.assertEqual(skel_term, _counted_skeleton_bytes(t.skel[:t.ncold]),
+                             "the entry's weight counts its skeletons as each holds")
+            self.assertGreater(skel_term, 1000000, "the pasted megabyte before the window is counted by its length")
+            stats = em.record_cache_stats()["tailOnly"]
+            self.assertEqual((stats.get("skeletonBytes"), stats.get("skeletons")), (t.skel_bytes, t.ncold))
