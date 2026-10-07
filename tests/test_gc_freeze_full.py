@@ -330,6 +330,19 @@ class RealCollector(unittest.TestCase):
         self.assertGreaterEqual(gc.get_freeze_count() - frozen0, 40000, "the heap's dicts and lists are frozen")
         self.assertFalse(any(o is heap for o in gc.get_objects(2)), "and gone from the oldest generation's walk")
 
+    def test_the_stored_frozen_count_tracks_the_real_one_at_each_freeze_and_reclaim(self):
+        gc.unfreeze(); gc.collect()
+        c = self._controller(full_backstop_ratio=1)
+        heap = [{"k": [i]} for i in range(20000)]
+        gc.collect()                                          # a callback freeze: the stored count adds what it froze
+        real = gc.get_freeze_count()
+        self.assertLessEqual(abs(c.frozen_count - real), max(50, real // 100), (c.frozen_count, real))
+        del heap[:10000]                                      # frozen objects dying by refcount: the stored count is an upper bound
+        self.assertGreaterEqual(c.frozen_count, gc.get_freeze_count())
+        c.remove_full_freeze()
+        self.assertEqual(c.tick(1), "backstop")               # a reclaim re-reads the whole count
+        self.assertLessEqual(abs(c.frozen_count - gc.get_freeze_count()), 50, "a reclaim re-reads it (a few temporaries apart)")
+
     def test_a_cycle_formed_later_among_frozen_objects_waits_for_the_backstop(self):
         gc.unfreeze(); gc.collect()
         c = self._controller(full_backstop_ratio=1)

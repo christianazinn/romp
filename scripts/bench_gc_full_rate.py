@@ -16,7 +16,10 @@ The workload (SYNTHETIC only: invented text, no real transcript):
   - a steady churn paced to the live kernel's generation-0 rate (~70 collections a second): each request decodes a JSON
     message and builds a dict from it (short-lived), keeps both for a few seconds (medium-lived: promoted into the old
     generation, then freed, which is what drives CPython 3.12's "pending > a quarter of the long-lived total" rule), and
-    one request in 25 leaves a reference cycle behind when it is dropped (cyclic garbage only the collector frees);
+    one request in 25 (--cycle-every) leaves a reference cycle behind when it is dropped (cyclic garbage only the collector
+    frees); each cycle counts its own free, so a row reports the peak of cycles that are DEAD but not yet collected, in
+    cycles and in MiB (bytes per cycle measured once with tracemalloc): with the freeze, this includes the cycles a freeze
+    pinned until a backstop (run --cycle-every 5 --cycle-life-s 5 for a row that stresses it);
   - an idle tick every second calls the controller's tick, so its backstop reclaims run and are timed like the kernel's.
 Every collection is timed by a gc.callbacks hook; only the steady phase after the heap is built is measured.
 
@@ -100,6 +103,19 @@ class Rec:
         self.children = []
 
 
+FREED = [0]
+
+
+class CycNode:
+    """One request's leftover reference cycle (it points at itself and holds the request's decoded message and result). Its
+    finalizer counts frees, so created - freed - still-in-window is the cycles that are DEAD but not yet collected: the ones
+    waiting for the next full collection, and, with the freeze, the ones a freeze pinned until a backstop."""
+    __slots__ = ("me", "payload", "__weakref__")
+
+    def __del__(self):
+        FREED[0] += 1
+
+
 def _untrack_all(obj, untrack):
     stack = [obj]
     while stack:
@@ -112,7 +128,7 @@ def _untrack_all(obj, untrack):
             untrack(o)
 
 
-def child(size_gb, setting, seconds, seed, gen0_rate, life_s):
+def child(size_gb, setting, seconds, seed, gen0_rate, life_s, cycle_every=25, cycle_life_s=None):
     import ctypes
     import gc
     t2, full_ms = SETTINGS[setting]
@@ -121,6 +137,24 @@ def child(size_gb, setting, seconds, seed, gen0_rate, life_s):
     spec.loader.exec_module(gcf)
     rng = random.Random(seed)
     texts = [json.dumps(_message(rng, i)) for i in range(256)]
+    cycle_life_s = life_s if cycle_life_s is None else cycle_life_s
+    # bytes per leftover cycle, measured once: the node, the request's decoded message and its result dict
+    import tracemalloc
+    tracemalloc.start()
+    m0 = tracemalloc.get_traced_memory()[0]
+    sample = []
+    for k in range(2000):
+        dd = json.loads(texts[k % 256])
+        cn = CycNode(); cn.me = cn
+        cn.payload = ({"id": k, "blocks": [{"k": b.get("type"), "n": len(b)} for b in dd["message"]["content"]],
+                       "tmp": [x for x in dd["meta"]["tags"]]}, dd)
+        sample.append(cn)
+    bytes_per_cycle = (tracemalloc.get_traced_memory()[0] - m0) / 2000.0
+    tracemalloc.stop()
+    for cn in sample:
+        cn.me = None; cn.payload = None
+    del sample, cn, dd
+    FREED[0] = 0
 
     # the timing hook: every collection, by generation
     tally = {0: [0, 0.0, 0.0], 1: [0, 0.0, 0.0], 2: [0, 0.0, 0.0]}
@@ -195,6 +229,9 @@ def child(size_gb, setting, seconds, seed, gen0_rate, life_s):
     rps = 2000.0
     g0_mark = 0
     med = collections.deque()
+    medc = collections.deque()                   # the leftover cycles, each kept for cycle_life_s (alive past a freeze, then dead)
+    created = 0
+    dead_peak = 0
     grow_per_s = max(1.0, len(base) / 100.0 / 60.0)   # ~1% of the long-lived heap a minute
     grown = 0
     i = 0
@@ -208,14 +245,17 @@ def child(size_gb, setting, seconds, seed, gen0_rate, life_s):
         d = json.loads(texts[i % 256])
         r = {"id": i, "blocks": [{"k": b.get("type"), "n": len(b)} for b in d["message"]["content"]],
              "tmp": [x for x in d["meta"]["tags"]]}
-        if i % 25 == 0:
-            c = {"payload": d, "r": r}
-            c["me"] = c                          # a cycle: freed only by the collector once the window drops it
-            med.append((now, c))
+        if i % cycle_every == 0:
+            c = CycNode(); c.me = c; c.payload = (r, d)   # a cycle: freed only by the collector once its window drops it
+            medc.append((now, c))
+            created += 1
+            del c
         else:
             med.append((now, (r, d)))
         while med and med[0][0] < now - life_s:
             med.popleft()
+        while medc and medc[0][0] < now - cycle_life_s:
+            medc.popleft()
         if grown < (now - t_start) * grow_per_s:
             base.append(Rec(n, d)); n += 1; grown += 1
         i += 1
@@ -232,6 +272,7 @@ def child(size_gb, setting, seconds, seed, gen0_rate, life_s):
             next_tick = paced_from + 1.0
             rss = _status_kb("VmRSS")
             rss_peak = max(rss_peak, rss)
+            dead_peak = max(dead_peak, created - FREED[0] - len(medc))
         due = paced_from + (i - paced_i) / rps   # pace to the current rate
         if due > now:
             time.sleep(due - now)
@@ -243,6 +284,7 @@ def child(size_gb, setting, seconds, seed, gen0_rate, life_s):
     # backstop or a release reclaim costs at this heap; what it collects is the cyclic garbage nothing else could free
     # (with the freeze on: the cycles it pinned), and the resident drop after malloc_trim is that garbage's memory.
     med.clear()
+    medc.clear()
     gc.collect()                                 # first the unfrozen garbage, so the backstop's count is the frozen part
     last2[0] = 0                                 # the tally is closed (measuring is False): the backstop is reported apart
     t_b = time.perf_counter()
@@ -268,6 +310,9 @@ def child(size_gb, setting, seconds, seed, gen0_rate, life_s):
            "hwm_mib": _status_kb("VmHWM") // 1024,
            "ctl": {"freezes": ctl.freezes, "reclaims": ctl.reclaims, "fullFreezes": ctl.full_freezes, "threshold": list(gc.get_threshold()),
                    "callbackErrors": ctl.callback_errors, "ticks": collections.Counter(ticks)},
+           "cycle_every": cycle_every, "cycle_life_s": cycle_life_s, "cycles_created": created,
+           "bytes_per_cycle": round(bytes_per_cycle), "dead_uncollected_peak_cycles": dead_peak,
+           "dead_uncollected_peak_mib": round(dead_peak * bytes_per_cycle / MIB, 2),
            "ctl_in_window": ctl_tally[0], "ctl_in_window_ms_sum": round(ctl_tally[1], 1),
            "ctl_in_window_ms_max": round(ctl_tally[2], 1), "ctl_in_window_share": round(ctl_tally[1] / 1000.0 / wall, 4),
            "frozen_at_end": gc.get_freeze_count(), "backstop_ms": round(backstop_ms, 1),
@@ -332,6 +377,8 @@ def main():
     ap.add_argument("--seed", type=int, default=7)
     ap.add_argument("--gen0-rate", type=float, default=70.0, help="target generation-0 collections a second (live: ~70)")
     ap.add_argument("--life-s", type=float, default=1.0, help="medium-lived request lifetime in seconds")
+    ap.add_argument("--cycle-every", type=int, default=25, help="one request in N leaves a reference cycle")
+    ap.add_argument("--cycle-life-s", type=float, default=None, help="how long a leftover cycle lives (default --life-s)")
     ap.add_argument("--out", default=None)
     ap.add_argument("--summarize", default=None)
     ap.add_argument("--at-gb", type=float, default=16.0)
@@ -341,7 +388,7 @@ def main():
         summarize(a.summarize, a.at_gb)
         return
     if a.child:
-        child(a.size_gb, a.setting, a.seconds, a.seed, a.gen0_rate, a.life_s)
+        child(a.size_gb, a.setting, a.seconds, a.seed, a.gen0_rate, a.life_s, a.cycle_every, a.cycle_life_s)
         return
     sizes = [float(x) for x in a.sizes.split(",")]
     settings = a.settings.split(",")
@@ -356,7 +403,8 @@ def main():
                 sys.exit("refused: MemAvailable %d MiB is under three times the run's need (%d MiB); the machine is shared"
                          % (avail, need_mib))
             cmd = [sys.executable, os.path.realpath(__file__), "--child", "--size-gb", str(size), "--setting", s,
-                   "--seconds", str(a.seconds), "--seed", str(a.seed), "--gen0-rate", str(a.gen0_rate), "--life-s", str(a.life_s)]
+                   "--seconds", str(a.seconds), "--seed", str(a.seed), "--gen0-rate", str(a.gen0_rate), "--life-s", str(a.life_s),
+                   "--cycle-every", str(a.cycle_every)] + (["--cycle-life-s", str(a.cycle_life_s)] if a.cycle_life_s is not None else [])
             env = dict(os.environ, PYTHONHASHSEED="0")
             res = subprocess.run(cmd, capture_output=True, text=True, env=env)
             line = res.stdout.strip().splitlines()[-1] if res.stdout.strip() else ""
@@ -365,8 +413,10 @@ def main():
                 continue
             out.write(line + "\n"); out.flush()
             r = json.loads(line)
-            sys.stderr.write("%s @ %.0f GB: %.0f full/h, avg %.0f ms, max %.0f ms, %.2f%% paused, peak %d MiB\n" % (
-                s, size, r["full_per_hour"], r["full_avg_ms"], r["gen2_ms_max"], 100 * r["full_share"], r["rss_peak_mib"]))
+            sys.stderr.write("%s @ %.0f GB: %.0f full/h, avg %.0f ms, max %.0f ms, %.2f%% paused, peak %d MiB, dead-uncollected "
+                             "cycles peak %d (%.1f MiB)\n" % (
+                s, size, r["full_per_hour"], r["full_avg_ms"], r["gen2_ms_max"], 100 * r["full_share"], r["rss_peak_mib"],
+                r["dead_uncollected_peak_cycles"], r["dead_uncollected_peak_mib"]))
 
 
 if __name__ == "__main__":

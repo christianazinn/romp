@@ -2284,7 +2284,10 @@ The snapshot's fields, all plain numbers (`ms` is milliseconds of wall time):
   measured ~97 fold-ins an hour), so a cycle released by an owner nobody
   registered is bounded by the next thousand loads, not the process lifetime. The
   sub-block carries `enabled`, `active` (whether a freeze is held now; named
-  apart from the integer `frozen` above, which is `gc.get_freeze_count()`),
+  apart from the integer `frozen` above, which is the controller's STORED count of
+  frozen objects as of its last freeze: an upper bound between reclaims, re-read
+  whole at each reclaim, and never `gc.get_freeze_count()`, which walks the frozen
+  list and would stall every read once the long-lived heap is frozen),
   `loadTrees` and `backstopFoldins` (the two thresholds), `freezes` and
   `reclaims` (a freeze ran one collection and a reclaim ran one, EXCEPT a full
   release that unfroze runs TWO generation-2 collections for its one reclaim, so
@@ -2332,6 +2335,19 @@ The snapshot's fields, all plain numbers (`ms` is milliseconds of wall time):
   stderr, as in `heap`; the tallies themselves need none. The kernel-samples
   rows carry the same generation-2 tallies as `gcGen2Collections` and
   `gcGen2MsSum`, cumulative, to difference per interval beside `rssKb`.
+  The FULL-COLLECTION freeze (2026-10-07; `ROMP_GC_FREEZE_FULL_MS`, default 250, `off`
+  restores the collector as before) freezes from the collector's own stop callback after
+  an organic full collection that paused at least `fullFreezeMs`, and raises the third
+  collection threshold to `fullT2` (`ROMP_GC_FREEZE_FULL_T2`, default 100). Its fields:
+  `fullFreezes` (freezes it ran), `lastFullMs` (the pause that last froze),
+  `fullSinceReclaim` (its freezes since the last reclaim), `fullMsSinceReclaim` and
+  `fullRefMs` (organic full-collection pause since the last reclaim, and the largest walk
+  seen, about the whole heap): a backstop reclaim is owed once the first reaches
+  `fullBackstopRatio` times the second. While one is owed nothing more is frozen
+  (`fullFreezeSkips`); `owedForS` says how long it has been owed (null when not), and once
+  it reaches `fullForceS` (`ROMP_GC_FREEZE_FULL_FORCE_S`, default 600, `off` waits for an
+  idle tick only) a BUSY pusher cycle runs it, counted in `forced`. `callbackErrors`
+  counts failures inside the callback, never raised into the collector.
 - `jobs`: the jobs thread, which runs the housekeeping (the sweeps, the
   reminder walk, the interrupt tick, the persists, the pause and retry
   family) off the pusher since 2026-09-13, so no browser frame waits on a
