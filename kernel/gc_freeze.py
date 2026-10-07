@@ -185,6 +185,7 @@ class GcFreeze:
         self._owed_since = None      # the clock when the full backstop was first seen owed; None while not owed
         self.full_freeze_skips = 0   # freezes the callback skipped because a backstop was owed (pinning frozen until it runs)
         self.forced = 0              # owed full backstops run on a busy pusher cycle because no idle tick came within full_force_s
+        self.reclaim_skips = 0       # reclaims whose collection did not run (another thread was collecting): left owed, retried
         self.full_t2 = int(full_t2) if full_t2 else None   # the third threshold installed with the full freeze; None leaves it
         self._saved_threshold = None # the thresholds install_full_freeze replaced, restored by remove_full_freeze
         self._full_t0 = None         # the open generation-2 collection's start (the collector serialises collections: one slot)
@@ -295,12 +296,14 @@ class GcFreeze:
             self._gc.collect(); self.collections += 1    # cheap: the freeze stays in place, so this walks only the unfrozen
             if any(sref() is not None for sref, _ in owed):
                 self._gc.unfreeze()                  # a survivor: the released cycle is in the frozen set, lift it and walk
-                self._gc.collect(); self.collections += 1
+                if not self._collect_ran():
+                    return self._reclaim_did_not_run(owed)
                 reclaimed = True
             # else the cheap collect took the released cycle whole: no full pause, counted as a load pass below
         elif kind == "backstop":
             self._gc.unfreeze()                      # blind periodic reclaim: nothing owed to re-read, walk everything
-            self._gc.collect(); self.collections += 1
+            if not self._collect_ran():
+                return self._reclaim_did_not_run([])
             reclaimed = True
         else:
             self._gc.collect(); self.collections += 1    # initial / load fold-in: walk only the unfrozen
@@ -338,6 +341,34 @@ class GcFreeze:
             if was_frozen:
                 self._foldins += 1                   # a load fold-in; the initial freeze is not one
         return self.last_kind
+
+    def _collect_ran(self):
+        """gc.collect() for a reclaim, and whether a generation-2 collection actually RAN: the call returns 0 without
+        collecting while another thread is inside a collection (the collecting flag stays set through the callbacks, with
+        the interpreter lock released), so the collector's own count is read around it. A collector without get_stats (a
+        test double) is taken to have run."""
+        try:
+            before = self._gc.get_stats()[2]["collections"]
+        except Exception:
+            before = None
+        self._gc.collect(); self.collections += 1
+        if before is None:
+            return True
+        try:
+            return self._gc.get_stats()[2]["collections"] > before
+        except Exception:
+            return True
+
+    def _reclaim_did_not_run(self, owed):
+        """A reclaim whose collection did not run: re-freeze (the unfreeze moved everything back into the walk), count it,
+        put the owed sessions back on the ended list, and change nothing else, so the backstop or release stays owed and the
+        next boundary retries. Returns None (no reconcile ran)."""
+        self._gc.freeze()
+        self.reclaim_skips += 1
+        if owed:
+            with self._ended_lock:
+                self._ended.extend(owed)
+        return None
 
     def gc_callback(self, phase, info):
         """The gc.callbacks hook for the full-collection freeze. Times each generation-2 collection from "start" to "stop"
@@ -409,7 +440,8 @@ class GcFreeze:
         if not self.force_due():
             return None
         self.resolve_ended()                         # judge the ended list as the idle tick would (the reclaim covers them all)
-        self._run("backstop", inserts, [])
+        if self._run("backstop", inserts, []) is None:
+            return None                              # the collection did not run: still owed, the next boundary retries
         self.forced += 1
         return "forced"
 
@@ -453,6 +485,7 @@ class GcFreeze:
                 "fullSinceReclaim": self._full_since_reclaim, "fullBackstopRatio": self.full_backstop_ratio,
                 "fullMsSinceReclaim": round(self._full_ms_since_reclaim, 1), "fullRefMs": round(self._full_ref_ms, 1),
                 "fullFreezeSkips": self.full_freeze_skips, "fullForceS": self.full_force_s, "forced": self.forced,
+                "reclaimSkips": self.reclaim_skips,
                 "owedForS": round(self._clock() - self._owed_since, 1) if self._owed_since is not None else None,
                 "lastFullMs": round(self.last_full_ms, 1), "callbackErrors": self.callback_errors}
 

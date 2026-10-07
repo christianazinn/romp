@@ -208,6 +208,57 @@ class OwedUnderLoad(unittest.TestCase):
             self.assertEqual(f({"ROMP_GC_FREEZE_FULL_FORCE_S": bad}), (gf.DEFAULT_FULL_FORCE_S, bad), bad)
 
 
+class StatsGc(FakeGc):
+    """A collector double whose collect() may silently not run, as the real one returns 0 without collecting while another
+    thread is inside a collection (the collecting flag stays set through the callbacks with the interpreter lock released)."""
+    def __init__(self):
+        super().__init__()
+        self.runs = True
+        self.n2 = 0
+    def collect(self, *a):
+        self.calls.append("collect")
+        if self.runs:
+            self.n2 += 1
+        return 0
+    def get_stats(self):
+        return [{"collections": 0}, {"collections": 0}, {"collections": self.n2}]
+
+
+class ReclaimThatDidNotRun(unittest.TestCase):
+    """2026-10-07 review of 69dc51e33: a reclaim's gc.collect() can return without collecting; it must not be recorded as a
+    reclaim (owed state cleared, the frozen cycles never walked). It stays owed and the next boundary retries."""
+    def test_a_backstop_whose_collect_did_not_run_stays_owed_and_retries(self):
+        fake, clock = StatsGc(), Clock()
+        c = gf.GcFreeze(enabled=True, gc=fake, clock=clock, full_freeze_ms=250.0, full_backstop_ratio=1, full_force_s=600)
+        c.tick(1)
+        _collection(c, clock, 2, 300.0)           # a freeze, and owed at once (ratio 1)
+        fake.runs = False
+        fake.calls.clear()
+        self.assertIsNone(c.tick(1), "the collect did not run: not a backstop")
+        self.assertEqual(fake.calls, ["unfreeze", "collect", "freeze"], "re-frozen, so the controller's state is restored")
+        self.assertEqual((c.reclaims, c.reclaim_skips, c.full_backstop_owed()), (0, 1, True))
+        clock.t += 700.0
+        self.assertIsNone(gf.pusher_tick(c, False, False, lambda: {"inserts": 1}, lambda e: None), "a forced run that did not run")
+        self.assertEqual((c.forced, c.reclaim_skips), (0, 2))
+        fake.runs = True
+        self.assertEqual(gf.pusher_tick(c, False, False, lambda: {"inserts": 1}, lambda e: None), "forced", "retried and ran")
+        self.assertEqual((c.forced, c.reclaims, c.full_backstop_owed()), (1, 1, False))
+
+    def test_a_release_whose_full_collect_did_not_run_keeps_its_owed_sessions(self):
+        fake, clock = StatsGc(), Clock()
+        c = gf.GcFreeze(enabled=True, gc=fake, clock=clock)
+        c.tick(1)
+        class Owner: sid = "aaaaaaaa-0000"
+        o = Owner()
+        c.note_ended(o)                           # no thread: judged a surviving cycle, a release is owed
+        fake.runs = False
+        self.assertIsNone(c.tick(1))
+        self.assertEqual((c.reclaims, c.reclaim_skips, len(c._ended)), (0, 1, 1), "the owed session is registered again")
+        fake.runs = True
+        self.assertEqual(c.tick(1), "release")
+        self.assertEqual(c.reclaims, 1)
+
+
 class FoldinBackstopUnderLoad(unittest.TestCase):
     """2026-10-07 review: the older fold-in backstop (after `backstop_foldins` load fold-ins) also ran only on an idle tick,
     and the live kernel once read 4 idle pusher cycles in 91. It now shares the full backstop's owed clock and forced run."""
