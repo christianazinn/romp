@@ -196,9 +196,10 @@ class GcFreeze:
         self._full_ref_ms = 0.0      # the largest walk seen since (and including) the last reclaim: about the whole heap
         self.last_full_ms = 0.0      # the pause of the organic full collection that last froze
         self.callback_errors = 0     # failures inside gc_callback: counted, never raised into the collector
-        self.frozen_count = 0        # objects frozen as of the last freeze, kept here so a /perf read never walks the frozen list
-        #                              (gc.get_freeze_count is a walk): an upper bound between reclaims, since frozen objects that
-        #                              die by reference counting leave the list without this count seeing it; re-read whole at each reclaim
+        self.frozen_as_of_cleanup = None     # the frozen count re-read at the LAST RECLAIM (gc.get_freeze_count walks the frozen
+        #                                      list, so it is read only inside a reclaim's pause, never on a /perf read and never
+        #                                      at a freeze: listing what a freeze adds was the same whole-heap walk); None until one
+        self.frozen_as_of_cleanup_at = None  # that reclaim's wall-clock time (epoch seconds)
         self.load_trees = max(MIN_LOAD_TREES, int(load_trees))
         self.backstop_foldins = max(1, int(backstop_foldins))
         self._gc = gc
@@ -309,15 +310,13 @@ class GcFreeze:
             self._gc.collect(); self.collections += 1    # initial / load fold-in: walk only the unfrozen
         self.last_ms = (self._clock() - t0) * 1000.0
         self.total_ms += self.last_ms
-        n = None if reclaimed else self._unfrozen_count()   # a fold-in adds what it freezes; a reclaim re-reads the whole below
         self._gc.freeze()                            # (re)freeze: the survivors leave the collector's walk again
         if reclaimed:
             try:
-                self.frozen_count = int(self._gc.get_freeze_count())   # one walk of the frozen list, inside the pause a reclaim pays
+                self.frozen_as_of_cleanup = int(self._gc.get_freeze_count())   # one walk of the frozen list, inside the pause a
+                self.frozen_as_of_cleanup_at = round(time.time(), 1)           #  reclaim already pays; served as of this cleanup
             except Exception:
                 pass
-        elif n is not None:
-            self.frozen_count += n
         was_frozen = self.frozen
         self.frozen = True
         self._ins_mark = inserts
@@ -394,25 +393,13 @@ class GcFreeze:
             if self._backstop_owed():                # a backstop owed and not yet run: freeze nothing more, so the pinned set cannot grow
                 self.full_freeze_skips += 1
                 return
-            n = self._unfrozen_count()               # the survivors about to be frozen: at most what this collection just walked
             self._gc.freeze()
-            if n is not None:
-                self.frozen_count += n
             self.frozen = True
             self.full_freezes += 1
             self._full_since_reclaim += 1
             self.last_full_ms = dt
         except Exception:
             self.callback_errors += 1
-
-    def _unfrozen_count(self):
-        """How many tracked objects are outside the frozen set right now (what a freeze is about to add): the sizes of the
-        three generations, read by listing them. Called only where that set is small (right after a collection walked it).
-        None on a collector without get_objects (a test double)."""
-        try:
-            return sum(len(self._gc.get_objects(generation=g)) for g in (0, 1, 2))
-        except Exception:
-            return None
 
     def full_backstop_owed(self):
         """Whether the full-collection freeze owes a backstop reclaim: a freeze ran since the last reclaim (so something
@@ -485,7 +472,8 @@ class GcFreeze:
                 "fullSinceReclaim": self._full_since_reclaim, "fullBackstopRatio": self.full_backstop_ratio,
                 "fullMsSinceReclaim": round(self._full_ms_since_reclaim, 1), "fullRefMs": round(self._full_ref_ms, 1),
                 "fullFreezeSkips": self.full_freeze_skips, "fullForceS": self.full_force_s, "forced": self.forced,
-                "reclaimSkips": self.reclaim_skips,
+                "reclaimSkips": self.reclaim_skips, "frozenAsOfCleanup": self.frozen_as_of_cleanup,
+                "frozenAsOfCleanupAt": self.frozen_as_of_cleanup_at,
                 "owedForS": round(self._clock() - self._owed_since, 1) if self._owed_since is not None else None,
                 "lastFullMs": round(self.last_full_ms, 1), "callbackErrors": self.callback_errors}
 

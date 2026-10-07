@@ -320,6 +320,47 @@ def child(size_gb, setting, seconds, seed, gen0_rate, life_s, cycle_every=25, cy
     print(json.dumps(out), flush=True)
 
 
+def listing_child(size_gb, seed):
+    """What listing or counting a large heap costs (the 2026-10-07 review): a tracked decoded-JSON heap of `size_gb`
+    resident, then timed, each once: len(gc.get_objects()) (the listing a per-freeze count would pay), a full collection,
+    gc.freeze() (a pointer move) and gc.get_freeze_count() (a walk of the frozen list, what a cleanup pays to re-read)."""
+    import gc
+    rng = random.Random(seed)
+    texts = [json.dumps(_message(rng, i)) for i in range(256)]
+    rss1 = _status_kb("VmRSS")
+    base, n = [], 0
+    while _status_kb("VmRSS") - rss1 < int(size_gb * 1024 * 1024):
+        for _ in range(5000):
+            base.append(Rec(n, json.loads(texts[n % 256]))); n += 1
+    out = {"mode": "listing", "size_gb": size_gb, "heap_mib": (_status_kb("VmRSS") - rss1) // 1024}
+    gc.collect()
+    t = time.perf_counter(); k = len(gc.get_objects()); out["get_objects_ms"] = round((time.perf_counter() - t) * 1000, 1)
+    out["tracked_objects"] = k
+    t = time.perf_counter(); gc.collect(); out["full_collect_ms"] = round((time.perf_counter() - t) * 1000, 1)
+    t = time.perf_counter(); gc.freeze(); out["freeze_ms"] = round((time.perf_counter() - t) * 1000, 3)
+    t = time.perf_counter(); f = gc.get_freeze_count(); out["get_freeze_count_ms"] = round((time.perf_counter() - t) * 1000, 1)
+    out["frozen_objects"] = f
+    gc.unfreeze()
+    out["hwm_mib"] = _status_kb("VmHWM") // 1024
+    print(json.dumps(out), flush=True)
+
+
+def summarize_listing(rows, at_gb):
+    rows = sorted(rows, key=lambda r: r["size_gb"])
+    print("LISTING COST (one read each, fresh process per size):")
+    print("%5s %8s %12s %14s %12s %10s %16s" % ("GB", "heapMiB", "objects", "get_objects ms", "collect ms", "freeze ms",
+                                              "freeze_count ms"))
+    for r in rows:
+        print("%5.1f %8d %12d %14.1f %12.1f %10.3f %16.1f" % (r["size_gb"], r["heap_mib"], r["tracked_objects"],
+              r["get_objects_ms"], r["full_collect_ms"], r["freeze_ms"], r["get_freeze_count_ms"]))
+    if len(rows) >= 2:
+        xs = [r["heap_mib"] / 1024.0 for r in rows]
+        print("EXTRAPOLATION to %.0f GB (linear fit; NOT a measurement):" % at_gb)
+        for key in ("get_objects_ms", "full_collect_ms", "get_freeze_count_ms"):
+            a, b = _fit(xs, [r[key] for r in rows])
+            print("  %-20s %8.0f ms" % (key, a + b * at_gb))
+
+
 def _fit(xs, ys):
     n = len(xs)
     mx, my = sum(xs) / n, sum(ys) / n
@@ -330,6 +371,13 @@ def _fit(xs, ys):
 
 def summarize(path, at_gb, live_share=0.11, live_max_ms=17780.0, live_avg_ms=5900.0, live_rate=67.0):
     rows = [json.loads(l) for l in open(path) if l.strip().startswith("{")]
+    listing = [r for r in rows if r.get("mode") == "listing"]
+    rows = [r for r in rows if r.get("mode") != "listing"]
+    if listing:
+        summarize_listing(listing, at_gb)
+        if not rows:
+            return
+        print()
     by = collections.OrderedDict()
     for r in rows:
         by.setdefault(r["setting"], []).append(r)
@@ -379,6 +427,8 @@ def main():
     ap.add_argument("--life-s", type=float, default=1.0, help="medium-lived request lifetime in seconds")
     ap.add_argument("--cycle-every", type=int, default=25, help="one request in N leaves a reference cycle")
     ap.add_argument("--cycle-life-s", type=float, default=None, help="how long a leftover cycle lives (default --life-s)")
+    ap.add_argument("--listing-sizes", default=None, help="time gc.get_objects / get_freeze_count over heaps of these GB")
+    ap.add_argument("--listing", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("--out", default=None)
     ap.add_argument("--summarize", default=None)
     ap.add_argument("--at-gb", type=float, default=16.0)
@@ -386,6 +436,24 @@ def main():
     a = ap.parse_args()
     if a.summarize:
         summarize(a.summarize, a.at_gb)
+        return
+    if a.listing:
+        listing_child(a.size_gb, a.seed)
+        return
+    if a.listing_sizes:
+        out = open(a.out, "a") if a.out else sys.stdout
+        for size in [float(x) for x in a.listing_sizes.split(",")]:
+            if size * 1.3 + 1.0 > a.max_peak_gb:
+                sys.exit("refused: %.1f GB would peak over --max-peak-gb %.1f" % (size, a.max_peak_gb))
+            if _mem_available_mib() < int((size * 1.3 + 1.0) * 1024) * 3:
+                sys.exit("refused: MemAvailable is under three times the run's need; the machine is shared")
+            res = subprocess.run([sys.executable, os.path.realpath(__file__), "--listing", "--size-gb", str(size),
+                                  "--seed", str(a.seed)], capture_output=True, text=True, env=dict(os.environ, PYTHONHASHSEED="0"))
+            line = res.stdout.strip().splitlines()[-1] if res.stdout.strip() else ""
+            if res.returncode != 0 or not line.startswith("{"):
+                sys.stderr.write("listing @ %s GB failed (exit %d): %s\n" % (size, res.returncode, res.stderr[-600:]))
+                continue
+            out.write(line + "\n"); out.flush()
         return
     if a.child:
         child(a.size_gb, a.setting, a.seconds, a.seed, a.gen0_rate, a.life_s, a.cycle_every, a.cycle_life_s)

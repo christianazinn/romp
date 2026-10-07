@@ -2248,10 +2248,14 @@ The snapshot's fields, all plain numbers (`ms` is milliseconds of wall time):
   `msSum`, `msMax` and `msLast` (their summed, largest and last pause) and
   `collectedLast` (the objects the last one freed). `thresholds` and `counts`
   are `gc.get_threshold()` and `gc.get_count()`, repeated from `heap.gc` so
-  the block reads on its own (how near the next collection is); `frozen`
-  counts the objects moved out of the collector's reach by `gc.freeze`, which
-  it never scans (reading the count is a linear walk of the frozen generation,
-  about 7 ms per million frozen, paid by the `/perf` read); `errors` counts callback failures (counted, never raised
+  the block reads on its own (how near the next collection is);
+  `frozenAsOfCleanup` counts the objects moved out of the collector's reach by
+  `gc.freeze`, which it never scans, AS OF THE LAST CLEANUP (a reclaim), and
+  `frozenAsOfCleanupAt` is that cleanup's time (epoch seconds); both are null
+  until the first cleanup. Reading the count is a linear walk of the frozen
+  generation (about 7 ms per million frozen), so the freeze controller reads it
+  only inside a reclaim's pause, never on the `/perf` read and never at a freeze
+  (2026-10-07); `errors` counts callback failures (counted, never raised
   into the collector; the first in the process is said once on stderr, a
   line prefixed `perf: gc hook:`, the rest counted only); `hooked` says
   whether the kernel's `gc.callbacks` hook is installed, so zeros with
@@ -2284,10 +2288,8 @@ The snapshot's fields, all plain numbers (`ms` is milliseconds of wall time):
   measured ~97 fold-ins an hour), so a cycle released by an owner nobody
   registered is bounded by the next thousand loads, not the process lifetime. The
   sub-block carries `enabled`, `active` (whether a freeze is held now; named
-  apart from the integer `frozen` above, which is the controller's STORED count of
-  frozen objects as of its last freeze: an upper bound between reclaims, re-read
-  whole at each reclaim, and never `gc.get_freeze_count()`, which walks the frozen
-  list and would stall every read once the long-lived heap is frozen),
+  apart from the integer `frozenAsOfCleanup` above, which this sub-block repeats with
+  `frozenAsOfCleanupAt`),
   `loadTrees` and `backstopFoldins` (the two thresholds), `freezes` and
   `reclaims` (a freeze ran one collection and a reclaim ran one, EXCEPT a full
   release that unfroze runs TWO generation-2 collections for its one reclaim, so

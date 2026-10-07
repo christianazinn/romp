@@ -382,7 +382,7 @@ class _PerfStats:
                                    main installs once): per generation, collections, msSum / msMax / msLast
                                    (wall on the collecting thread) and collectedLast; thresholds and counts
                                    (gc.get_threshold / gc.get_count, repeated from heap.gc so the block reads
-                                   on its own), frozen (the freeze controller's stored count), errors (callback failures,
+                                   on its own), frozenAsOfCleanup/At (the frozen count at the last cleanup), errors (callback failures,
                                    counted, never raised) and hooked (whether this collector's hook is in
                                    gc.callbacks). Each split row on the rings carries the cycle's own delta
                                    as `gc` (n0, n1, n2 collections per generation and ms2), so a slow cycle
@@ -1206,9 +1206,11 @@ class _PerfStats:
                     # and the block still serves (the heap block's review find, 2026-09-15, applied here)
                     "thresholds": _gc_read("thresholds", lambda: list(gc.get_threshold())),
                     "counts": _gc_read("counts", lambda: list(gc.get_count())),
-                    # the controller's stored count, never gc.get_freeze_count() (a walk of the frozen list: seconds once the
-                    # long-lived heap is frozen, and every /perf read would stall the kernel for it); 2026-10-07
-                    "frozen": _gc_read("frozen", lambda: _GC_FREEZE.frozen_count),
+                    # the frozen count AS OF THE LAST CLEANUP and that cleanup's time, never gc.get_freeze_count() here (a walk
+                    # of the frozen list: seconds once the long-lived heap is frozen, every /perf read would stall the kernel for
+                    # it); the controller re-reads it inside each reclaim's pause; 2026-10-07
+                    "frozenAsOfCleanup": _gc_read("frozenAsOfCleanup", lambda: _GC_FREEZE.frozen_as_of_cleanup),
+                    "frozenAsOfCleanupAt": _gc_read("frozenAsOfCleanupAt", lambda: _GC_FREEZE.frozen_as_of_cleanup_at),
                     "errors": gc_errors,
                     "hooked": _gc_read("hooked", lambda: self.gc_event in gc.callbacks),
                     # #1735: the freeze controller's state and the reconcile trade, so a reconcile collection is told

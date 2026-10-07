@@ -14,6 +14,7 @@ import gc
 import os
 import re
 import sys
+import time
 import tempfile
 import unittest
 import weakref
@@ -437,18 +438,39 @@ class RealCollector(unittest.TestCase):
         self.assertGreaterEqual(gc.get_freeze_count() - frozen0, 40000, "the heap's dicts and lists are frozen")
         self.assertFalse(any(o is heap for o in gc.get_objects(2)), "and gone from the oldest generation's walk")
 
-    def test_the_stored_frozen_count_tracks_the_real_one_at_each_freeze_and_reclaim(self):
+    def test_no_freeze_lists_the_heap_and_the_count_is_read_at_each_cleanup(self):
+        """2026-10-07 review of 69dc51e33: counting what a freeze adds by gc.get_objects listed every survivor inside each
+        freeze, the whole-heap walk the stored count was meant to avoid. No freeze lists anything now; the count is re-read
+        once at each cleanup (inside the pause it pays) and served as of that cleanup, with its time."""
+        class Listing:
+            def __init__(self):
+                self.listings = 0
+            def __getattr__(self, name):
+                return getattr(gc, name)
+            def get_objects(self, *a, **k):
+                self.listings += 1
+                return gc.get_objects(*a, **k)
+        proxy = Listing()
         gc.unfreeze(); gc.collect()
-        c = self._controller(full_backstop_ratio=1)
+        c = gf.GcFreeze(enabled=True, load_trees=1, gc=proxy, full_freeze_ms=1e-6, full_backstop_ratio=1000)
+        self.assertTrue(c.install_full_freeze())
+        self.addCleanup(c.remove_full_freeze)
         heap = [{"k": [i]} for i in range(20000)]
-        gc.collect()                                          # a callback freeze: the stored count adds what it froze
-        real = gc.get_freeze_count()
-        self.assertLessEqual(abs(c.frozen_count - real), max(50, real // 100), (c.frozen_count, real))
-        del heap[:10000]                                      # frozen objects dying by refcount: the stored count is an upper bound
-        self.assertGreaterEqual(c.frozen_count, gc.get_freeze_count())
-        c.remove_full_freeze()
-        self.assertEqual(c.tick(1), "backstop")               # a reclaim re-reads the whole count
-        self.assertLessEqual(abs(c.frozen_count - gc.get_freeze_count()), 50, "a reclaim re-reads it (a few temporaries apart)")
+        c.tick(1)                                             # the start-up freeze
+        gc.collect()                                          # a callback freeze
+        c.tick(2)                                             # a load fold-in
+        self.assertEqual(proxy.listings, 0, "no freeze lists the heap")
+        self.assertIsNone(c.frozen_as_of_cleanup, "no cleanup yet: no count served")
+        self.assertIsNone(c.frozen_as_of_cleanup_at)
+        c._foldins = c.backstop_foldins                       # owe the fold-in backstop
+        t0 = time.time()
+        self.assertEqual(c.tick(3), "backstop")
+        self.assertEqual(proxy.listings, 0)
+        self.assertLessEqual(abs(c.frozen_as_of_cleanup - gc.get_freeze_count()), 50, "re-read at the cleanup")
+        self.assertGreaterEqual(c.frozen_as_of_cleanup, len(heap))
+        self.assertGreaterEqual(c.frozen_as_of_cleanup_at, t0 - 1)
+        p = c.perf()
+        self.assertEqual((p["frozenAsOfCleanup"], p["frozenAsOfCleanupAt"]), (c.frozen_as_of_cleanup, c.frozen_as_of_cleanup_at))
 
     def test_a_cycle_formed_later_among_frozen_objects_waits_for_the_backstop(self):
         gc.unfreeze(); gc.collect()
