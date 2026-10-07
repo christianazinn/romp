@@ -794,3 +794,78 @@ class SkeletonWalksEqualFullWalks(Base):
         self.assertEqual(em._walk_with_skeletons(build), "whole")
         self.assertEqual(seen, [True, False])
         self.assertEqual(em.cold_read_stats()["skeleton"]["misses"], before + 1)
+
+
+class DocumentSeededWalksReadNothingBeforeTheWindow(Base):
+    """file_rewound and chain_membership over a leaf whose assembly document stands (review find, 2026-10-07): the document's
+    cut moves only on a whole parse, so on a large leaf it trails the end of the file by far more than the window, and each
+    call read the records between the cut and the window off disk TWICE (the document chain check, then the seeded
+    adapter), on every judge pass the leaf grew. Both now walk the skeletons of that span."""
+
+    def parse(self, path):
+        return em.parse_session(path, rompuuid=SID, name="impl", dir="/TESTDIR", candidate_files=[path],
+                                states=None, postal_log=[], now=NOW)
+
+    def _grow(self, path, last, start, n, fork_at=None):
+        """`n` spine records chained onto uuid `last`, and, when `fork_at` is given, a two-record branch off the spine record
+        with that index that the spine then leaves (a rewound line). Returns (the last spine uuid, the branch's uuids)."""
+        rnd = random.Random(start)
+        prev, branch, lines = last, set(), []
+        for i in range(start, start + n):
+            r = _rec(i, rnd)
+            r["uuid"] = "44444444-2222-4333-8444-%012d" % i
+            r["parentUuid"] = prev
+            r["timestamp"] = "2026-06-11T13:%02d:%02d.000Z" % ((i // 60) % 60, i % 60)
+            lines.append(json.dumps(r)); prev = r["uuid"]
+            if i == fork_at:
+                for b, kind in enumerate(("user", "assistant")):
+                    u = "55555555-2222-4333-8444-%012d" % b
+                    msg = ({"role": "user", "content": "a line the user rewound away"} if kind == "user" else
+                           {"role": "assistant", "content": [{"type": "text", "text": "a reply on the rewound line"}]})
+                    lines.append(json.dumps({"type": kind, "uuid": u, "parentUuid": r["uuid"] if b == 0 else branch_last,
+                                             "timestamp": r["timestamp"], "message": msg}))
+                    branch.add(u); branch_last = u
+        with open(path, "a") as f:
+            f.write("\n".join(lines) + "\n")
+        return prev, branch
+
+    def _ref(self, path):
+        with knobs(0, 4, roots=[str(self.proj)]):
+            fresh()
+            saved = em._CKPT_DIR_FN; em._CKPT_DIR_FN = None
+            try:
+                out = (em.file_rewound(path), em.chain_membership(path))
+            finally:
+                em._CKPT_DIR_FN = saved
+        fresh()
+        return out
+
+    def test_the_seeded_walks_read_nothing_before_the_window_per_pass(self):
+        path = self.leaf()
+        recs = transcript(NOW - 86400, turns=160, compact_every=40)
+        Path(path).write_text("".join(json.dumps(r) + "\n" for r in recs))
+        with knobs(16 * 1024, 4, roots=[str(self.proj)]):
+            tree = self.parse(path)
+            self.assertTrue(em.asm_checkpoint_write(path, SID, tree=tree), em.asm_checkpoint_stats())
+        last, branch = self._grow(path, recs[-1]["uuid"], 0, 1500, fork_at=30)   # far past the cut: the span is before the window
+        ref_rw, ref_cm = self._ref(path)
+        self.assertEqual(ref_rw, branch, "the reference walk files the branch as rewound")
+        with knobs(16 * 1024, 4, roots=[str(self.proj)]):
+            fresh()
+            self.assertEqual(em.file_rewound(path, rompuuid=SID, sdk_human=False), ref_rw)
+            ent = em._JSONL_CACHE[path]
+            self.assertTrue(_tail(ent[4]) and ent[5] > 0 and ent[4].ncold > 1000,
+                            "the entry holds the records past the document's cut, tail-only, the branch before its window")
+            per_pass, nxt = [], 1500
+            for k in range(3):
+                last, _ = self._grow(path, last, nxt, 3); nxt += 3
+                c0 = cold_records()
+                rw = em.file_rewound(path, rompuuid=SID, sdk_human=False)
+                cm = em.chain_membership(path, rompuuid=SID, sdk_human=False)
+                per_pass.append(cold_records() - c0)
+                self.assertEqual(rw, ref_rw, "pass %d: the seeded walk over skeletons files the same rewound set" % k)
+                self.assertTrue(branch <= cm["rewind"], "pass %d: the membership's rewind set holds the branch" % k)
+            self.assertEqual(per_pass, [0, 0, 0], "records read before the window per pass: %r" % per_pass)
+        ref_rw2, ref_cm2 = self._ref(path)
+        self.assertEqual(rw, ref_rw2)
+        self.assertEqual(cm, ref_cm2, "the seeded membership equals the whole walk's after the appends")

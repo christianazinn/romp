@@ -5688,13 +5688,14 @@ def chain_membership(leaf_path, candidate_files=None, states=None, leaf_override
             doc = None if _standing else _asm_ckpt_load(leaf_path, rompuuid, sdk_human, candidate_files, links)
             if _standing:
                 _asm_stat("seeded:refusedStanding")       # the cold walk, no proof, while the mark stands (round two)
-            if doc is not None and not _tail_chains_onto_the_document(leaf_path, doc):
+            if doc is not None and not _tail_chains_onto_the_document(leaf_path, doc, walk_only=True):
                 _asm_stat("seeded:chainRefused"); doc = None   # the tail re-parents into the pre-cut part: the cold walk, as
             if doc is not None:                              #  before T391 (T402 round four)
                 try:                                         # no current entry: the document's pre-cut facts plus the tail
                     seed, _landed = _seed_from_doc(doc)      #  read now, the whole graph's verdicts without the whole read
-                    adapter = FileAdapter(candidate_files, leaf_path, resume_links=links, seed=seed)
-                    how = "seeded"
+                    adapter = _walk_with_skeletons(lambda w: _membership_of(FileAdapter(
+                        candidate_files, leaf_path, resume_links=links, seed=seed, walk_only=w)))   # skeletons: no disk read
+                    how = "seeded"                           #  between the cut and the window per call (review find, 2026-10-07)
                 except Exception as e:                       # noqa: BLE001
                     _asm_ckpt_note(leaf_path, "restore", repr(e)[:120]); adapter = None
             elif _READER_TRACE:
@@ -5703,7 +5704,7 @@ def chain_membership(leaf_path, candidate_files=None, states=None, leaf_override
         adapter = FileAdapter(candidate_files, leaf_path, leaf_override=leaf_override, resume_links=links)
     if _READER_TRACE:
         sys.stderr.write("chain: %s %s\n" % (how, leaf_path))
-    return _membership_of(adapter)
+    return adapter if isinstance(adapter, dict) else _membership_of(adapter)
 
 
 def file_rewound(path, rompuuid=None, sdk_human=None, own=True):
@@ -5715,6 +5716,13 @@ def file_rewound(path, rompuuid=None, sdk_human=None, own=True):
     session's leaf (2026-09-15): its document is loaded without the note, so a document that does not verify for this
     walk (written under the other owner bit, moved, rewritten) is refused quietly and stands for its owner, and the walk
     reads the file whole here as before the seeded road."""
+    return _walk_with_skeletons(lambda walk_only: _file_rewound(path, rompuuid, sdk_human, own, walk_only))
+
+
+def _file_rewound(path, rompuuid, sdk_human, own, walk_only):
+    """file_rewound's walk; `walk_only`, over a tail-only entry's skeletons (see _walk_with_skeletons): the judges call it on
+    every pass a leaf grew, and over the document's road the records between the cut and the window were read off disk twice
+    per call before skeletons (review find, 2026-10-07)."""
     path = Path(path)
     ad = None
     if rompuuid is not None and _CKPT_DIR_FN is not None:
@@ -5723,12 +5731,14 @@ def file_rewound(path, rompuuid=None, sdk_human=None, own=True):
                                                     memo="seeded")   # the decode once per process per document (2026-09-15)
         if _standing:                                     # the cold walk, no proof, while the mark stands (round two); a reader
             _asm_stat("seeded:refusedStanding" if own else "foreign:refusedStanding")   # that does not own the leaf counts its own
-        if doc is not None and not _tail_chains_onto_the_document(path, doc):
+        if doc is not None and not _tail_chains_onto_the_document(path, doc, walk_only=walk_only):
             _asm_stat("seeded:chainRefused"); doc = None      # the cold walk over a tail that re-parents into the pre-cut
         if doc is not None:                                   #  part (T402 round four)
             try:
                 seed, _landed = _seed_from_doc(doc)
-                ad = FileAdapter([str(path)], str(path), seed=seed)
+                ad = FileAdapter([str(path)], str(path), seed=seed, walk_only=walk_only)
+            except _SkelMiss:
+                raise                                         # a skeleton miss is the walk's to rerun whole, never a refusal
             except Exception as e:                            # noqa: BLE001
                 if own:
                     _asm_ckpt_note(path, "restore", repr(e)[:120])
@@ -5736,7 +5746,7 @@ def file_rewound(path, rompuuid=None, sdk_human=None, own=True):
                     _asm_stat("foreign:restore")              # another session's document: never unlinked from here
                 ad = None
     if ad is None:
-        ad = FileAdapter([str(path)], str(path))
+        ad = FileAdapter([str(path)], str(path), walk_only=walk_only)
     if not ad.by_uuid and (ad.seed is None or not ad.seed["verdicts"]) and path.stat().st_size > 0:
         raise OSError("transcript read yielded no records")
     verdicts = dict(ad.chain_verdicts())
@@ -8155,7 +8165,7 @@ def _boundary_effective_parent(r, known):
     return None
 
 
-def _tail_chains_onto_the_document(leaf_path, doc, assume_childless=False):
+def _tail_chains_onto_the_document(leaf_path, doc, assume_childless=False, walk_only=False):
     """Whether the leaf's tail (its records past the document's cut) CHAINS onto the document: every tail record that bears a
     uuid or a parentUuid key, whatever its type (user, assistant, a system spur, a summary, a sidechain record, an attachment),
     parents a record IN THE TAIL, or the pre-cut SPINE TIP when the document says the writer proved the tip had no pre-cut
@@ -8180,6 +8190,17 @@ def _tail_chains_onto_the_document(leaf_path, doc, assume_childless=False):
         return True
     ent = _read_jsonl_entry(leaf_path, tail_ok=True, tail_from=(int(cut[0]), int(cut[1]), bytes.fromhex(cut[2])))
     recs = ent[4] if ent is not None else []
+    if walk_only and type(recs) is _TailRecords and _walk_ready(recs):
+        try:                                              # the graph fields of the records between the cut and the window from
+            return _tail_chains_over(_walk_list(recs), ent, cut, doc, assume_childless)   # their skeletons: no disk read per
+        except _SkelMiss:                                 #  call (review find, 2026-10-07: every judge pass read that span twice)
+            with _COLD_STATS_LOCK:
+                _COLD_STATS.setdefault("skeleton", {"walks": 0, "records": 0, "misses": 0})["misses"] += 1
+    return _tail_chains_over(recs, ent, cut, doc, assume_childless)
+
+
+def _tail_chains_over(recs, ent, cut, doc, assume_childless):
+    """_tail_chains_onto_the_document's rule over the leaf entry `ent`'s records `recs` (its own, or its walk list)."""
     if ent is not None and ent[5] < int(cut[1]):          # a whole entry: the tail is the records past the cut
         recs = recs[int(cut[1]) - ent[5]:]
     nodes = [r for r in recs if isinstance(r, dict) and r.get("uuid")]   # the graph nodes: records the parse indexes by uuid; a
@@ -8266,9 +8287,10 @@ def _asm_restore_inner(key, leaf_path, candidate_files, links, rompuuid, postal_
         _t0 = time.perf_counter()
         seed, landed = _seed_from_doc(doc)
         _restore_ms("seed", _t0)
-        if not _tail_chains_onto_the_document(leaf_path, doc):
+        if not _tail_chains_onto_the_document(leaf_path, doc, walk_only=True):   # graph fields only: skeletons (2026-10-07)
             _asm_stat("restore:chainRefused")             # the tail does not chain onto the document: the whole parse (T402); the
-            _why = ("unproven" if doc.get("tipChildless") is None and _tail_chains_onto_the_document(leaf_path, doc, assume_childless=True)
+            _why = ("unproven" if doc.get("tipChildless") is None and _tail_chains_onto_the_document(leaf_path, doc, assume_childless=True,
+                                                                                                      walk_only=True)
                     else "shape")                         # the missing bit alone, or the tail's own shape
             with _ASM_CKPT_LOCK:
                 _ASM_CHAIN_REFUSED_PATHS[os.path.realpath(str(leaf_path))] = (_why, int((((doc.get("files") or {}).get(Path(leaf_path).stem)
