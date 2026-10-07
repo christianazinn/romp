@@ -2344,17 +2344,20 @@ def _window_start(offs, total, end, ncold):
     return max(ncold, min(i, max(0, total - 1)))
 
 
-def _tail_shape(path, offs, ncold, hot, end, guard, force=False):
+def _tail_shape(path, offs, ncold, hot, end, guard, force=False, keep_index=None):
     """The records field for an entry holding `ncold` records before the window and `hot` in memory, with every record's
     offsets in `offs`, consumed to `end` with witness `guard`: the window slid when it has grown past _TAIL_SLIDE_FACTOR
-    times _TAIL_BYTES (or `force`, a list converting to a window), a plain list when nothing lies before it, else a
-    _TailRecords. A held span under _TAIL_MIN_FILE_BYTES, or the rule off, is never windowed."""
+    times _TAIL_BYTES (or `force`, a list converting to a window), never past `keep_index` (the first record the read
+    that called this appended), a plain list when nothing lies before it, else a _TailRecords. A held span under
+    _TAIL_MIN_FILE_BYTES, or the rule off, is never windowed."""
     total = ncold + len(hot)
     if _TAIL_BYTES > 0 and total and hot and (ncold > 0 or _tail_eligible(path)):
         hot_bytes = end - int(offs[2 * ncold])
         span = end - int(offs[0])
         if span >= _TAIL_MIN_FILE_BYTES and (force or hot_bytes > _TAIL_SLIDE_FACTOR * _TAIL_BYTES):
             w = _window_start(offs, total, end, ncold)
+            if keep_index is not None:
+                w = max(ncold, min(w, int(keep_index)))
             if w > ncold:
                 hot = hot[w - ncold:]
                 ncold = w
@@ -2363,13 +2366,19 @@ def _tail_shape(path, offs, ncold, hot, end, guard, force=False):
     return _TailRecords(path, offs, ncold, hot, end, guard)
 
 
-def _tail_scan_info(path, size, span_start):
+def _tail_scan_info(path, size, span_start, append_from=None):
     """The scan's tail mode for a read that will leave an entry holding records from byte `span_start` of `path`, a file of
     `size` bytes: None when the rule is off, the file is no transcript (_tail_eligible) or the held span stays under
-    _TAIL_MIN_FILE_BYTES (held whole), else the window's start byte and the record floor (_scan_jsonl_stream's `tail`)."""
+    _TAIL_MIN_FILE_BYTES (held whole), else the window's start byte and the record floor (_scan_jsonl_stream's `tail`).
+    `append_from`, the byte an APPEND to a held entry starts at: an append of up to _TAIL_MIN_FILE_BYTES is kept whole in the
+    window, so a fold that was current before it steps the new records from memory however large one of them is (a
+    40 KB tool result appended to a 32 KiB window would otherwise slide the window past the fold's cursor)."""
     if _TAIL_BYTES <= 0 or size - int(span_start) < _TAIL_MIN_FILE_BYTES or not _tail_eligible(path):
         return None
-    return {"keep_from": max(0, int(size) - _TAIL_BYTES), "keep_last": _TAIL_RECORDS}
+    keep_from = max(0, int(size) - _TAIL_BYTES)
+    if append_from is not None and int(size) - int(append_from) <= _TAIL_MIN_FILE_BYTES:
+        keep_from = min(keep_from, int(append_from))
+    return {"keep_from": keep_from, "keep_last": _TAIL_RECORDS}
 
 
 def _tail_combine(old, new, tinfo):
@@ -2566,7 +2575,8 @@ def _read_jsonl_entry_unlocked(path, on_fail=None, tail_ok=False, tail_from=None
                                                                     and (st.st_mtime == hit[0] or tail_from is not None)))
             unchanged_tail = (hit is not None and not tail_ok and hit[5] > 0 and st.st_size == hit[1]
                               and st.st_mtime == hit[0])            # a whole reader meets an unchanged tail entry
-            ncold, tinfo = 0, None                        # records before the tail-only window, and the scan's tail mode
+            ncold, tinfo, keep_index = 0, None, None      # records before the tail-only window, the scan's tail mode, and the
+            #                                               first record an append brought (the window keeps it: see _tail_shape)
             if grown or unchanged_tail:
                 _, _, offset, tail, records, base0, gen0 = hit[:7]
                 fh.seek(max(0, offset - len(tail)))
@@ -2574,7 +2584,9 @@ def _read_jsonl_entry_unlocked(path, on_fail=None, tail_ok=False, tail_from=None
                 if fh.read(len(tail)) == tail:            # the file really is our cached prefix + more
                     if tail_ok or base0 == 0:
                         offs = array.array("q", hit[7]) if len(hit) > 7 else array.array("q")
-                        tinfo = _tail_scan_info(path, st.st_size, int(offs[0]) if offs else offset)
+                        tinfo = _tail_scan_info(path, st.st_size, int(offs[0]) if offs else offset,
+                                                append_from=offset if records else None)
+                        keep_index = len(records) if (records and st.st_size - offset <= _TAIL_MIN_FILE_BYTES) else None
                         new, offset, nread = _scan_jsonl_stream(fh, offset, offs, limit=max(0, st.st_size - fh.tell()),
                                                                 tail=tinfo)   # the appended lines, one at a time
                         _count_read(path, nread)
@@ -2612,7 +2624,7 @@ def _read_jsonl_entry_unlocked(path, on_fail=None, tail_ok=False, tail_from=None
             fh.seek(tail_from)
             tail = fh.read(offset - tail_from)
             _count_read(path, len(tail))                  # the guard capture is a read too (/perf's count is what was pulled)
-            records = _tail_shape(path, offs, ncold, records, offset, tail)   # a plain list, or the window over the indexed file
+            records = _tail_shape(path, offs, ncold, records, offset, tail, keep_index=keep_index)   # a plain list, or the window
             if kind in _WHOLE_READ_KINDS:                 # a whole read: counted by kind and caller on /perf (T384), always on; the
                 try:                                      #  frame walk runs only here, on the rare whole read, never on a tail or an
                     fr = sys._getframe(1)                 #  append
