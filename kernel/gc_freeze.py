@@ -60,7 +60,12 @@ forms LATER among objects it froze (alive at the freeze, cyclic garbage afterwar
 unfreeze, so once a full-collection freeze has run, a backstop reclaim (the same unfreeze/collect/re-freeze the fold-in
 backstop runs) is owed at the next idle tick when the organic full-collection pause summed since the last reclaim reaches
 `full_backstop_ratio` times the largest pause seen (the last reclaim's walk or an organic one, about the whole heap): its
-cost is bounded by what the collector already spends, keyed on measured pauses, never a clock. The third collection
+cost is bounded by what the collector already spends, keyed on measured pauses, never a clock. While a backstop is owed
+and has not run, the callback freezes NOTHING more (each skip counted), so what is pinned cannot grow; and because the
+idle tick may never come under sustained load (the live kernel once read no idle pusher cycle in 5.5 hours), an owed
+backstop that has waited `full_force_s` (ROMP_GC_FREEZE_FULL_FORCE_S, default 600 s) runs at the next BUSY pusher cycle
+boundary instead (pusher_tick, never inside the gc callback or a locked region), counted as forced. The idle tick stays
+the preferred path. The third collection
 threshold is raised to `full_t2` with the freeze: once the long-lived heap is frozen, a full collection is cheap but
 CPython's quarter rule no longer holds it back (the long-lived total it divides is the small unfrozen part), so the
 generation-1 count gate is what bounds the rate. `ROMP_GC_FREEZE_FULL_MS=off` (or 0) restores the
@@ -78,6 +83,7 @@ DEFAULT_BACKSTOP_FOLDINS = 1000  # a reclaim after this many load fold-ins since
 #                                  no ended ref caught; at the measured ~97 fold-ins an hour it fires about once in ten hours
 DEFAULT_FULL_FREEZE_MS = 250.0   # an organic full collection at least this long freezes its survivors (bench: scripts/bench_gc_full_rate.py)
 DEFAULT_FULL_T2 = 100          # the third collection threshold while the full freeze is on (CPython's default is 10)
+DEFAULT_FULL_FORCE_S = 600.0     # an owed full backstop that waited this long runs on a busy pusher cycle (the idle tick may never come)
 DEFAULT_FULL_BACKSTOP_RATIO = 10.0   # a backstop is owed once the organic full-collection pause since the last reclaim reaches this many
 #                                      times the largest whole-heap walk seen: the backstop then costs at most ~1/10 of what full
 #                                      collections spend (a count of freezes instead fired one every ~4 min at a 4 GB bench heap)
@@ -142,16 +148,40 @@ def full_t2_from_env(env=None):
     return (n, None) if n > 0 else (DEFAULT_FULL_T2, raw)
 
 
+def full_force_s_from_env(env=None):
+    """(full_force_s, bad_raw): the ROMP_GC_FREEZE_FULL_FORCE_S knob, how long an owed full backstop may wait for an idle
+    tick before a busy pusher cycle runs it. Unset or empty is the default; an off value is None (never forced: the idle
+    tick only, as at 203fcc519); a positive number is seconds; anything else falls back to the default with `bad_raw` set."""
+    raw = (env if env is not None else os.environ).get("ROMP_GC_FREEZE_FULL_FORCE_S")
+    if raw is None or raw.strip() == "":
+        return DEFAULT_FULL_FORCE_S, None
+    v = raw.strip().lower()
+    if v in _OFF:
+        return None, None
+    try:
+        sec = float(v)
+    except (TypeError, ValueError):
+        return DEFAULT_FULL_FORCE_S, raw
+    if not sec > 0 or sec != sec or sec == float("inf"):
+        return DEFAULT_FULL_FORCE_S, raw
+    return sec, None
+
+
 class GcFreeze:
     """The freeze controller. `gc` and `clock` are injected so a test drives a fake collector or a real one; the
     kernel passes the real `gc`. The `tick`/`_run` path runs on the pusher thread; `note_ended` runs on every
     thread that ends a session (the HTTP handler, housekeeping, a worker), so a small lock guards the ended list."""
 
     def __init__(self, enabled=True, load_trees=DEFAULT_LOAD_TREES, backstop_foldins=DEFAULT_BACKSTOP_FOLDINS,
-                 gc=_gc_mod, clock=time.perf_counter, full_freeze_ms=None, full_backstop_ratio=DEFAULT_FULL_BACKSTOP_RATIO, full_t2=None):
+                 gc=_gc_mod, clock=time.perf_counter, full_freeze_ms=None, full_backstop_ratio=DEFAULT_FULL_BACKSTOP_RATIO, full_t2=None,
+                 full_force_s=DEFAULT_FULL_FORCE_S):
         self.enabled = bool(enabled)
         self.full_freeze_ms = float(full_freeze_ms) if full_freeze_ms else None   # None: the full-collection freeze is off
         self.full_backstop_ratio = max(1.0, float(full_backstop_ratio))
+        self.full_force_s = float(full_force_s) if full_force_s else None   # None: an owed backstop waits for an idle tick only
+        self._owed_since = None      # the clock when the full backstop was first seen owed; None while not owed
+        self.full_freeze_skips = 0   # freezes the callback skipped because a backstop was owed (pinning frozen until it runs)
+        self.forced = 0              # owed full backstops run on a busy pusher cycle because no idle tick came within full_force_s
         self.full_t2 = int(full_t2) if full_t2 else None   # the third threshold installed with the full freeze; None leaves it
         self._saved_threshold = None # the thresholds install_full_freeze replaced, restored by remove_full_freeze
         self._full_t0 = None         # the open generation-2 collection's start (the collector serialises collections: one slot)
@@ -287,6 +317,7 @@ class GcFreeze:
             self._full_since_reclaim = 0
             self._full_ms_since_reclaim = 0.0
             self._full_ref_ms = self.last_ms         # the reclaim walked the whole heap: the new reference
+            self._owed_since = None
         else:
             self.last_kind = "initial" if not was_frozen else "load"   # a cheap-collect release folds in like a load
             self.freezes += 1
@@ -315,6 +346,9 @@ class GcFreeze:
                 self._full_ref_ms = dt
             if dt < self.full_freeze_ms:
                 return
+            if self.full_backstop_owed():            # owed and not yet run: freeze nothing more, so the pinned set cannot grow
+                self.full_freeze_skips += 1
+                return
             self._gc.freeze()
             self.frozen = True
             self.full_freezes += 1
@@ -326,8 +360,27 @@ class GcFreeze:
     def full_backstop_owed(self):
         """Whether the full-collection freeze owes a backstop reclaim: a freeze ran since the last reclaim (so something
         may be pinned) and the organic full-collection pause since then reached `full_backstop_ratio` times the largest walk."""
-        return (self._full_since_reclaim > 0 and self._full_ref_ms > 0
+        owed = (self._full_since_reclaim > 0 and self._full_ref_ms > 0
                 and self._full_ms_since_reclaim >= self.full_backstop_ratio * self._full_ref_ms)
+        if owed and self._owed_since is None:
+            self._owed_since = self._clock()         # stamped at the first reading that finds it owed (the callback or a tick)
+        return owed
+
+    def force_due(self):
+        """Whether an owed full backstop has waited `full_force_s` for an idle tick: then a busy pusher cycle runs it."""
+        if not (self.enabled and self.full_force_s) or not self.full_backstop_owed():
+            return False
+        return (self._clock() - self._owed_since) >= self.full_force_s
+
+    def force_backstop(self, inserts):
+        """Run an owed full backstop on a busy cycle once force_due; returns "forced" when it ran, else None. Called only from
+        pusher_tick at a cycle boundary, never from the gc callback."""
+        if not self.force_due():
+            return None
+        self.resolve_ended()                         # judge the ended list as the idle tick would (the reclaim covers them all)
+        self._run("backstop", inserts, [])
+        self.forced += 1
+        return "forced"
 
     def install_full_freeze(self):
         """When the controller and the full-collection freeze are both on: gc_callback into gc.callbacks (once) and the
@@ -368,17 +421,25 @@ class GcFreeze:
                 "fullFreezeMs": self.full_freeze_ms, "fullFreezes": self.full_freezes, "fullT2": self.full_t2,
                 "fullSinceReclaim": self._full_since_reclaim, "fullBackstopRatio": self.full_backstop_ratio,
                 "fullMsSinceReclaim": round(self._full_ms_since_reclaim, 1), "fullRefMs": round(self._full_ref_ms, 1),
+                "fullFreezeSkips": self.full_freeze_skips, "fullForceS": self.full_force_s, "forced": self.forced,
+                "owedForS": round(self._clock() - self._owed_since, 1) if self._owed_since is not None else None,
                 "lastFullMs": round(self.last_full_ms, 1), "callbackErrors": self.callback_errors}
 
 
 def pusher_tick(controller, idle, first, stats_fn, on_error):
-    """The pusher's idle-boundary call, extracted so it is pinned in-process. Reconcile only on an IDLE, non-FIRST
-    cycle. `stats_fn` returns the record cache stats (its `inserts` keys the LOAD fold-in). A raising `stats_fn` or
+    """The pusher's cycle-boundary call, extracted so it is pinned in-process. Reconcile on an IDLE, non-FIRST cycle; on a
+    BUSY non-first cycle, run only an owed full backstop that has waited past its bound (controller.force_due), so pinned
+    cycles are reclaimed under sustained load too. `stats_fn` returns the record cache stats (its `inserts` keys the LOAD fold-in). A raising `stats_fn` or
     tick is handed to `on_error` and never propagates: the pusher must not die on the freeze. Returns the reconcile
     kind run, or None."""
-    if not (idle and not first) or not controller.enabled:
+    if first or not controller.enabled:
         return None
     try:
+        if not idle:
+            force_due = getattr(controller, "force_due", None)
+            if force_due is None or not force_due():
+                return None
+            return controller.force_backstop(int((stats_fn() or {}).get("inserts") or 0))
         inserts = int((stats_fn() or {}).get("inserts") or 0)
         return controller.tick(inserts)
     except Exception as e:

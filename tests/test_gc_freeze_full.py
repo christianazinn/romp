@@ -156,6 +156,119 @@ class Trigger(unittest.TestCase):
         self.assertEqual((p["fullFreezeMs"], p["fullFreezes"], p["fullT2"], p["fullSinceReclaim"]), (250.0, 1, 1000, 1))
 
 
+class OwedUnderLoad(unittest.TestCase):
+    """2026-10-07 review: the owed backstop ran only on an idle tick, and the live kernel once read no idle pusher cycle in
+    5.5 hours, while the callback kept freezing. Now an owed backstop stops further freezing and runs on a busy cycle once
+    it has waited full_force_s."""
+    def _c(self, **kw):
+        fake, clock = FakeGc(), Clock()
+        kw.setdefault("full_freeze_ms", 250.0)
+        return gf.GcFreeze(enabled=True, gc=fake, clock=clock, **kw), fake, clock
+
+    def test_no_freeze_while_a_backstop_is_owed_and_each_skip_is_counted(self):
+        c, fake, clock = self._c(full_backstop_ratio=2)
+        _collection(c, clock, 2, 300.0)           # freeze 1 (reference 300 ms)
+        _collection(c, clock, 2, 300.0)           # 600 ms = 2 x 300: owed, so this one is NOT frozen
+        _collection(c, clock, 2, 300.0)
+        self.assertEqual((fake.calls.count("freeze"), c.full_freezes, c.full_freeze_skips), (1, 1, 2))
+        self.assertTrue(c.full_backstop_owed())
+
+    def test_a_busy_cycle_runs_the_owed_backstop_only_after_the_bound(self):
+        c, fake, clock = self._c(full_backstop_ratio=1, full_force_s=600)
+        c.tick(1)
+        _collection(c, clock, 2, 300.0)           # freeze and owed at once (ratio 1)
+        stats = lambda: {"inserts": 1}
+        errs = []
+        self.assertIsNone(gf.pusher_tick(c, False, False, stats, errs.append), "owed, but within the bound: the idle tick may still come")
+        clock.t += 599.0
+        self.assertIsNone(gf.pusher_tick(c, False, False, stats, errs.append))
+        clock.t += 2.0
+        self.assertIsNone(gf.pusher_tick(c, False, True, stats, errs.append), "never on the boot's first cycle")
+        fake.calls.clear()
+        self.assertEqual(gf.pusher_tick(c, False, False, stats, errs.append), "forced", "past the bound: the busy cycle runs it")
+        self.assertEqual(fake.calls, ["unfreeze", "collect", "freeze"])
+        self.assertEqual((c.forced, c.reclaims, c.full_backstop_owed(), errs), (1, 1, False, []))
+        self.assertIsNone(c.perf()["owedForS"])
+
+    def test_force_off_waits_for_the_idle_tick_only(self):
+        c, fake, clock = self._c(full_backstop_ratio=1, full_force_s=None)
+        c.tick(1)
+        _collection(c, clock, 2, 300.0)
+        clock.t += 1e6
+        self.assertIsNone(gf.pusher_tick(c, False, False, lambda: {"inserts": 1}, lambda e: None))
+        self.assertEqual(gf.pusher_tick(c, True, False, lambda: {"inserts": 1}, lambda e: None), "backstop")
+
+    def test_force_knob(self):
+        f = gf.full_force_s_from_env
+        self.assertEqual(f({}), (gf.DEFAULT_FULL_FORCE_S, None))
+        for off in ("off", "0", "false"):
+            self.assertEqual(f({"ROMP_GC_FREEZE_FULL_FORCE_S": off}), (None, None), off)
+        self.assertEqual(f({"ROMP_GC_FREEZE_FULL_FORCE_S": "120"}), (120.0, None))
+        for bad in ("soon", "-1", "nan"):
+            self.assertEqual(f({"ROMP_GC_FREEZE_FULL_FORCE_S": bad}), (gf.DEFAULT_FULL_FORCE_S, bad), bad)
+
+
+class StepClock:
+    """Every read advances `step` seconds: a full collection's start and stop reads are `step` apart (a pause of step*1000 ms)."""
+    def __init__(self, step):
+        self.t, self.step = 0.0, step
+    def __call__(self):
+        self.t += self.step
+        return self.t
+
+
+class BusyRealCollector(unittest.TestCase):
+    """The regression on the REAL collector: many rounds of objects alive at a freeze that then become unreachable cycles,
+    with EVERY pusher tick busy. Before the fix the callback froze each round's cycles and nothing ever reclaimed them, so
+    the pinned set grew with the rounds; now freezing stops once a backstop is owed, the forced backstop runs within its
+    bound on a busy tick, and what is pinned stays bounded."""
+    ROUNDS, PAIRS = 40, 300
+
+    def setUp(self):
+        self._thr = gc.get_threshold()
+        gc.unfreeze(); gc.collect()
+
+    def tearDown(self):
+        gc.unfreeze()
+        gc.set_threshold(*self._thr)
+        gc.collect()
+
+    def test_pinning_stops_when_owed_the_forced_backstop_reclaims_and_retention_stays_bounded(self):
+        clock = StepClock(0.3)                    # every full collection reads 300 ms; the force bound is in the same clock
+        c = gf.GcFreeze(enabled=True, gc=gc, clock=clock, full_freeze_ms=250.0, full_backstop_ratio=3, full_force_s=6.0)
+        self.assertTrue(c.install_full_freeze())
+        self.addCleanup(c.remove_full_freeze)
+        c.tick(1)                                 # the start-up freeze
+        frozen0 = gc.get_freeze_count()
+        stats = lambda: {"inserts": 1}
+        errs = []
+        refs, alive_peak, frozen_peak, owed_freezes = [], 0, 0, []
+        for _ in range(self.ROUNDS):
+            live = []
+            for _ in range(self.PAIRS):
+                a = Cyclic(); b = Cyclic(); a.o = b; b.o = a
+                live.append(a); refs.append(weakref.ref(a))
+            owed_before = c.full_backstop_owed()
+            n_before = c.full_freezes
+            gc.collect()                          # organic and slow (300 ms): frozen at its stop unless a backstop is owed
+            if owed_before:
+                owed_freezes.append(c.full_freezes - n_before)
+            del live, a, b                        # alive at the freeze, unreachable cycles now: pinned if frozen
+            gf.pusher_tick(c, False, False, stats, errs.append)   # every cycle BUSY: no idle tick ever comes
+            alive_peak = max(alive_peak, sum(1 for r in refs if r() is not None))
+            frozen_peak = max(frozen_peak, gc.get_freeze_count() - frozen0 - len(refs))   # less the test's own live weakrefs
+        self.assertEqual(errs, [])
+        self.assertGreater(c.full_freeze_skips, 0, "slow collections came while owed and froze nothing")
+        self.assertEqual(set(owed_freezes), {0}, "no freeze ever ran while a backstop was owed")
+        self.assertGreaterEqual(c.forced, 2, "the owed backstop ran on busy ticks, repeatedly")
+        bound = 6 * self.PAIRS                    # a few rounds' cycles at most (owed after 3 x 300 ms, forced within ~6 s of clock)
+        self.assertLessEqual(alive_peak, bound, "pinned cycles stay bounded across %d rounds (peak %d)" % (self.ROUNDS, alive_peak))
+        self.assertLess(frozen_peak, 6 * 2 * self.PAIRS + 2000, "the frozen set stays bounded too (peak %d)" % frozen_peak)
+        c.remove_full_freeze()
+        gc.unfreeze(); gc.collect()
+        self.assertEqual(sum(1 for r in refs if r() is not None), 0, "and every cycle is reclaimable")
+
+
 class Knobs(unittest.TestCase):
     def test_full_freeze_ms(self):
         f = gf.full_freeze_ms_from_env

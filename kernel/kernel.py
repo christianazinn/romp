@@ -1260,11 +1260,14 @@ _GC_FREEZE_LOAD_TREES, _gc_freeze_bad_knob = gcf.load_trees_from_env()   # parse
 # the collector as it was before (no callback, thresholds untouched); ROMP_GC_FREEZE=off turns the whole controller off.
 _GC_FREEZE_FULL_MS, _gc_freeze_bad_full = gcf.full_freeze_ms_from_env()
 _GC_FREEZE_FULL_T2, _gc_freeze_bad_t2 = gcf.full_t2_from_env()
+_GC_FREEZE_FULL_FORCE_S, _gc_freeze_bad_force = gcf.full_force_s_from_env()   # an owed backstop runs on a busy cycle after this long
 _GC_FREEZE = gcf.GcFreeze(enabled=gcf.enabled_from_env(), load_trees=_GC_FREEZE_LOAD_TREES,   # the ended note (note_ended) is wired
-                          full_freeze_ms=_GC_FREEZE_FULL_MS, full_t2=_GC_FREEZE_FULL_T2)    #  when the SDK backend loads (below)
+                          full_freeze_ms=_GC_FREEZE_FULL_MS, full_t2=_GC_FREEZE_FULL_T2,    #  when the SDK backend loads (below)
+                          full_force_s=_GC_FREEZE_FULL_FORCE_S)
 for _knob, _bad, _default in (("ROMP_GC_FREEZE_LOAD_TREES", _gc_freeze_bad_knob, gcf.DEFAULT_LOAD_TREES),
                               ("ROMP_GC_FREEZE_FULL_MS", _gc_freeze_bad_full, gcf.DEFAULT_FULL_FREEZE_MS),
-                              ("ROMP_GC_FREEZE_FULL_T2", _gc_freeze_bad_t2, gcf.DEFAULT_FULL_T2)):
+                              ("ROMP_GC_FREEZE_FULL_T2", _gc_freeze_bad_t2, gcf.DEFAULT_FULL_T2),
+                              ("ROMP_GC_FREEZE_FULL_FORCE_S", _gc_freeze_bad_force, gcf.DEFAULT_FULL_FORCE_S)):
     if _bad is not None:     # a bad knob fell back to its default: said once, counted, never fatal
         _GC_FREEZE_ERRORS[0] += 1
         try:
@@ -1287,6 +1290,12 @@ def _gc_freeze_tick(idle, first):
             except Exception:
                 pass
     kind = gcf.pusher_tick(_GC_FREEZE, idle, first, em.record_cache_stats, on_error)
+    if kind == "forced":     # no idle cycle came while a full backstop was owed: it ran on this busy cycle (one line per run)
+        try:
+            sys.stderr.write("gc-freeze: a full backstop owed past %.0f s ran on a busy cycle in %.1f ms\n"
+                             % (_GC_FREEZE.full_force_s or 0, _GC_FREEZE.last_ms))
+        except Exception:
+            pass
     if kind == "release":    # #1735: a release means a session ended and the collector took (or was owed) a full-heap pause; name it (one per release, none per load)
         try:
             survivors = getattr(_GC_FREEZE, "last_release_survivors", 0)
@@ -63373,7 +63382,8 @@ def _pusher_cycle():
             _boot_health_first_cycle(time.monotonic() - _t_cycle)   # the boot's first cycle, on the record (a no-op after)
         elif not _BOOT_HEALTH_DONE[0]:
             _boot_health_row_backstop(time.monotonic())         # the jobs pass still open long after: the row without it
-        _gc_freeze_tick(_cycle_idle, first)                     # #1735: reconcile the freeze at the idle boundary (the guard is inside pusher_tick)
+        _gc_freeze_tick(_cycle_idle, first)                     # #1735: reconcile the freeze at the idle boundary, or run an owed full backstop
+        #                                                         past its bound on a busy one (2026-10-07); the guards are inside pusher_tick
 
 
 @contextlib.contextmanager
