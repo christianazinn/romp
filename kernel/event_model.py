@@ -2506,6 +2506,8 @@ def _skel_bare(r):
         dict.__setitem__(s, "type", t)
         if "uuid" in r:
             dict.__setitem__(s, "uuid", r["uuid"])        # a present but empty uuid stays present, as the parse sees it
+        if _GC_UNTRACK_ON:
+            _PY_GC_UNTRACK(s)
         if key is not None and "uuid" not in r and len(_SKEL_BARE) < 256:
             _SKEL_BARE[key] = s
     return s
@@ -2553,12 +2555,18 @@ def _skel(r):
                                 put(sb, "tool_use_id", b["tool_use_id"])
                             if "text" in b:
                                 put(sb, "text", b["text"] if user else _skel_text_mark(b["text"]))
+                            if _GC_UNTRACK_ON:
+                                _PY_GC_UNTRACK(sb)
                             out.append(sb)
                         else:
                             out.append(b)
+                    if _GC_UNTRACK_ON and _gc.is_tracked(out):
+                        _PY_GC_UNTRACK(out)
                     put(sm, "content", out)
                 else:
                     put(sm, "content", c)
+            if _GC_UNTRACK_ON:
+                _PY_GC_UNTRACK(sm)
             m = sm
         put(s, "message", m)
     if "attachment" in r:
@@ -2569,6 +2577,8 @@ def _skel(r):
                 put(sa, "type", _skel_word(a["type"]))
             if "prompt" in a and a.get("type") == "queued_command":
                 put(sa, "prompt", a["prompt"])
+            if _GC_UNTRACK_ON:
+                _PY_GC_UNTRACK(sa)
             a = sa
         put(s, "attachment", a)
     if "compactMetadata" in r:
@@ -2577,8 +2587,12 @@ def _skel(r):
             scm = _SkelCM()
             if "preservedSegment" in cm:
                 put(scm, "preservedSegment", cm["preservedSegment"])
+            if _GC_UNTRACK_ON:
+                _PY_GC_UNTRACK(scm)
             cm = scm
         put(s, "compactMetadata", cm)
+    if _GC_UNTRACK_ON:
+        _PY_GC_UNTRACK(s)                                 # acyclic, as the records it stands for: out of the collector's walk
     return s
 
 
@@ -3100,6 +3114,8 @@ def _read_jsonl_entry_unlocked(path, on_fail=None, tail_ok=False, tail_from=None
                 records.gen = gen
                 records.skel = _skel_entry(sk_old, sk_ncold, sk_hot, tinfo.get("skel") if tinfo else None,
                                            int(tinfo.get("dropped") or 0) if tinfo else 0, sk_start, records)
+                if _GC_UNTRACK_ON and records.skel is not None and _gc.is_tracked(records.skel):
+                    _PY_GC_UNTRACK(records.skel)  # the list of acyclic skeletons, as the window's own list below
             if kind in _WHOLE_READ_KINDS:                 # a whole read: counted by kind and caller on /perf (T384), always on; the
                 try:                                      #  frame walk runs only here, on the rare whole read, never on a tail or an
                     fr = sys._getframe(1)                 #  append

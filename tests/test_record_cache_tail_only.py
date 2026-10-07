@@ -1015,3 +1015,31 @@ class WholeAdaptersShareOneList(Base):
             a4 = em.FileAdapter([path], path)
             self.assertGreater(cold_records() - c0, 0, "a new generation with no live holder streams its own list")
             self.assertEqual(a4._src[path], plain(path))
+
+
+class SkeletonsStayOutOfTheCollectorsWalk(Base):
+    """The record cache keeps its decoded records out of the cyclic collector's walk (the kernel's gc pause work); skeletons
+    are dict subclasses, which that untracking skips by type, so they are untracked where they are built: a large leaf
+    holds hundreds of thousands of them, and tracked they would lengthen every full collection."""
+
+    def test_skeletons_and_their_list_are_untracked(self):
+        import gc
+        if not em._GC_UNTRACK_ON:
+            self.skipTest("the record cache's gc untracking is off in this interpreter")
+        with knobs(32 * 1024, 4, roots=[str(self.proj)]):
+            path = self.leaf()
+            _, nxt = write_transcript(path, 300 * 1024)
+            write_forked(self.leaf("bbbbbbbb-4444-4222-8333-555555555555"), 600)
+            for p in (path, self.leaf("bbbbbbbb-4444-4222-8333-555555555555")):
+                recs = em._read_jsonl_entry(p)[4]
+                self.assertTrue(_tail(recs) and recs.skel is not None and len(recs.skel) >= recs.ncold)
+                tracked = [i for i, s in enumerate(recs.skel[:recs.ncold]) if gc.is_tracked(s)
+                           or (isinstance(s.get("message"), dict) and gc.is_tracked(s.get("message")))
+                           or any(gc.is_tracked(b) for b in ((s.get("message") or {}).get("content") or [])
+                                  if isinstance(b, dict))]
+                self.assertEqual(tracked, [], "skeletons tracked by the collector")
+                self.assertFalse(gc.is_tracked(recs.skel), "the skeleton list itself")
+            write_transcript(path, 200 * 1024, start=nxt, mode="a")          # an append slides the window: new skeletons
+            recs = em._read_jsonl_entry(path)[4]
+            self.assertEqual([i for i, s in enumerate(recs.skel[:recs.ncold]) if gc.is_tracked(s)], [])
+            self.assertFalse(gc.is_tracked(recs.skel))
