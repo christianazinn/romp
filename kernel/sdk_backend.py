@@ -3498,6 +3498,10 @@ def fed_text_opener(text: str) -> str:
 # The bus banner's per-message marker, event_model's one detector (its POSTAL_RE; the fallback is the same pattern
 # for a stand-in event_model in tests).
 _POSTAL_MID_RE = getattr(_em, "POSTAL_RE", None) or re.compile(r"<!--\s*romp-msg-id:\s*(\S+?)\s*-->")
+# The romp-tag marker, bound once at import like the marker above (event_model's MSG_TAG_RE, the one reading of the
+# marker): the queue code runs on the backend's threads, which must not reach a building name on the event model
+# (tests/test_stage_marks.py, StageMarksCensus).
+_TAG_MARK_RE = getattr(_em, "MSG_TAG_RE", None) or re.compile(r"<!--\s*romp-tag:\s*([A-Za-z0-9][A-Za-z0-9-]{0,23})\s*-->")
 
 
 # How many postal message ids a session remembers as TAKEN (SdkBackend.deliver), newest kept. The bus re-posts a chunk
@@ -3537,10 +3541,10 @@ def _is_mail_copy(text, meta) -> bool:
 
 def _is_tagged_send(text, meta) -> bool:
     """Is this queued copy a TAGGED machine send? It carries the `<!-- romp-tag: <label> -->` marker (`romp send --tag`,
-    the event model's MSG_TAG_RE, the one reading of the marker) and is not the person's: never a line marked fromUser
+    the event model's MSG_TAG_RE, bound at import as _TAG_MARK_RE) and is not the person's: never a line marked fromUser
     (the chat page's relay of what they typed; the kernel refuses the two together, and this refuses them again), and
     never a slash command, tagged or not (a command is the CLI's to run on its own, not words to read)."""
-    if not isinstance(text, str) or not _em.MSG_TAG_RE.search(text):
+    if not isinstance(text, str) or not _TAG_MARK_RE.search(text):
         return False
     if isinstance(meta, dict) and meta.get("fromUser"):
         return False
