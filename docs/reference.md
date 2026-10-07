@@ -2350,7 +2350,11 @@ The snapshot's fields, all plain numbers (`ms` is milliseconds of wall time):
   it reaches `fullForceS` (`ROMP_GC_FREEZE_FULL_FORCE_S`, default 600, `off` waits for an
   idle tick only) a BUSY pusher cycle runs it, counted in `forced`. A reclaim whose
   collection did not actually run (another thread was inside a collection, so
-  `gc.collect()` returned at once) is re-frozen and left owed, counted in `reclaimSkips`. The same owed clock and
+  `gc.collect()` returned at once) is re-frozen and left owed, counted in `reclaimSkips`.
+  Once anything is frozen a cleanup is also owed `cleanupMaxS` after the last one
+  (`ROMP_GC_FREEZE_CLEANUP_MAX_S`, default 3000, `off` for none), because the cost rule's
+  reference is the last cleanup's own walk and so stretched the interval as the pinned heap
+  grew; with the forced bound, a frozen heap goes at most about an hour between cleanups. The same owed clock and
   forced run cover the fold-in backstop (`backstopFoldins` load fold-ins), with or without
   the full-collection freeze. `callbackErrors`
   counts failures inside the callback, never raised into the collector.

@@ -287,6 +287,59 @@ class OwedClockStartsAtTheDebt(unittest.TestCase):
         self.assertTrue(c.force_due(), "600 s since the cheap collection that created the debt")
 
 
+class WalkingGc(FakeGc):
+    """A collector double whose UNFROZEN collection costs clock time: after an unfreeze the next collect walks the whole
+    heap, `walk_s` seconds, and the next cleanup's walk is `grow` times longer (the pinned heap grows between cleanups)."""
+    def __init__(self, clock, walk_s, grow):
+        super().__init__()
+        self.clock, self.walk_s, self.grow = clock, walk_s, grow
+        self.unfrozen = False
+    def unfreeze(self):
+        self.calls.append("unfreeze"); self.unfrozen = True
+    def collect(self, *a):
+        self.calls.append("collect")
+        if self.unfrozen:
+            self.clock.t += self.walk_s
+            self.walk_s *= self.grow
+            self.unfrozen = False
+        return 0
+
+
+class CleanupIntervalIsCapped(unittest.TestCase):
+    """2026-10-07 live finding on 69dc51e33: a cleanup was owed at full_backstop_ratio x the largest walk, and each
+    cleanup's own walk raised that reference, so cleanups got rarer as the pinned heap grew (live: about every 2 h and
+    stretching, the tracked heap back on the no-fix curve by 9.7 h). Once anything is frozen, a cleanup is now owed at most
+    full_cleanup_max_s after the last one, however long its walk."""
+    def test_cleanups_keep_a_bounded_interval_while_each_walk_is_longer_than_the_last(self):
+        clock = Clock()
+        fake = WalkingGc(clock, walk_s=30.0, grow=2.0)
+        c = gf.GcFreeze(enabled=True, gc=fake, clock=clock, full_freeze_ms=250.0, full_backstop_ratio=10, full_force_s=600)
+        c.full_cleanup_max_s = 3600.0             # set as an attribute, so the same test reads the commit before the cap
+        stats = lambda: {"inserts": 1}
+        gf.pusher_tick(c, True, False, stats, lambda e: None)   # the start-up freeze (nothing walked)
+        reclaim_times = [clock.t]
+        last = c.reclaims
+        for _ in range(int(14 * 3600 / 60)):      # 14 hours of one-minute pusher cycles, every one idle
+            _collection(c, clock, 2, 700.0)       # a slow organic full collection each minute: freezes its survivors
+            clock.t += 60.0
+            gf.pusher_tick(c, True, False, stats, lambda e: None)
+            if c.reclaims != last:
+                last = c.reclaims
+                reclaim_times.append(clock.t)
+        gaps = [b - a for a, b in zip(reclaim_times, reclaim_times[1:])]
+        self.assertGreaterEqual(len(gaps), 10, "cleanups keep coming as walks grow: %d in 14 h" % len(gaps))
+        self.assertLessEqual(max(gaps), 3600.0 + 61.0 + fake.walk_s, "no gap beyond the cap (gaps %r)" % [round(g) for g in gaps])
+
+    def test_the_cap_knob(self):
+        f = gf.full_cleanup_max_s_from_env
+        self.assertEqual(f({}), (gf.DEFAULT_FULL_CLEANUP_MAX_S, None))
+        for off in ("off", "0", "false"):
+            self.assertEqual(f({"ROMP_GC_FREEZE_CLEANUP_MAX_S": off}), (None, None), off)
+        self.assertEqual(f({"ROMP_GC_FREEZE_CLEANUP_MAX_S": "1800"}), (1800.0, None))
+        for bad in ("hourly", "-5", "nan"):
+            self.assertEqual(f({"ROMP_GC_FREEZE_CLEANUP_MAX_S": bad}), (gf.DEFAULT_FULL_CLEANUP_MAX_S, bad), bad)
+
+
 class FoldinBackstopUnderLoad(unittest.TestCase):
     """2026-10-07 review: the older fold-in backstop (after `backstop_foldins` load fold-ins) also ran only on an idle tick,
     and the live kernel once read 4 idle pusher cycles in 91. It now shares the full backstop's owed clock and forced run."""
@@ -370,7 +423,8 @@ class BusyRealCollector(unittest.TestCase):
 
     def test_pinning_stops_when_owed_the_forced_backstop_reclaims_and_retention_stays_bounded(self):
         clock = StepClock(0.3)                    # every full collection reads 300 ms; the force bound is in the same clock
-        c = gf.GcFreeze(enabled=True, gc=gc, clock=clock, full_freeze_ms=250.0, full_backstop_ratio=3, full_force_s=6.0)
+        c = gf.GcFreeze(enabled=True, gc=gc, clock=clock, full_freeze_ms=250.0, full_backstop_ratio=3, full_force_s=6.0,
+                        full_cleanup_max_s=None)  # the forced path alone (this clock advances per read; the cap has its own test)
         self.assertTrue(c.install_full_freeze())
         self.addCleanup(c.remove_full_freeze)
         c.tick(1)                                 # the start-up freeze

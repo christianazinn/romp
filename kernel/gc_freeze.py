@@ -68,7 +68,15 @@ boundary instead (pusher_tick, never inside the gc callback or a locked region),
 the preferred path. The rule is ONE for both backstops: the fold-in backstop (after `backstop_foldins` load fold-ins) and
 the full backstop share the owed test (`_backstop_owed`), one owed-since clock and one forced run (the live kernel once
 read 4 idle pusher cycles in 91, so the fold-in backstop could wait as long as the full one). The forced path is governed by
-ROMP_GC_FREEZE_FULL_FORCE_S alone, so it also covers the fold-in backstop with ROMP_GC_FREEZE_FULL_MS off. The third collection
+ROMP_GC_FREEZE_FULL_FORCE_S alone, so it also covers the fold-in backstop with ROMP_GC_FREEZE_FULL_MS off.
+
+The interval between cleanups is CAPPED (2026-10-07 live finding): the cost rule owes a cleanup at `full_backstop_ratio`
+times the largest walk, and each cleanup's own walk raises that walk, so as the pinned heap grew cleanups got rarer (live:
+about every 2 h and stretching, the tracked heap back on the no-fix curve by 9.7 h) while each freeze pinned more. Once
+anything is frozen, a cleanup is also owed `full_cleanup_max_s` (ROMP_GC_FREEZE_CLEANUP_MAX_S, default 3000 s) after the
+last cleanup (or the first freeze), its owed clock starting at that moment; with the forced path that is at most an hour
+under sustained load. A lower ratio would still scale with the walk; a reference taken from the cheap collections would owe
+a whole-heap walk every few minutes. The cap costs one whole-heap walk per interval and nothing else. The third collection
 threshold is raised to `full_t2` with the freeze: once the long-lived heap is frozen, a full collection is cheap but
 CPython's quarter rule no longer holds it back (the long-lived total it divides is the small unfrozen part), so the
 generation-1 count gate is what bounds the rate. `ROMP_GC_FREEZE_FULL_MS=off` (or 0) restores the
@@ -87,6 +95,8 @@ DEFAULT_BACKSTOP_FOLDINS = 1000  # a reclaim after this many load fold-ins since
 DEFAULT_FULL_FREEZE_MS = 250.0   # an organic full collection at least this long freezes its survivors (bench: scripts/bench_gc_full_rate.py)
 DEFAULT_FULL_T2 = 100          # the third collection threshold while the full freeze is on (CPython's default is 10)
 DEFAULT_FULL_FORCE_S = 600.0     # an owed full backstop that waited this long runs on a busy pusher cycle (the idle tick may never come)
+DEFAULT_FULL_CLEANUP_MAX_S = 3000.0   # once anything is frozen, a cleanup is owed at most this long after the last (plus the
+#                                       600 s forced bound: an hour at most under load)
 DEFAULT_FULL_BACKSTOP_RATIO = 10.0   # a backstop is owed once the organic full-collection pause since the last reclaim reaches this many
 #                                      times the largest whole-heap walk seen: the backstop then costs at most ~1/10 of what full
 #                                      collections spend (a count of freezes instead fired one every ~4 min at a 4 GB bench heap)
@@ -170,6 +180,25 @@ def full_force_s_from_env(env=None):
     return sec, None
 
 
+def full_cleanup_max_s_from_env(env=None):
+    """(full_cleanup_max_s, bad_raw): the ROMP_GC_FREEZE_CLEANUP_MAX_S knob, the longest a frozen heap goes between cleanups.
+    Unset or empty is the default; an off value is None (no cap: the cost rule alone, as at d1e0d4654); a positive number is
+    seconds; anything else falls back to the default with `bad_raw` set (said once by the caller, never fatal)."""
+    raw = (env if env is not None else os.environ).get("ROMP_GC_FREEZE_CLEANUP_MAX_S")
+    if raw is None or raw.strip() == "":
+        return DEFAULT_FULL_CLEANUP_MAX_S, None
+    v = raw.strip().lower()
+    if v in _OFF:
+        return None, None
+    try:
+        sec = float(v)
+    except (TypeError, ValueError):
+        return DEFAULT_FULL_CLEANUP_MAX_S, raw
+    if not sec > 0 or sec != sec or sec == float("inf"):
+        return DEFAULT_FULL_CLEANUP_MAX_S, raw
+    return sec, None
+
+
 class GcFreeze:
     """The freeze controller. `gc` and `clock` are injected so a test drives a fake collector or a real one; the
     kernel passes the real `gc`. The `tick`/`_run` path runs on the pusher thread; `note_ended` runs on every
@@ -177,12 +206,14 @@ class GcFreeze:
 
     def __init__(self, enabled=True, load_trees=DEFAULT_LOAD_TREES, backstop_foldins=DEFAULT_BACKSTOP_FOLDINS,
                  gc=_gc_mod, clock=time.perf_counter, full_freeze_ms=None, full_backstop_ratio=DEFAULT_FULL_BACKSTOP_RATIO, full_t2=None,
-                 full_force_s=DEFAULT_FULL_FORCE_S):
+                 full_force_s=DEFAULT_FULL_FORCE_S, full_cleanup_max_s=DEFAULT_FULL_CLEANUP_MAX_S):
         self.enabled = bool(enabled)
         self.full_freeze_ms = float(full_freeze_ms) if full_freeze_ms else None   # None: the full-collection freeze is off
         self.full_backstop_ratio = max(1.0, float(full_backstop_ratio))
         self.full_force_s = float(full_force_s) if full_force_s else None   # None: an owed backstop waits for an idle tick only
         self._owed_since = None      # the clock when the full backstop was first seen owed; None while not owed
+        self.full_cleanup_max_s = float(full_cleanup_max_s) if full_cleanup_max_s else None   # None: no cap on the interval
+        self._pin_since = None       # the clock at the first freeze, then at each cleanup: frozen (so pinnable) since then
         self.full_freeze_skips = 0   # freezes the callback skipped because a backstop was owed (pinning frozen until it runs)
         self.forced = 0              # owed full backstops run on a busy pusher cycle because no idle tick came within full_force_s
         self.reclaim_skips = 0       # reclaims whose collection did not run (another thread was collecting): left owed, retried
@@ -319,6 +350,8 @@ class GcFreeze:
                 pass
         was_frozen = self.frozen
         self.frozen = True
+        if reclaimed or self._pin_since is None:
+            self._pin_since = self._clock()          # a cleanup re-freezes everything: the cap's interval starts over here
         self._ins_mark = inserts
         # the owed refs still alive after the re-freeze are kept by a LIVE ROOT, not a cycle: the reclaim freed nothing. Record
         # this release's survivor count and their sids (the release line names them kept, not "reclaimed"), and total them.
@@ -398,6 +431,8 @@ class GcFreeze:
                 return
             self._gc.freeze()
             self.frozen = True
+            if self._pin_since is None:
+                self._pin_since = self._clock()
             self.full_freezes += 1
             self._full_since_reclaim += 1
             self.last_full_ms = dt
@@ -414,9 +449,12 @@ class GcFreeze:
     def _backstop_owed(self):
         """Whether EITHER backstop is owed (the fold-in count, or the full-collection cost rule), stamping the one owed-since
         clock at the first reading that finds it owed (the callback or a tick). One test, one clock, both backstops."""
-        owed = self._foldins >= self.backstop_foldins or self.full_backstop_owed()
+        cap_at = (self._pin_since + self.full_cleanup_max_s
+                  if (self.full_cleanup_max_s and self._pin_since is not None) else None)
+        cap_due = cap_at is not None and self._clock() >= cap_at   # the clock is read only when a cap is set
+        owed = self._foldins >= self.backstop_foldins or self.full_backstop_owed() or cap_due
         if owed and self._owed_since is None:
-            self._owed_since = self._clock()
+            self._owed_since = cap_at if cap_due else self._clock()   # the cap's debt arose when the cap was reached
         return owed
 
     def force_due(self):
@@ -476,7 +514,7 @@ class GcFreeze:
                 "fullSinceReclaim": self._full_since_reclaim, "fullBackstopRatio": self.full_backstop_ratio,
                 "fullMsSinceReclaim": round(self._full_ms_since_reclaim, 1), "fullRefMs": round(self._full_ref_ms, 1),
                 "fullFreezeSkips": self.full_freeze_skips, "fullForceS": self.full_force_s, "forced": self.forced,
-                "reclaimSkips": self.reclaim_skips, "frozenAsOfCleanup": self.frozen_as_of_cleanup,
+                "reclaimSkips": self.reclaim_skips, "cleanupMaxS": self.full_cleanup_max_s, "frozenAsOfCleanup": self.frozen_as_of_cleanup,
                 "frozenAsOfCleanupAt": self.frozen_as_of_cleanup_at,
                 "owedForS": round(self._clock() - self._owed_since, 1) if self._owed_since is not None else None,
                 "lastFullMs": round(self.last_full_ms, 1), "callbackErrors": self.callback_errors}

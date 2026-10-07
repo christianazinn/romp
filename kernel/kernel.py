@@ -1265,13 +1265,15 @@ _GC_FREEZE_LOAD_TREES, _gc_freeze_bad_knob = gcf.load_trees_from_env()   # parse
 _GC_FREEZE_FULL_MS, _gc_freeze_bad_full = gcf.full_freeze_ms_from_env()
 _GC_FREEZE_FULL_T2, _gc_freeze_bad_t2 = gcf.full_t2_from_env()
 _GC_FREEZE_FULL_FORCE_S, _gc_freeze_bad_force = gcf.full_force_s_from_env()   # an owed backstop runs on a busy cycle after this long
+_GC_FREEZE_CLEANUP_MAX_S, _gc_freeze_bad_cap = gcf.full_cleanup_max_s_from_env()   # the longest a frozen heap goes between cleanups
 _GC_FREEZE = gcf.GcFreeze(enabled=gcf.enabled_from_env(), load_trees=_GC_FREEZE_LOAD_TREES,   # the ended note (note_ended) is wired
                           full_freeze_ms=_GC_FREEZE_FULL_MS, full_t2=_GC_FREEZE_FULL_T2,    #  when the SDK backend loads (below)
-                          full_force_s=_GC_FREEZE_FULL_FORCE_S)
+                          full_force_s=_GC_FREEZE_FULL_FORCE_S, full_cleanup_max_s=_GC_FREEZE_CLEANUP_MAX_S)
 for _knob, _bad, _default in (("ROMP_GC_FREEZE_LOAD_TREES", _gc_freeze_bad_knob, gcf.DEFAULT_LOAD_TREES),
                               ("ROMP_GC_FREEZE_FULL_MS", _gc_freeze_bad_full, gcf.DEFAULT_FULL_FREEZE_MS),
                               ("ROMP_GC_FREEZE_FULL_T2", _gc_freeze_bad_t2, gcf.DEFAULT_FULL_T2),
-                              ("ROMP_GC_FREEZE_FULL_FORCE_S", _gc_freeze_bad_force, gcf.DEFAULT_FULL_FORCE_S)):
+                              ("ROMP_GC_FREEZE_FULL_FORCE_S", _gc_freeze_bad_force, gcf.DEFAULT_FULL_FORCE_S),
+                              ("ROMP_GC_FREEZE_CLEANUP_MAX_S", _gc_freeze_bad_cap, gcf.DEFAULT_FULL_CLEANUP_MAX_S)):
     if _bad is not None:     # a bad knob fell back to its default: said once, counted, never fatal
         _GC_FREEZE_ERRORS[0] += 1
         try:

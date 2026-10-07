@@ -128,7 +128,8 @@ def _untrack_all(obj, untrack):
             untrack(o)
 
 
-def child(size_gb, setting, seconds, seed, gen0_rate, life_s, cycle_every=25, cycle_life_s=None):
+def child(size_gb, setting, seconds, seed, gen0_rate, life_s, cycle_every=25, cycle_life_s=None, cleanup_max_s="default",
+          grow_pct_per_min=1.0):
     import ctypes
     import gc
     t2, full_ms = SETTINGS[setting]
@@ -183,7 +184,8 @@ def child(size_gb, setting, seconds, seed, gen0_rate, life_s, cycle_every=25, cy
             pauses2.append(dt)
     gc.callbacks.append(hook)                    # first, so its stop timing excludes the controller's freeze (a pointer move)
 
-    ctl = gcf.GcFreeze(enabled=True, load_trees=8, gc=gc, full_freeze_ms=full_ms, full_t2=t2)
+    cap_kw = {} if cleanup_max_s == "default" else {"full_cleanup_max_s": cleanup_max_s}
+    ctl = gcf.GcFreeze(enabled=True, load_trees=8, gc=gc, full_freeze_ms=full_ms, full_t2=t2, **cap_kw)
     ctl_box[0] = ctl
     if not ctl.install_full_freeze() and t2 is not None:   # lever (a) alone: the threshold without the freeze
         a, b, _ = gc.get_threshold()
@@ -232,7 +234,7 @@ def child(size_gb, setting, seconds, seed, gen0_rate, life_s, cycle_every=25, cy
     medc = collections.deque()                   # the leftover cycles, each kept for cycle_life_s (alive past a freeze, then dead)
     created = 0
     dead_peak = 0
-    grow_per_s = max(1.0, len(base) / 100.0 / 60.0)   # ~1% of the long-lived heap a minute
+    grow_per_s = max(1.0, len(base) * grow_pct_per_min / 100.0 / 60.0)   # long-lived growth, a share of the heap a minute
     grown = 0
     i = 0
     paced_from, paced_i = t_start, 0
@@ -310,7 +312,8 @@ def child(size_gb, setting, seconds, seed, gen0_rate, life_s, cycle_every=25, cy
            "hwm_mib": _status_kb("VmHWM") // 1024,
            "ctl": {"freezes": ctl.freezes, "reclaims": ctl.reclaims, "fullFreezes": ctl.full_freezes, "threshold": list(gc.get_threshold()),
                    "callbackErrors": ctl.callback_errors, "ticks": collections.Counter(ticks)},
-           "cycle_every": cycle_every, "cycle_life_s": cycle_life_s, "cycles_created": created,
+           "cleanup_max_s": getattr(ctl, "full_cleanup_max_s", None), "grow_pct_per_min": grow_pct_per_min,
+           "reclaims_in_window": ctl.reclaims, "cycle_every": cycle_every, "cycle_life_s": cycle_life_s, "cycles_created": created,
            "bytes_per_cycle": round(bytes_per_cycle), "dead_uncollected_peak_cycles": dead_peak,
            "dead_uncollected_peak_mib": round(dead_peak * bytes_per_cycle / MIB, 2),
            "ctl_in_window": ctl_tally[0], "ctl_in_window_ms_sum": round(ctl_tally[1], 1),
@@ -429,6 +432,8 @@ def main():
     ap.add_argument("--cycle-life-s", type=float, default=None, help="how long a leftover cycle lives (default --life-s)")
     ap.add_argument("--listing-sizes", default=None, help="time gc.get_objects / get_freeze_count over heaps of these GB")
     ap.add_argument("--listing", action="store_true", help=argparse.SUPPRESS)
+    ap.add_argument("--cleanup-max-s", default="default", help="the cleanup cap in seconds, 'off' for none (d1e0d4654)")
+    ap.add_argument("--grow-pct-per-min", type=float, default=1.0, help="long-lived growth, percent of the heap a minute")
     ap.add_argument("--out", default=None)
     ap.add_argument("--summarize", default=None)
     ap.add_argument("--at-gb", type=float, default=16.0)
@@ -456,7 +461,8 @@ def main():
             out.write(line + "\n"); out.flush()
         return
     if a.child:
-        child(a.size_gb, a.setting, a.seconds, a.seed, a.gen0_rate, a.life_s, a.cycle_every, a.cycle_life_s)
+        cap = a.cleanup_max_s if a.cleanup_max_s == "default" else (None if a.cleanup_max_s.lower() in ("off", "0") else float(a.cleanup_max_s))
+        child(a.size_gb, a.setting, a.seconds, a.seed, a.gen0_rate, a.life_s, a.cycle_every, a.cycle_life_s, cap, a.grow_pct_per_min)
         return
     sizes = [float(x) for x in a.sizes.split(",")]
     settings = a.settings.split(",")
@@ -472,7 +478,8 @@ def main():
                          % (avail, need_mib))
             cmd = [sys.executable, os.path.realpath(__file__), "--child", "--size-gb", str(size), "--setting", s,
                    "--seconds", str(a.seconds), "--seed", str(a.seed), "--gen0-rate", str(a.gen0_rate), "--life-s", str(a.life_s),
-                   "--cycle-every", str(a.cycle_every)] + (["--cycle-life-s", str(a.cycle_life_s)] if a.cycle_life_s is not None else [])
+                   "--cycle-every", str(a.cycle_every), "--cleanup-max-s", str(a.cleanup_max_s),
+                   "--grow-pct-per-min", str(a.grow_pct_per_min)] + (["--cycle-life-s", str(a.cycle_life_s)] if a.cycle_life_s is not None else [])
             env = dict(os.environ, PYTHONHASHSEED="0")
             res = subprocess.run(cmd, capture_output=True, text=True, env=env)
             line = res.stdout.strip().splitlines()[-1] if res.stdout.strip() else ""
