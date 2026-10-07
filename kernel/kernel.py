@@ -1292,9 +1292,9 @@ def _gc_freeze_tick(idle, first):
             except Exception:
                 pass
     kind = gcf.pusher_tick(_GC_FREEZE, idle, first, em.record_cache_stats, on_error)
-    if kind == "forced":     # no idle cycle came while a full backstop was owed: it ran on this busy cycle (one line per run)
+    if kind == "forced":     # no idle cycle came while a backstop was owed: it ran on this busy cycle (one line per run)
         try:
-            sys.stderr.write("gc-freeze: a full backstop owed past %.0f s ran on a busy cycle in %.1f ms\n"
+            sys.stderr.write("gc-freeze: a backstop owed past %.0f s ran on a busy cycle in %.1f ms\n"
                              % (_GC_FREEZE.full_force_s or 0, _GC_FREEZE.last_ms))
         except Exception:
             pass

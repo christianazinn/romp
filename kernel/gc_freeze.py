@@ -65,7 +65,10 @@ and has not run, the callback freezes NOTHING more (each skip counted), so what 
 idle tick may never come under sustained load (the live kernel once read no idle pusher cycle in 5.5 hours), an owed
 backstop that has waited `full_force_s` (ROMP_GC_FREEZE_FULL_FORCE_S, default 600 s) runs at the next BUSY pusher cycle
 boundary instead (pusher_tick, never inside the gc callback or a locked region), counted as forced. The idle tick stays
-the preferred path. The third collection
+the preferred path. The rule is ONE for both backstops: the fold-in backstop (after `backstop_foldins` load fold-ins) and
+the full backstop share the owed test (`_backstop_owed`), one owed-since clock and one forced run (the live kernel once
+read 4 idle pusher cycles in 91, so the fold-in backstop could wait as long as the full one). The forced path is governed by
+ROMP_GC_FREEZE_FULL_FORCE_S alone, so it also covers the fold-in backstop with ROMP_GC_FREEZE_FULL_MS off. The third collection
 threshold is raised to `full_t2` with the freeze: once the long-lived heap is frozen, a full collection is cheap but
 CPython's quarter rule no longer holds it back (the long-lived total it divides is the small unfrozen part), so the
 generation-1 count gate is what bounds the rate. `ROMP_GC_FREEZE_FULL_MS=off` (or 0) restores the
@@ -264,7 +267,7 @@ class GcFreeze:
             return self._run("initial", inserts, []) if inserts > 0 else None
         if owed:
             return self._run("release", inserts, owed)
-        if self._foldins >= self.backstop_foldins or self.full_backstop_owed():
+        if self._backstop_owed():
             return self._run("backstop", inserts, [])
         if (inserts - self._ins_mark) >= self.load_trees:
             return self._run("load", inserts, [])
@@ -357,7 +360,7 @@ class GcFreeze:
                 self._full_ref_ms = dt
             if dt < self.full_freeze_ms:
                 return
-            if self.full_backstop_owed():            # owed and not yet run: freeze nothing more, so the pinned set cannot grow
+            if self._backstop_owed():                # a backstop owed and not yet run: freeze nothing more, so the pinned set cannot grow
                 self.full_freeze_skips += 1
                 return
             n = self._unfrozen_count()               # the survivors about to be frozen: at most what this collection just walked
@@ -383,21 +386,26 @@ class GcFreeze:
     def full_backstop_owed(self):
         """Whether the full-collection freeze owes a backstop reclaim: a freeze ran since the last reclaim (so something
         may be pinned) and the organic full-collection pause since then reached `full_backstop_ratio` times the largest walk."""
-        owed = (self._full_since_reclaim > 0 and self._full_ref_ms > 0
+        return (self._full_since_reclaim > 0 and self._full_ref_ms > 0
                 and self._full_ms_since_reclaim >= self.full_backstop_ratio * self._full_ref_ms)
+
+    def _backstop_owed(self):
+        """Whether EITHER backstop is owed (the fold-in count, or the full-collection cost rule), stamping the one owed-since
+        clock at the first reading that finds it owed (the callback or a tick). One test, one clock, both backstops."""
+        owed = self._foldins >= self.backstop_foldins or self.full_backstop_owed()
         if owed and self._owed_since is None:
-            self._owed_since = self._clock()         # stamped at the first reading that finds it owed (the callback or a tick)
+            self._owed_since = self._clock()
         return owed
 
     def force_due(self):
-        """Whether an owed full backstop has waited `full_force_s` for an idle tick: then a busy pusher cycle runs it."""
-        if not (self.enabled and self.full_force_s) or not self.full_backstop_owed():
+        """Whether an owed backstop (either kind) has waited `full_force_s` for an idle tick: then a busy pusher cycle runs it."""
+        if not (self.enabled and self.full_force_s) or not self._backstop_owed():
             return False
         return (self._clock() - self._owed_since) >= self.full_force_s
 
     def force_backstop(self, inserts):
-        """Run an owed full backstop on a busy cycle once force_due; returns "forced" when it ran, else None. Called only from
-        pusher_tick at a cycle boundary, never from the gc callback."""
+        """Run an owed backstop (either kind) on a busy cycle once force_due; returns "forced" when it ran, else None. Called
+        only from pusher_tick at a cycle boundary, never from the gc callback."""
         if not self.force_due():
             return None
         self.resolve_ended()                         # judge the ended list as the idle tick would (the reclaim covers them all)

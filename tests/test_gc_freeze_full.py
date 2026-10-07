@@ -208,6 +208,62 @@ class OwedUnderLoad(unittest.TestCase):
             self.assertEqual(f({"ROMP_GC_FREEZE_FULL_FORCE_S": bad}), (gf.DEFAULT_FULL_FORCE_S, bad), bad)
 
 
+class FoldinBackstopUnderLoad(unittest.TestCase):
+    """2026-10-07 review: the older fold-in backstop (after `backstop_foldins` load fold-ins) also ran only on an idle tick,
+    and the live kernel once read 4 idle pusher cycles in 91. It now shares the full backstop's owed clock and forced run."""
+    def test_an_owed_foldin_backstop_runs_on_a_busy_cycle_after_the_bound(self):
+        fake, clock = FakeGc(), Clock()
+        c = gf.GcFreeze(enabled=True, load_trees=1, backstop_foldins=2, gc=fake, clock=clock, full_freeze_ms=None,
+                        full_force_s=600)
+        stats = {"inserts": 0}
+        def st():
+            return dict(stats)
+        for n in (1, 2, 3):                       # idle ticks: the initial freeze, then two load fold-ins
+            stats["inserts"] = n
+            gf.pusher_tick(c, True, False, st, lambda e: None)
+        self.assertTrue(c._backstop_owed(), "two fold-ins: the fold-in backstop is owed")
+        for _ in range(5):                        # every later cycle BUSY: within the bound nothing runs
+            clock.t += 100.0
+            self.assertIsNone(gf.pusher_tick(c, False, False, st, lambda e: None))
+        clock.t += 101.0
+        fake.calls.clear()
+        self.assertEqual(gf.pusher_tick(c, False, False, st, lambda e: None), "forced")
+        self.assertEqual(fake.calls, ["unfreeze", "collect", "freeze"])
+        self.assertEqual((c.forced, c.reclaims, c._foldins, c._backstop_owed()), (1, 1, 0, False))
+
+    def test_the_two_backstops_share_one_owed_clock(self):
+        fake, clock = FakeGc(), Clock()
+        c = gf.GcFreeze(enabled=True, load_trees=1, backstop_foldins=1, gc=fake, clock=clock, full_freeze_ms=250.0,
+                        full_backstop_ratio=1, full_force_s=600)
+        c.tick(1); c.tick(2)                      # initial, then one fold-in: the fold-in backstop is owed at t=0
+        self.assertTrue(c._backstop_owed())
+        clock.t += 400.0
+        _collection(c, clock, 2, 300.0)           # a slow full collection while owed: no freeze (skipped), and no new clock
+        self.assertEqual((c.full_freezes, c.full_freeze_skips), (0, 1))
+        clock.t += 200.0
+        self.assertTrue(c.force_due(), "600 s since the FIRST owed reading, whichever backstop it was")
+
+    def test_a_cycle_pinned_by_a_load_foldin_is_reclaimed_on_busy_cycles(self):
+        gc.unfreeze(); gc.collect()
+        self.addCleanup(lambda: (gc.unfreeze(), gc.collect()))
+        clock = Clock()
+        c = gf.GcFreeze(enabled=True, load_trees=1, backstop_foldins=1, gc=gc, clock=clock, full_freeze_ms=None,
+                        full_force_s=10)
+        c.tick(1)
+        a = Cyclic(); b = Cyclic()
+        c.tick(2)                                 # a load fold-in freezes a and b alive; the fold-in backstop is now owed
+        a.o = b; b.o = a
+        w = weakref.ref(a)
+        del a, b
+        gc.collect()
+        self.assertIsNotNone(w(), "pinned in the frozen set")
+        st = lambda: {"inserts": 2}
+        self.assertIsNone(gf.pusher_tick(c, False, False, st, lambda e: None), "busy, inside the bound")
+        clock.t += 11.0
+        self.assertEqual(gf.pusher_tick(c, False, False, st, lambda e: None), "forced")
+        self.assertIsNone(w(), "the forced backstop reclaimed it on a busy cycle")
+
+
 class StepClock:
     """Every read advances `step` seconds: a full collection's start and stop reads are `step` apart (a pause of step*1000 ms)."""
     def __init__(self, step):

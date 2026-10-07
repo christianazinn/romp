@@ -2346,7 +2346,9 @@ The snapshot's fields, all plain numbers (`ms` is milliseconds of wall time):
   `fullBackstopRatio` times the second. While one is owed nothing more is frozen
   (`fullFreezeSkips`); `owedForS` says how long it has been owed (null when not), and once
   it reaches `fullForceS` (`ROMP_GC_FREEZE_FULL_FORCE_S`, default 600, `off` waits for an
-  idle tick only) a BUSY pusher cycle runs it, counted in `forced`. `callbackErrors`
+  idle tick only) a BUSY pusher cycle runs it, counted in `forced`. The same owed clock and
+  forced run cover the fold-in backstop (`backstopFoldins` load fold-ins), with or without
+  the full-collection freeze. `callbackErrors`
   counts failures inside the callback, never raised into the collector.
 - `jobs`: the jobs thread, which runs the housekeeping (the sweeps, the
   reminder walk, the interrupt tick, the persists, the pause and retry
