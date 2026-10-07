@@ -405,9 +405,9 @@ def summarize(files, live_gib, live_cache_gb, live_rss_gb):
         print("EXTRAPOLATION (not a measurement) to %.1f GiB of live transcripts in 23 files:" % live_gib)
         before_w = live_gib * GIB * 3.0
         live_records = live_gib * GIB / per_rec
-        after_w = 23 * tb * 3.0 + live_records * 16
+        after_w = 23 * tb * 3.0 + live_records * 20          # offsets (16 bytes) and a CRC (4) a record
         print("  cache weight whole (3 bytes a file byte): %.1f GB (tonight's measured cache: %.1f GB in 59 entries)" % (before_w / 1e9, live_cache_gb))
-        print("  cache weight tail-only: 23 windows of %d MiB x 3 + %.1f M records x 16 B of index = %.2f GB" % (tb // MIB, live_records / 1e6, after_w / 1e9))
+        print("  cache weight tail-only: 23 windows of %d MiB x 3 + %.1f M records x 20 B of index = %.2f GB" % (tb // MIB, live_records / 1e6, after_w / 1e9))
         print("  bench ratio after/before (cache, end of run): %.4f -> %.2f GB of tonight's %.1f GB" % (
             a["cache GB (end)"] / b["cache GB (end)"], live_cache_gb * a["cache GB (end)"] / b["cache GB (end)"], live_cache_gb))
         print("  resident: tonight %.1f GB with a %.1f GB cache; the same heap with a tail-only cache: about %.1f GB "
