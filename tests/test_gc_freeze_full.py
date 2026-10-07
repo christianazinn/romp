@@ -260,6 +260,33 @@ class ReclaimThatDidNotRun(unittest.TestCase):
         self.assertEqual(c.reclaims, 1)
 
 
+class OwedClockStartsAtTheDebt(unittest.TestCase):
+    """2026-10-07 review of 69dc51e33: the forced-run clock started at the next CHECK, not when the debt arose: the fold-in
+    increment and the cheap-collection path created debt without stamping it, so a forced run could wait up to twice the
+    bound. The clock now starts where the debt arises."""
+    def test_a_foldin_that_creates_the_debt_starts_the_clock(self):
+        fake, clock = FakeGc(), Clock()
+        c = gf.GcFreeze(enabled=True, load_trees=1, backstop_foldins=1, gc=fake, clock=clock, full_freeze_ms=None,
+                        full_force_s=600)
+        c.tick(1)
+        clock.t = 50.0
+        self.assertEqual(c.tick(2), "load")       # this fold-in makes the backstop owed, at t=50
+        clock.t = 650.0                           # the first check comes 600 s later
+        self.assertTrue(c.force_due(), "600 s since the debt arose, not since this check")
+
+    def test_a_cheap_collection_that_creates_the_debt_starts_the_clock(self):
+        fake, clock = FakeGc(), Clock()
+        c = gf.GcFreeze(enabled=True, gc=fake, clock=clock, full_freeze_ms=250.0, full_backstop_ratio=2, full_force_s=600)
+        c.tick(1)
+        _collection(c, clock, 2, 300.0)           # a freeze: reference 300 ms, 300 ms spent
+        _collection(c, clock, 2, 200.0)           # cheap: 500 ms, not owed yet
+        self.assertFalse(c.full_backstop_owed())
+        _collection(c, clock, 2, 200.0)           # cheap: 700 ms >= 2 x 300: the debt arises here, on the early-return path
+        t_debt = clock.t
+        clock.t = t_debt + 600.0
+        self.assertTrue(c.force_due(), "600 s since the cheap collection that created the debt")
+
+
 class FoldinBackstopUnderLoad(unittest.TestCase):
     """2026-10-07 review: the older fold-in backstop (after `backstop_foldins` load fold-ins) also ran only on an idle tick,
     and the live kernel once read 4 idle pusher cycles in 91. It now shares the full backstop's owed clock and forced run."""

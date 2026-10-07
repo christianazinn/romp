@@ -339,6 +339,7 @@ class GcFreeze:
             self.freezes += 1
             if was_frozen:
                 self._foldins += 1                   # a load fold-in; the initial freeze is not one
+                self._backstop_owed()                # this fold-in may create the fold-in backstop's debt: start its clock now
         return self.last_kind
 
     def _collect_ran(self):
@@ -388,9 +389,11 @@ class GcFreeze:
             self._full_ms_since_reclaim += dt
             if dt > self._full_ref_ms:
                 self._full_ref_ms = dt
+            owed = self._backstop_owed()             # stamps the owed clock HERE if this collection's pause created the debt,
+            #                                          the cheap early return below included (2026-10-07 review)
             if dt < self.full_freeze_ms:
                 return
-            if self._backstop_owed():                # a backstop owed and not yet run: freeze nothing more, so the pinned set cannot grow
+            if owed:                                 # a backstop owed and not yet run: freeze nothing more, so the pinned set cannot grow
                 self.full_freeze_skips += 1
                 return
             self._gc.freeze()
@@ -398,6 +401,7 @@ class GcFreeze:
             self.full_freezes += 1
             self._full_since_reclaim += 1
             self.last_full_ms = dt
+            self._backstop_owed()                    # a freeze can complete the debt (the cost rule needs one): stamp it now
         except Exception:
             self.callback_errors += 1
 
