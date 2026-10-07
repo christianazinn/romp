@@ -43,6 +43,7 @@ EVENT_MODEL_ALLOWED = {
     "plan_atoms",                                       # reads blocks only of atoms with no lazy marker; a lazy one answers from tu/tr
     "_pre_tree_identity", "_restore_prefix_atoms", "_asm_heal", "_asm_full", "_asm_fold", "_asm_restore",
     # record-level helpers over jsonl rows and postal/state rows
+    "_skel",                                            # a raw record's walk skeleton, built by the reader as it decodes (never lazy)
     "_norm_message", "_content", "_text_of", "author_of", "_record_origin", "_is_tool_result", "_scan_bg_tasks", "_bg_step",
     "_bg_finish", "scan_bg_tasks_cached", "task_store_plan", "_load_postal_index", "postal_pairs", "injected_source",
     "strip_harness_preamble", "parse_teammate_message", "_absorbed", "_absorbed_atom", "_landing_t", "chain_verdicts",
