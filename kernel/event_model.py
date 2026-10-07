@@ -800,6 +800,62 @@ def _entry_weight(ent) -> int:
         return 0
 
 
+# The record cache's decoded json is kept OUT of the cyclic collector's view (2026-10-06). A full (generation-two)
+# collection visits every container the collector tracks and touches everything those containers point at, so with the
+# cache in view each full pause grew with the cache: the live kernel paused about 28 s per full collection over 61.8 GB
+# of cached records, 14.6% of its wall time. The freeze controller (gc_freeze.py) keeps them out only once an idle pusher
+# cycle has folded them in, and every reclaim's unfreeze puts the whole cache back in the walk. The records are decoded json:
+# dicts, lists and scalars, acyclic, freed by reference counting, so the collector has nothing to find in them. Each
+# record's containers are untracked right after its decode (PyObject_GC_UnTrack, the call every container's own
+# deallocator makes), and the entry's outer list where the entry is built, so no collection walks them, frozen or not,
+# and an eviction still frees them by reference counting. Measured with scripts/bench_record_cache_gc.py (synthetic
+# transcripts through this reader); the figures are in the commit that added this. Safe for the collector's
+# correctness: an untracked container's references count as external, so nothing it points at is ever freed early. The
+# one cost is a leak, never a crash: a cycle closed later THROUGH a cached list would not be collected (a dict re-tracks
+# itself when a container is put in it; a list does not), and no caller puts one there (the reader never extends a
+# served list in place). ROMP_RECORD_CACHE_GC_UNTRACK=off (or 0/false) turns it off.
+try:
+    import ctypes as _ctypes
+    import gc as _gc
+    _PY_GC_UNTRACK = _ctypes.pythonapi.PyObject_GC_UnTrack
+    _PY_GC_UNTRACK.argtypes = (_ctypes.py_object,)
+    _PY_GC_UNTRACK.restype = None
+except Exception:                 # no ctypes or no C API symbol (another interpreter): the records stay tracked, as before
+    import gc as _gc
+    _PY_GC_UNTRACK = None
+
+
+def _record_cache_gc_untrack_enabled(env=None):
+    """Whether cached records are untracked: on unless ROMP_RECORD_CACHE_GC_UNTRACK names an off value, and only where
+    the C call resolved."""
+    v = (env if env is not None else os.environ).get("ROMP_RECORD_CACHE_GC_UNTRACK")
+    return _PY_GC_UNTRACK is not None and not (v is not None and v.strip().lower() in ("off", "0", "false"))
+
+
+_GC_UNTRACK_ON = _record_cache_gc_untrack_enabled()
+
+
+def _gc_untrack_json(obj):
+    """Untrack every dict and list in one decoded json value, iteratively (no recursion limit). A container already
+    untracked is skipped with its contents: CPython creates a dict untracked while it holds only scalars and keeps it
+    so until a container is put in it, and a list only becomes untracked here, after its contents were walked. Runs on
+    the reading thread before the entry is published, so no other thread sees the value yet."""
+    untrack, is_tracked = _PY_GC_UNTRACK, _gc.is_tracked
+    stack = [obj]
+    pop, push = stack.pop, stack.append
+    while stack:
+        o = pop()
+        t = type(o)
+        if t is dict or t is list:
+            if not is_tracked(o):
+                continue
+            untrack(o)
+            for v in (o.values() if t is dict else o):
+                tv = type(v)
+                if tv is dict or tv is list:
+                    push(v)
+
+
 def _cache_pop_locked(path):
     """Under _JSONL_CACHE_LOCK: drop `path`'s entry and its weight; returns the weight (0 when absent). Every pop
     that actually removed an entry counts under `released`, a /perf STATISTIC only (#1735): these entries are
@@ -1928,9 +1984,12 @@ def _scan_jsonl_stream(fh, base_offset, offsets=None, limit=None):
             if not piece_s:
                 continue
             try:
-                records.append(json.loads(piece_s.decode("utf-8", "replace")))
+                rec = json.loads(piece_s.decode("utf-8", "replace"))
             except Exception:
                 continue
+            if _GC_UNTRACK_ON:
+                _gc_untrack_json(rec)                     # out of the cyclic collector's walk while it is hot (see _gc_untrack_json)
+            records.append(rec)
             if offsets is not None:
                 offsets.append(base_offset + at); offsets.append(len(piece))
         consumed = seen
@@ -2184,6 +2243,8 @@ def _read_jsonl_entry_unlocked(path, on_fail=None, tail_ok=False, tail_from=None
         if on_fail is not None and not isinstance(e, FileNotFoundError):
             on_fail(e)
         return None
+    if _GC_UNTRACK_ON and _gc.is_tracked(records):
+        _PY_GC_UNTRACK(records)                   # the entry's outer list (a fresh list per read; its records were untracked at decode)
     ent = (st.st_mtime, st.st_size, offset, tail, records, base, gen, offs)
     with _JSONL_CACHE_LOCK:
         _cache_insert_locked(path, ent)      # the count cap and the byte budget, LRU order (hot entries survive any cold flood)
