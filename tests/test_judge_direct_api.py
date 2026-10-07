@@ -93,6 +93,8 @@ class StandInAPI:
                     api.requests.append({"path": self.path, "headers": {k.lower(): v for k, v in self.headers.items()},
                                          "body": json.loads(body or b"{}"), "port": self.client_address[1]})
                     n = len(api.requests)
+                    drop = api.drop_after                 # read with the request: a test that resets the flag after
+                    #                                       its call returns cannot race the close below
                     status, hdrs, payload = api.script[min(n, len(api.script)) - 1]
                     api.inflight += 1
                     api.max_inflight = max(api.max_inflight, api.inflight)
@@ -109,7 +111,7 @@ class StandInAPI:
                     self.send_header("content-length", str(len(out)))
                     self.end_headers()
                     self.wfile.write(out)
-                    if api.drop_after:
+                    if drop:
                         self.close_connection = True  # the server's idle close: the client still thinks it is open
                 finally:
                     with api._lock:
@@ -332,9 +334,13 @@ class TheRequest(DirectRoadBase):
         self._caption()
         self.api.drop_after = False
         time.sleep(0.05)                              # let the server's close land
-        t0 = time.monotonic()
-        self.assertEqual(self._caption(), jd._clean_caption(CAPTION))
-        self.assertLess(time.monotonic() - t0, 0.3, "a fresh connection at once, not a backoff retry")
+        backoff, jd._DIRECT_API_BACKOFF_S = jd._DIRECT_API_BACKOFF_S, (5.0, 8.0)   # a retry would wait 3.75 s or more
+        try:
+            t0 = time.monotonic()
+            self.assertEqual(self._caption(), jd._clean_caption(CAPTION))
+            self.assertLess(time.monotonic() - t0, 2.0, "a fresh connection at once, not a backoff retry")
+        finally:
+            jd._DIRECT_API_BACKOFF_S = backoff
         self.assertEqual(len(self.api.requests), 2, "one request reached the API for the second call")
         self.assertEqual(len({r["port"] for r in self.api.requests}), 2)
 
