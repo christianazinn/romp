@@ -593,9 +593,6 @@ class ChatScrollBack(unittest.TestCase):
                 self.assertTrue(_tail(ent[4]) or ent[5] > 0, "the leaf's record entry never became whole")
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 def write_forked(path, n, fork_at=40, branch=3, seed=5):
     """A synthetic linear transcript of `n` records with a REWOUND branch: `branch` records hanging off record `fork_at`,
@@ -1120,3 +1117,18 @@ class SkeletonWeightIsWhatSkeletonsHold(Base):
             self.assertGreater(skel_term, 1000000, "the pasted megabyte before the window is counted by its length")
             stats = em.record_cache_stats()["tailOnly"]
             self.assertEqual((stats.get("skeletonBytes"), stats.get("skeletons")), (t.skel_bytes, t.ncold))
+
+
+class TheFileRunsWhole(unittest.TestCase):
+    """A direct run (python tests/test_record_cache_tail_only.py) runs every class: the main guard sat mid-file, so the seven
+    classes after it never ran that way and the run still said OK (review find, 2026-10-07)."""
+
+    def test_the_main_guard_is_the_last_statement(self):
+        import ast
+        tree = ast.parse(Path(__file__).read_text())
+        guards = [i for i, n in enumerate(tree.body) if isinstance(n, ast.If) and "__main__" in ast.dump(n.test)]
+        self.assertEqual(guards, [len(tree.body) - 1], "the main guard is the file's last top-level statement")
+
+
+if __name__ == "__main__":
+    unittest.main()
