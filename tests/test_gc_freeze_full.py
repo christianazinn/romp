@@ -238,6 +238,8 @@ class ReclaimThatDidNotRun(unittest.TestCase):
         self.assertIsNone(c.tick(1), "the collect did not run: not a backstop")
         self.assertEqual(fake.calls, ["unfreeze", "collect", "freeze"], "re-frozen, so the controller's state is restored")
         self.assertEqual((c.reclaims, c.reclaim_skips, c.full_backstop_owed()), (0, 1, True))
+        self.assertEqual(c.collections, 1, "only the initial freeze's collect ran: a collect that did not run is not counted, so "
+                                           "organic = gen-2 collections less `collections` holds")
         clock.t += 700.0
         self.assertIsNone(gf.pusher_tick(c, False, False, lambda: {"inserts": 1}, lambda e: None), "a forced run that did not run")
         self.assertEqual((c.forced, c.reclaim_skips), (0, 2))
@@ -294,12 +296,14 @@ class WalkingGc(FakeGc):
         super().__init__()
         self.clock, self.walk_s, self.grow = clock, walk_s, grow
         self.unfrozen = False
+        self.walks = []                           # each cleanup's walk, in order
     def unfreeze(self):
         self.calls.append("unfreeze"); self.unfrozen = True
     def collect(self, *a):
         self.calls.append("collect")
         if self.unfrozen:
             self.clock.t += self.walk_s
+            self.walks.append(self.walk_s)
             self.walk_s *= self.grow
             self.unfrozen = False
         return 0
@@ -328,7 +332,23 @@ class CleanupIntervalIsCapped(unittest.TestCase):
                 reclaim_times.append(clock.t)
         gaps = [b - a for a, b in zip(reclaim_times, reclaim_times[1:])]
         self.assertGreaterEqual(len(gaps), 10, "cleanups keep coming as walks grow: %d in 14 h" % len(gaps))
-        self.assertLessEqual(max(gaps), 3600.0 + 61.0 + fake.walk_s, "no gap beyond the cap (gaps %r)" % [round(g) for g in gaps])
+        # each gap against the cap, one cycle and the walk of the cleanup that ENDED it (not the final, doubled walk)
+        over = [(round(g), round(w)) for g, w in zip(gaps, fake.walks) if g > 3600.0 + 61.0 + w]
+        self.assertEqual(over, [], "gaps beyond the cap plus their own cleanup's walk: %r" % over)
+
+    def test_with_the_full_freeze_off_the_cap_never_owes_a_cleanup(self):
+        """2026-10-07 review of 25c43358b: the cap applied with ROMP_GC_FREEZE_FULL_MS=off too (the start-up freeze set the
+        pinned clock), so the documented rollback still ran an hourly whole-heap cleanup, forced onto busy cycles. The cap
+        belongs to the full-collection freeze and is off with it."""
+        fake, clock = FakeGc(), Clock()
+        c = gf.GcFreeze(enabled=True, gc=fake, clock=clock, full_freeze_ms=None, full_force_s=600, full_cleanup_max_s=3000)
+        stats = lambda: {"inserts": 1}
+        self.assertEqual(gf.pusher_tick(c, True, False, stats, lambda e: None), "initial")
+        for _ in range(10):
+            clock.t += 3600.0
+            self.assertIsNone(gf.pusher_tick(c, False, False, stats, lambda e: None), "no forced cleanup on a busy cycle")
+            self.assertIsNone(gf.pusher_tick(c, True, False, stats, lambda e: None), "and none on an idle one")
+        self.assertEqual((c.reclaims, c.forced), (0, 0))
 
     def test_the_cap_knob(self):
         f = gf.full_cleanup_max_s_from_env

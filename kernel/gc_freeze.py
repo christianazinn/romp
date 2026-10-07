@@ -74,7 +74,8 @@ The interval between cleanups is CAPPED (2026-10-07 live finding): the cost rule
 times the largest walk, and each cleanup's own walk raises that walk, so as the pinned heap grew cleanups got rarer (live:
 about every 2 h and stretching, the tracked heap back on the no-fix curve by 9.7 h) while each freeze pinned more. Once
 anything is frozen, a cleanup is also owed `full_cleanup_max_s` (ROMP_GC_FREEZE_CLEANUP_MAX_S, default 3000 s) after the
-last cleanup (or the first freeze), its owed clock starting at that moment; with the forced path that is at most an hour
+last cleanup (or the first freeze), its owed clock starting at that moment, while the full-collection freeze is on (with
+ROMP_GC_FREEZE_FULL_MS off there is no cap, as before it); with the forced path that is at most an hour
 under sustained load. A lower ratio would still scale with the walk; a reference taken from the cheap collections would owe
 a whole-heap walk every few minutes. The cap costs one whole-heap walk per interval and nothing else. Bench (1 GB, 25
 min, one request in 5 leaving a cycle that lives 5 s, survivors growing 3% of the heap a minute; scripts/bench_gc_full_rate.py
@@ -387,13 +388,16 @@ class GcFreeze:
             before = self._gc.get_stats()[2]["collections"]
         except Exception:
             before = None
-        self._gc.collect(); self.collections += 1
-        if before is None:
-            return True
-        try:
-            return self._gc.get_stats()[2]["collections"] > before
-        except Exception:
-            return True
+        self._gc.collect()
+        ran = True
+        if before is not None:
+            try:
+                ran = self._gc.get_stats()[2]["collections"] > before
+            except Exception:
+                ran = True
+        if ran:
+            self.collections += 1                    # counted only when it ran: organic = gen-2 collections less `collections`
+        return ran
 
     def _reclaim_did_not_run(self, owed):
         """A reclaim whose collection did not run: re-freeze (the unfreeze moved everything back into the walk), count it,
@@ -452,8 +456,9 @@ class GcFreeze:
     def _backstop_owed(self):
         """Whether EITHER backstop is owed (the fold-in count, or the full-collection cost rule), stamping the one owed-since
         clock at the first reading that finds it owed (the callback or a tick). One test, one clock, both backstops."""
-        cap_at = (self._pin_since + self.full_cleanup_max_s
-                  if (self.full_cleanup_max_s and self._pin_since is not None) else None)
+        cap_at = (self._pin_since + self.full_cleanup_max_s       # the cap belongs to the full-collection freeze: off with it,
+                  if (self.full_cleanup_max_s and self.full_freeze_ms   # so ROMP_GC_FREEZE_FULL_MS=off restores the old collector
+                      and self._pin_since is not None) else None)
         cap_due = cap_at is not None and self._clock() >= cap_at   # the clock is read only when a cap is set
         owed = self._foldins >= self.backstop_foldins or self.full_backstop_owed() or cap_due
         if owed and self._owed_since is None:

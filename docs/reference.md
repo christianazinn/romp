@@ -2351,7 +2351,8 @@ The snapshot's fields, all plain numbers (`ms` is milliseconds of wall time):
   idle tick only) a BUSY pusher cycle runs it, counted in `forced`. A reclaim whose
   collection did not actually run (another thread was inside a collection, so
   `gc.collect()` returned at once) is re-frozen and left owed, counted in `reclaimSkips`.
-  Once anything is frozen a cleanup is also owed `cleanupMaxS` after the last one
+  While the full-collection freeze is on and anything is frozen, a cleanup is also owed
+  `cleanupMaxS` after the last one
   (`ROMP_GC_FREEZE_CLEANUP_MAX_S`, default 3000, `off` for none), because the cost rule's
   reference is the last cleanup's own walk and so stretched the interval as the pinned heap
   grew; with the forced bound, a frozen heap goes at most about an hour between cleanups. The same owed clock and
