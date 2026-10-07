@@ -2676,7 +2676,14 @@ The snapshot's fields, all plain numbers (`ms` is milliseconds of wall time):
   the stage being the pusher thread's current tick job (`jobs.<job>`) or
   `push`, `connect` for a fresh client's full push on its handler thread (a
   browser reload or reconnect), `none` outside those (T401), and `asmCheckpoint.hydratedByStage`
-  does the same for the hydration rows.
+  does the same for the hydration rows. `tailOnly` counts the transcripts held
+  tail-only (see "The record cache holds a large transcript's tail" below):
+  `entries`, `windowBytes` (the file bytes their windows hold), `fileBytes`
+  (their files' sizes) and the two knobs; `coldReads` counts the reads of
+  records before a window: `passes` (one per streaming pass or single-record
+  read), `records`, `bytes`, `byCaller` (the same per first calling function
+  outside the event model) and `rewrites` (reads refused because the file was
+  rewritten under the index).
 - `asmCheckpoint`: the assembly documents since boot: `written`, `restored`,
   `fallbacks` per reason (`version`, `rows` (a version-6 document whose atom
   row fails its shape check at load, or fails its decode at the first read
@@ -3388,6 +3395,43 @@ a copy of a state directory and with no live kernel, `tools/perf-bench.py`
 loads a checkout's kernel in-process and reports each builder's cost on
 real-sized data; two checkouts can run against one copy for a before-and-after
 comparison. Its module docstring is the reference.
+
+### The record cache holds a large transcript's tail
+
+A transcript (a file under the Claude projects root) whose held records span
+64 MiB or more keeps only its newest records decoded in memory: the last
+32 MiB of the file or the last 2,000 records, whichever holds more. Every
+older record stays indexed by its byte offset and length (16 bytes a record).
+The entry's record list is then a read-only sequence with the whole list's
+length, order, indexing and slicing; a record before the window is read off
+disk when asked for, one seek for a single record and a streaming pass in runs
+of about 4 MiB for a walk, each run freed as the walk moves on. The entry's
+base, generation, offsets and count are a whole read's, so every consumer sees
+every record.
+
+- The window follows appends. A read always keeps what it appended (up to
+  64 MiB), so a fold that was current steps the new records from memory; once
+  the window holds more than one and a half times 32 MiB it slides forward.
+  A from-zero read never builds the whole list: it decodes every line, keeps
+  the window and drops the rest as it goes.
+- Who reads before the window: a fold with no cursor to resume from (a refold
+  from record 0) streams the file once; the assembly's whole parse streams it
+  into its adapter, which keeps its own list until the entry is re-seated on its
+  document, so the document writer never walks the disk. Chat scroll-back reads
+  the assembly's atoms, or the lazy atoms a document restored, and hydrates
+  bodies by offset as before. Each such read is counted under
+  `recordCache.coldReads` by caller.
+- A pass that reads before the window first checks the entry's 64-byte guard on
+  disk; a file rewritten since it was indexed raises an error naming the path
+  (an OSError) instead of serving a wrong record, and the next read through the
+  reader reads it afresh.
+- Other large logs stay whole: the postal log is walked from its first record
+  by every parse. `entry_whole_resident` answers false for a tail-only entry (a
+  fold from record 0 over it reads), so the converge pass does not prime folds
+  over it; the assembly converge pass asks `entry_indexed_whole` instead.
+- `ROMP_RECORD_CACHE_TAIL_MB` sets the window (0 turns the rule off, every entry
+  whole as before), `ROMP_RECORD_CACHE_TAIL_RECORDS` the record floor, and
+  `ROMP_RECORD_CACHE_TAIL_ROOTS` (a path list) the directories it applies to.
 
 ### The chat wire's two protocols
 

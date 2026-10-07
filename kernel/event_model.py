@@ -897,6 +897,11 @@ def record_cache_stats() -> dict:
     with _JSONL_CACHE_LOCK:
         out = {"entries": len(_JSONL_CACHE), "bytes": _JSONL_CACHE_BYTES[0], "budgetBytes": _JSONL_CACHE_BUDGET_BYTES,
                "countCap": _JSONL_CACHE_MAX, **_RECORD_CACHE_STATS, "keptWhole": len(_DROP_KEPT)}
+        tails = [e for e in _JSONL_CACHE.values() if type(e[4]) is _TailRecords]   # 2026-10-07: the entries held tail-only
+        out["tailOnly"] = {"entries": len(tails), "windowBytes": sum(max(0, int(e[1]) - e[4].hot_offset()) for e in tails),
+                           "fileBytes": sum(int(e[1]) for e in tails), "tailBytes": _TAIL_BYTES, "tailRecords": _TAIL_RECORDS}
+    out["coldReads"] = cold_read_stats()
+    with _JSONL_CACHE_LOCK:
         table = _RECORD_CACHE_STATS.get("wholeReads")
         out["wholeReads"] = {k: dict(v) for k, v in table.items()} if isinstance(table, dict) else {}
         bys = _RECORD_CACHE_STATS.get("wholeReadsByStage")             # T401: the same reads per (stage, caller)
@@ -2099,9 +2104,11 @@ def tail_rule_on():
     return _TAIL_BYTES > 0
 
 
-class TailRecordsRead(RuntimeError):
+class TailRecordsRead(OSError):
     """A record before a tail-only entry's window was asked for and the file no longer holds the bytes the entry indexed
-    (it was rewritten since the read): raised, never answered with a wrong record."""
+    (it was rewritten since the read): raised, never answered with a wrong record. An OSError, so every handler that
+    treats a failed read of the file as a failed read (the reader's own pop and on_fail, the assembly's fallback to a
+    whole parse) treats this one the same way; the next read through the reader sees the rewrite and reads afresh."""
 
 
 def _caller_outside_module():
@@ -2251,6 +2258,8 @@ class _TailRecords:
                 rec = json.loads(piece.decode("utf-8", "replace"))
             except Exception:
                 self._refuse()                                   # it decoded when it was indexed: the bytes moved
+            if _GC_UNTRACK_ON:
+                _gc_untrack_json(rec)                            # as the scan does: a whole adapter may hold it for a while
             out.append(rec)
         return out, a1 - a0
 
