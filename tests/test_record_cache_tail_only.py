@@ -12,8 +12,11 @@ through a read-only sequence with the whole list's length and order. Pinned here
   - an append extends the window and, past one and a half windows, slides it, under the same generation;
   - every index, slice, walk and reversed walk equals a plain read's; a fold from record 0, a fold whose cursor fell
     behind the window, a checkpoint write and a fresh process's restore all get every record they need;
-  - nothing can see a truncated view: the C json encoder refuses the sequence, and a file rewritten under the index
-    raises rather than serving a wrong record;
+  - nothing can see a truncated view: the C json encoder refuses the sequence, and a held view whose file was rewritten,
+    replaced, or edited in place at equal length with its last bytes untouched raises rather than serving a wrong record
+    (every record's CRC is checked before it is decoded, review find); a whole list growing past the threshold, by a
+    small append or one large one, takes its records' CRCs only after proving them against the records it holds;
+  - the record floor (the last _TAIL_RECORDS) never stretches the window past two windows' bytes;
   - other large files (the postal log's case) stay whole, and ROMP_RECORD_CACHE_TAIL_MB=0 turns the rule off;
   - the assembly's whole parse, its document and a fresh process's restore over a tail-only leaf equal the rule-off
     parse, and the chat build's scroll-back pages over it equal the whole build.
@@ -327,6 +330,92 @@ class TheWindow(Base):
             self.assertGreater(em.cold_read_stats()["rewrites"], 0)
             self.assertEqual(list(self._read(path)[4]), plain(path), "the next read through the reader sees the rewrite")
 
+    def _edit_in_place(self, path, j, old=b"make", new=b"MAKE"):
+        """Record j's bytes edited in place at equal length (the file's last bytes untouched): the case the 64-byte witness
+        alone cannot see (review find, 2026-10-07)."""
+        ent = em._JSONL_CACHE[path]
+        at, ln = int(ent[7][2 * j]), int(ent[7][2 * j + 1])
+        with open(path, "r+b") as f:
+            f.seek(at)
+            b = f.read(ln)
+            self.assertIn(old, b)
+            f.seek(at)
+            f.write(b.replace(old, new, 1))
+
+    def test_a_same_length_edit_of_an_older_record_is_refused_by_a_held_view(self):
+        with knobs(32 * 1024, 4, roots=[str(self.proj)]):
+            path = self.leaf()
+            write_transcript(path, 300 * 1024)
+            held = self._read(path)[4]
+            self.assertTrue(_tail(held))
+            j = next(i for i in range(held.ncold) if i % 4 == 1)          # a tool call before the window ("make test # i")
+            before = held[j]
+            self._edit_in_place(path, j)
+            fresh_view = self._read(path)[4]                               # another reader sees the new mtime and re-reads
+            self.assertNotEqual(fresh_view[j], before, "the re-read serves the file as it now is")
+            with self.assertRaises(em.TailRecordsRead):
+                held[j]                                                    # the held view never serves the edited bytes
+            with self.assertRaises(em.TailRecordsRead):
+                list(held)
+            self.assertEqual(held[-1], self._read(path)[4][-1], "records inside its window are still its own")
+
+    def test_a_replaced_file_is_refused_by_a_held_view(self):
+        with knobs(32 * 1024, 4, roots=[str(self.proj)]):
+            path = self.leaf()
+            write_transcript(path, 300 * 1024)
+            held = self._read(path)[4]
+            self.assertTrue(_tail(held))
+            tmp = path + ".tmp"
+            shutil.copy(path, tmp)
+            os.replace(tmp, path)                                          # the same bytes, another file
+            with self.assertRaises(em.TailRecordsRead):
+                held[0]
+
+    def test_a_whole_list_that_grows_past_the_threshold_converts_with_checksums(self):
+        with knobs(32 * 1024, 4, roots=[str(self.proj)]):
+            path = self.leaf()
+            _, nxt = write_transcript(path, 40 * 1024)
+            first = self._read(path)
+            self.assertIs(type(first[4]), list, "under twice the window: whole")
+            write_transcript(path, 120 * 1024, start=nxt, mode="a")
+            grown = self._read(path)
+            self.assertTrue(_tail(grown[4]), "past the threshold by appends: the window, under the same generation")
+            self.assertEqual(grown[6], first[6])
+            self.assertEqual(list(grown[4]), plain(path))
+            self.assertEqual(len(grown[4].crcs), len(grown[4]), "a CRC for every record, the ones held whole before included")
+            self._edit_in_place(path, 1)
+            with self.assertRaises(em.TailRecordsRead):
+                grown[4][1]
+
+    def test_a_large_append_to_a_whole_list_takes_its_checksums_before_dropping_its_records(self):
+        with knobs(32 * 1024, 4, roots=[str(self.proj)]):
+            path = self.leaf()
+            _, nxt = write_transcript(path, 40 * 1024)
+            first = self._read(path)
+            self.assertIs(type(first[4]), list)
+            n0 = len(first[4])
+            write_transcript(path, 300 * 1024, start=nxt, mode="a")          # one append over two windows: the scan drops
+            grown = self._read(path)[4]
+            self.assertTrue(_tail(grown))
+            self.assertGreater(grown.ncold, n0, "the list held whole went to disk with the append's older records")
+            self.assertEqual(len(grown.crcs), len(grown))
+            self.assertEqual(list(grown), plain(path))
+            self._edit_in_place(path, 1)
+            with self.assertRaises(em.TailRecordsRead):
+                grown[1]
+
+    def test_the_record_floor_is_bounded_in_bytes(self):
+        with knobs(32 * 1024, 1000, roots=[str(self.proj)]):
+            path = self.leaf()
+            with open(path, "w") as f:
+                for i in range(60):                                        # 60 records of about 10 KB: 1,000 of them would be 10 MB
+                    f.write(json.dumps({"type": "user", "uuid": "u%d" % i, "message": {"content": "x" * 10000}}) + "\n")
+            got = self._read(path)[4]
+            self.assertTrue(_tail(got))
+            self.assertLessEqual(os.path.getsize(path) - got.hot_offset(), 64 * 1024 + 10100,
+                                 "the record floor reaches back at most two windows")
+            self.assertEqual(list(got), plain(path))
+
     def test_no_c_fast_path_sees_a_truncated_view(self):
         with knobs(32 * 1024, 4, roots=[str(self.proj)]):
             path = self.leaf()
@@ -453,7 +542,7 @@ class ChatScrollBack(unittest.TestCase):
         fresh()
         with km._chat_fold_lock:
             km._chat_fold.clear()
-        jd._PARSE_CACHE.clear()
+        jd._PARSE_CACHE.clear(); jd._CHAIN_MEMO.clear()   # the two share one identity key (test_judge_parse_cache)
         km._parse_mode.clear()
         km._built_chat.clear() if hasattr(km, "_built_chat") else None
         km._prev_chat_events.clear()

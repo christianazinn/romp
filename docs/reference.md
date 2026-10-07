@@ -3400,8 +3400,10 @@ comparison. Its module docstring is the reference.
 
 A transcript (a file under the Claude projects root) whose held records span
 64 MiB or more keeps only its newest records decoded in memory: the last
-32 MiB of the file or the last 2,000 records, whichever holds more. Every
-older record stays indexed by its byte offset and length (16 bytes a record).
+32 MiB of the file or the last 2,000 records, whichever holds more (the record
+floor reaches back at most 64 MiB, so large records cannot stretch it). Every
+older record stays indexed by its byte offset and length and the CRC-32 of its
+bytes (20 bytes a record).
 The entry's record list is then a read-only sequence with the whole list's
 length, order, indexing and slicing; a record before the window is read off
 disk when asked for, one seek for a single record and a streaming pass in runs
@@ -3421,10 +3423,15 @@ every record.
   the assembly's atoms, or the lazy atoms a document restored, and hydrates
   bodies by offset as before. Each such read is counted under
   `recordCache.coldReads` by caller.
-- A pass that reads before the window first checks the entry's 64-byte guard on
-  disk; a file rewritten since it was indexed raises an error naming the path
-  (an OSError) instead of serving a wrong record, and the next read through the
-  reader reads it afresh.
+- A read before the window checks, on each open, that the file is the one
+  indexed (its device and inode) and that the entry's 64-byte guard stands, and
+  checks each record's CRC before decoding it. A file rewritten, replaced or
+  edited in place since it was indexed (even at equal length with its last bytes
+  unchanged) raises an error naming the path (an OSError) instead of serving a
+  wrong record, and the next read through the reader reads it afresh. A
+  transcript that grows past the threshold in one kernel life has no CRCs for
+  the records it held whole: their bytes are read once and each must decode to
+  the record in memory before its CRC is taken, or the entry stays whole.
 - Other large logs stay whole: the postal log is walked from its first record
   by every parse. `entry_whole_resident` answers false for a tail-only entry (a
   fold from record 0 over it reads), so the converge pass does not prime folds

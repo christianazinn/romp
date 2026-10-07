@@ -26,7 +26,7 @@ Auxiliary inputs the file adapter may read (same category as the transcript):
                                transcript lost to an API-errored try; judge parse only)
   timeline/messages.jsonl   -> peer rompUuid for a postal atom (join on the msg id)
 """
-import array, bisect, collections, copy, gzip, json, os, re, sys, time, hashlib, threading, weakref
+import array, bisect, collections, copy, gzip, json, os, re, sys, time, hashlib, threading, weakref, zlib
 from datetime import datetime
 from pathlib import Path
 
@@ -788,10 +788,10 @@ def _entry_weight(ent) -> int:
     try:
         size, base = int(ent[1]), int(ent[5])
         recs = ent[4] if len(ent) > 4 else None
-        if type(recs) is _TailRecords:                    # tail-only (2026-10-07): the window's bytes, plus the offset index of
-            held = max(0, size - recs.hot_offset())       #  every record (16 bytes a record, held as they are, not decoded)
-            offs = recs.offs
-            return int(held * RECORD_CACHE_RESIDENT_PER_FILE_BYTE) + len(offs) * offs.itemsize
+        if type(recs) is _TailRecords:                    # tail-only (2026-10-07): the window's bytes, plus the offsets and CRCs
+            held = max(0, size - recs.hot_offset())       #  of every record (20 bytes a record, held as they are, not decoded)
+            offs, crcs = recs.offs, recs.crcs
+            return int(held * RECORD_CACHE_RESIDENT_PER_FILE_BYTE) + len(offs) * offs.itemsize + len(crcs) * crcs.itemsize
         if base <= 0:
             held = size
         else:
@@ -1983,18 +1983,23 @@ def _scan_jsonl_stream(fh, base_offset, offsets=None, limit=None, tail=None):
     first cut split at b"\\n" alone and documented the bare-\\r case as a difference; parity costs one splitlines call
     per line). tests/test_reader_stream_peak.py pins the equivalence, the bare-\\r case included.
 
-    `tail` (2026-10-07, the tail-only rule above _TailRecords): a dict with "keep_from", a byte offset, and "keep_last", a
+    `tail` (2026-10-07, the tail-only rule above _TailRecords; tail["crcs"] receives every parsed record's CRC-32, aligned
+    with `offsets`): a dict with "keep_from", a byte offset, and "keep_last", a
     count. A record starting before keep_from is decoded (the count and the offsets stay the reference's) but not kept: it
     goes into a ring of the last keep_last such records, tail["ring"], and is counted in tail["dropped"], so a large read
-    never holds more than the window and the ring. The offsets of every record, kept or not, go into `offsets`."""
+    never holds more than the window and the ring. "ring_from", when given, is the earliest byte a ring record may start
+    at (the ring then holds at most the bytes between it and keep_from). The offsets of every record, kept or not, go into
+    `offsets`."""
     records = []
-    keep_from = ring = None
+    keep_from = ring = crcs = None
+    ring_from = 0
     if tail is not None:
         keep_from = int(tail.get("keep_from") or 0)
-        ring = tail["ring"] = collections.deque(maxlen=max(0, int(tail.get("keep_last") or 0)))
+        ring_from = int(tail.get("ring_from") or 0)
+        crcs = tail["crcs"] = array.array("I")           # the CRC-32 of every parsed record's bytes, aligned with `offsets`
+        ring = tail["ring"] = collections.deque(maxlen=max(1, int(tail.get("keep_last") or 0)))   # at least the newest
         tail["dropped"] = 0
-        if not ring.maxlen:
-            ring = None
+    last_dropped = None
     seen = 0                                              # bytes iterated so far, complete lines and the trailing partial alike
     consumed = 0                                          # bytes of complete lines: what the next read resumes after
     remaining = limit
@@ -2022,13 +2027,18 @@ def _scan_jsonl_stream(fh, base_offset, offsets=None, limit=None, tail=None):
                 _gc_untrack_json(rec)                     # out of the cyclic collector's walk while it is hot (see _gc_untrack_json)
             if keep_from is not None and base_offset + at < keep_from:
                 tail["dropped"] += 1                      # before the window: indexed, not kept (the ring holds the newest few)
-                if ring is not None:
+                if base_offset + at >= ring_from:
                     ring.append(rec)
+                last_dropped = rec
             else:
                 records.append(rec)
             if offsets is not None:
                 offsets.append(base_offset + at); offsets.append(len(piece))
+            if crcs is not None:
+                crcs.append(zlib.crc32(piece))
         consumed = seen
+    if last_dropped is not None and (not ring or ring[-1] is not last_dropped):
+        ring.append(last_dropped)                         # the newest dropped record whatever its size: a window never ends empty
     return records, base_offset + consumed, seen
 
 
@@ -2040,8 +2050,8 @@ def _scan_jsonl_stream(fh, base_offset, offsets=None, limit=None, tail=None):
 #
 # The rule. A file whose held span (the bytes from its first held record to the consumed end) reaches _TAIL_MIN_FILE_BYTES
 # keeps in memory only its newest records: the last _TAIL_BYTES of the file or the last _TAIL_RECORDS records, whichever
-# holds more. Every record before that window stays INDEXED (its byte offset and length, 16 bytes a record, the array the
-# entry always carried as ent[7]) but not decoded. The entry's records field is then a _TailRecords: a read-only sequence
+# holds more. Every record before that window stays INDEXED (its byte offset and length, the array the entry always carried
+# as ent[7], and the CRC-32 of its bytes: 20 bytes a record) but not decoded. The entry's records field is then a _TailRecords: a read-only sequence
 # of the SAME length, indexing and order as the whole list it replaces, which serves a record inside the window from
 # memory and one before it by reading its bytes off disk (one seek-read, or a sequential streaming pass for a run of them,
 # freeing each record as the caller moves on). Nothing about the entry's shape changes: base, gen, the offsets and the
@@ -2062,11 +2072,16 @@ def _scan_jsonl_stream(fh, base_offset, offsets=None, limit=None, tail=None):
 # Every such read is counted under /perf recordCache.coldReads by the caller that asked (the first frame outside this
 # module), so a consumer that turned a cached walk into a disk walk shows up by name rather than as unexplained CPU.
 #
-# Correctness of a read before the window rests on the file being the one the entry indexed: transcripts are append-only,
-# and each pass that reads before the window first verifies the entry's witness (the up-to-64 bytes before its consumed
-# offset, the reader's own guard) on disk. A file rewritten since the read fails that check and the read raises
-# TailRecordsRead naming the path: loud, never a wrong record (the next read of the file through the reader sees the
-# rewrite and re-reads it, as before). ROMP_RECORD_CACHE_TAIL_MB=0 turns the rule off: every entry whole, as before.
+# Correctness of a read before the window rests on the bytes being the ones the entry indexed. Every record of a tail-only
+# entry carries the CRC-32 of its bytes as scanned (4 bytes a record, beside its offsets), and every read before the
+# window checks the record's CRC before decoding it, the file's identity (device and inode) and the entry's witness (the
+# up-to-64 bytes before its consumed offset) on each open. A held view whose file was rewritten, replaced or edited in
+# place since it was indexed raises TailRecordsRead naming the path, even when the edit kept a record's length and the
+# file's last bytes: loud, never a wrong record (review find, 2026-10-07: the witness alone passed a same-length edit of
+# an old record, and a held view would have served it under its old generation where a held whole list kept serving the
+# original). A whole list turning into a window for the first time (a transcript that grew past the threshold in this
+# process) has no CRCs for the records it already held: their bytes are read once and each must decode to the record held
+# in memory before its CRC is taken; a mismatch leaves the entry whole. ROMP_RECORD_CACHE_TAIL_MB=0 turns the rule off.
 _TAIL_BYTES = int(float(os.environ.get("ROMP_RECORD_CACHE_TAIL_MB", "32")) * 1024 * 1024)
 _TAIL_RECORDS = int(os.environ.get("ROMP_RECORD_CACHE_TAIL_RECORDS", "2000") or 0)
 _TAIL_MIN_FILE_BYTES = 2 * _TAIL_BYTES            # a file whose held span is under this is held whole (no window)
@@ -2150,15 +2165,17 @@ class _TailRecords:
     Deliberately not a list subclass: the C json encoder and other C fast paths read a list subclass's storage directly,
     which here would be the window alone, a silent truncation. A caller that needs a real list fails loudly instead.
     Immutable once built, like every list the reader serves (the reader builds a new one per append)."""
-    __slots__ = ("path", "offs", "ncold", "hot", "guard_off", "guard", "__weakref__")
+    __slots__ = ("path", "offs", "ncold", "hot", "guard_off", "guard", "crcs", "ident", "__weakref__")
 
-    def __init__(self, path, offs, ncold, hot, guard_off, guard):
+    def __init__(self, path, offs, ncold, hot, guard_off, guard, crcs, ident):
         self.path = path
         self.offs = offs
         self.ncold = int(ncold)
         self.hot = hot
         self.guard_off = int(guard_off)
         self.guard = bytes(guard)
+        self.crcs = crcs                                  # array("I"): the CRC-32 of every record's bytes, aligned with offs
+        self.ident = ident                                # (st_dev, st_ino) of the file the records were read from
 
     def __len__(self):
         return self.ncold + len(self.hot)
@@ -2228,7 +2245,12 @@ class _TailRecords:
                 hi = lo
 
     def _verify(self, fh):
-        """The entry's witness on disk: the bytes before its consumed offset are the ones it captured."""
+        """The file is the one indexed (its device and inode) and the entry's witness stands on disk (the bytes before its
+        consumed offset are the ones it captured). Each record's own bytes are checked by its CRC as it is decoded."""
+        if self.ident is not None:
+            st = os.fstat(fh.fileno())
+            if (st.st_dev, st.st_ino) != self.ident:
+                return False
         g = self.guard
         if not g:
             return True
@@ -2251,9 +2273,13 @@ class _TailRecords:
         if len(blob) != a1 - a0:
             self._refuse()
         out = []
+        crcs = self.crcs
         for j in range(lo, hi):
             at = int(offs[2 * j]) - a0
-            piece = blob[at:at + int(offs[2 * j + 1])].strip()
+            piece = blob[at:at + int(offs[2 * j + 1])]
+            if zlib.crc32(piece) != crcs[j]:
+                self._refuse()                                   # these are not the bytes the record was indexed from
+            piece = piece.strip()
             try:
                 rec = json.loads(piece.decode("utf-8", "replace"))
             except Exception:
@@ -2337,28 +2363,39 @@ class _RecordsView:
         return self.parent[self.start + i]
 
 
-def _window_start(offs, total, end, ncold):
-    """The first record index the window keeps for a file of `total` records ending (consumed) at byte `end`: the records
-    inside the last _TAIL_BYTES, or the last _TAIL_RECORDS, whichever is more, never before `ncold` (a window only moves
-    forward) and always at least the last record."""
-    lo, hi = ncold, total                                 # the smallest i with end - offs[2i] <= _TAIL_BYTES (binary search)
+def _first_within(offs, lo, hi, end, nbytes):
+    """The smallest record index in lo..hi whose record starts within `nbytes` of `end` (hi when none does): offsets ascend."""
     while lo < hi:
         mid = (lo + hi) // 2
-        if end - int(offs[2 * mid]) <= _TAIL_BYTES:
+        if end - int(offs[2 * mid]) <= nbytes:
             hi = mid
         else:
             lo = mid + 1
-    i_bytes = lo
-    i = min(i_bytes, max(0, total - max(1, _TAIL_RECORDS)))
+    return lo
+
+
+def _window_start(offs, total, end, ncold):
+    """The first record index the window keeps for a file of `total` records ending (consumed) at byte `end`: the records
+    inside the last _TAIL_BYTES, or the last _TAIL_RECORDS, whichever is more, never before `ncold` (a window only moves
+    forward) and always at least the last record. The record floor reaches back at most _TAIL_MIN_FILE_BYTES (twice the
+    window) from the end, so a run of very large records (an image payload in every one) cannot make the floor hold more
+    than two windows' bytes."""
+    i_bytes = _first_within(offs, ncold, total, end, _TAIL_BYTES)
+    i_floor = max(0, total - max(1, _TAIL_RECORDS))
+    if i_floor < i_bytes:
+        i_floor = max(i_floor, _first_within(offs, ncold, total, end, _TAIL_MIN_FILE_BYTES))
+    i = min(i_bytes, i_floor)
     return max(ncold, min(i, max(0, total - 1)))
 
 
-def _tail_shape(path, offs, ncold, hot, end, guard, force=False, keep_index=None):
+def _tail_shape(path, offs, ncold, hot, end, guard, force=False, keep_index=None, crcs=None, fh=None):
     """The records field for an entry holding `ncold` records before the window and `hot` in memory, with every record's
     offsets in `offs`, consumed to `end` with witness `guard`: the window slid when it has grown past _TAIL_SLIDE_FACTOR
     times _TAIL_BYTES (or `force`, a list converting to a window), never past `keep_index` (the first record the read
     that called this appended), a plain list when nothing lies before it, else a _TailRecords. A held span under
-    _TAIL_MIN_FILE_BYTES, or the rule off, is never windowed."""
+    _TAIL_MIN_FILE_BYTES, or the rule off, is never windowed. `crcs` are the records' CRCs aligned with `offs` (complete for a
+    tail-only entry; for a whole list turning into a window, only its newest records', the rest filled from the open file
+    `fh` by _fill_crcs, which leaves the list whole when its bytes do not prove the records)."""
     total = ncold + len(hot)
     if _TAIL_BYTES > 0 and total and hot and (ncold > 0 or _tail_eligible(path)):
         hot_bytes = end - int(offs[2 * ncold])
@@ -2368,26 +2405,89 @@ def _tail_shape(path, offs, ncold, hot, end, guard, force=False, keep_index=None
             if keep_index is not None:
                 w = max(ncold, min(w, int(keep_index)))
             if w > ncold:
+                have = len(crcs) if crcs is not None else 0
+                if have < total:                          # a first conversion: the records held whole have no CRCs yet
+                    if ncold > 0 or fh is None:
+                        w = ncold                         # (never: a tail-only entry's scan always keeps CRCs) stay as is
+                    else:
+                        crcs = _fill_crcs(fh, offs, hot, total - have, crcs)
+                        if crcs is None:
+                            w = ncold                     # the bytes do not prove the records: whole, as before
+            if w > ncold:
                 hot = hot[w - ncold:]
                 ncold = w
     if ncold <= 0:
         return hot
-    return _TailRecords(path, offs, ncold, hot, end, guard)
+    try:
+        st = os.fstat(fh.fileno()) if fh is not None else os.stat(path)
+        ident = (st.st_dev, st.st_ino)
+    except OSError:
+        ident = None
+    return _TailRecords(path, offs, ncold, hot, end, guard, crcs, ident)
 
 
-def _tail_scan_info(path, size, span_start, append_from=None):
+def _tail_scan_info(path, size, span_start, append_from=None, held_tail=False):
     """The scan's tail mode for a read that will leave an entry holding records from byte `span_start` of `path`, a file of
     `size` bytes: None when the rule is off, the file is no transcript (_tail_eligible) or the held span stays under
     _TAIL_MIN_FILE_BYTES (held whole), else the window's start byte and the record floor (_scan_jsonl_stream's `tail`).
     `append_from`, the byte an APPEND to a held entry starts at: an append of up to _TAIL_MIN_FILE_BYTES is kept whole in the
     window, so a fold that was current before it steps the new records from memory however large one of them is (a
-    40 KB tool result appended to a 32 KiB window would otherwise slide the window past the fold's cursor)."""
+    40 KB tool result appended to a 32 KiB window would otherwise slide the window past the fold's cursor). `held_tail`: the
+    entry being appended to is tail-only, so the scan runs in tail mode whatever the rule says now (its new records need
+    their CRCs beside the old ones), dropping nothing when the rule would not window it."""
     if _TAIL_BYTES <= 0 or size - int(span_start) < _TAIL_MIN_FILE_BYTES or not _tail_eligible(path):
-        return None
+        return {"keep_from": 0, "keep_last": 0} if held_tail else None
     keep_from = max(0, int(size) - _TAIL_BYTES)
     if append_from is not None and int(size) - int(append_from) <= _TAIL_MIN_FILE_BYTES:
         keep_from = min(keep_from, int(append_from))
-    return {"keep_from": keep_from, "keep_last": _TAIL_RECORDS}
+    return {"keep_from": keep_from, "keep_last": _TAIL_RECORDS,
+            "ring_from": max(0, int(size) - _TAIL_MIN_FILE_BYTES)}   # the floor's reach (see _window_start): the ring's too
+
+
+def _crcs_after(old, tinfo, pre=None):
+    """The CRCs of the entry an append to `old` leaves: a tail-only entry's own, extended by the scan's (a NEW array, the
+    served one untouched); a plain list's `pre` (filled from disk before a scan that drops records) extended the same way;
+    the scan's alone otherwise (the plain list's records have none until a first conversion fills them, _tail_shape);
+    None when the scan kept none."""
+    new = tinfo.get("crcs") if tinfo else None
+    base = old.crcs if type(old) is _TailRecords else pre
+    if base is not None:
+        out = array.array("I", base)
+        if new:
+            out.extend(new)
+        return out
+    return new
+
+
+def _fill_crcs(fh, offs, hot, m, crcs):
+    """The CRCs of records 0..m of a whole list turning into a window, from their bytes on disk, each proved by decoding to
+    the record held in memory (hot[j]) first; the scan's `crcs` for the rest appended. None on any mismatch or read error:
+    the entry then stays whole (the file is not what the list holds; the reader's next read decides)."""
+    out = array.array("I")
+    try:
+        j = 0
+        while j < m:
+            k = j + 1
+            a0 = int(offs[2 * j])
+            while k < m and int(offs[2 * k]) + int(offs[2 * k + 1]) - a0 <= _COLD_CHUNK_BYTES:
+                k += 1
+            a1 = int(offs[2 * k - 2]) + int(offs[2 * k - 1])
+            fh.seek(a0)
+            blob = fh.read(a1 - a0)
+            if len(blob) != a1 - a0:
+                return None
+            for i in range(j, k):
+                at = int(offs[2 * i]) - a0
+                piece = blob[at:at + int(offs[2 * i + 1])]
+                if json.loads(piece.strip().decode("utf-8", "replace")) != hot[i]:
+                    return None
+                out.append(zlib.crc32(piece))
+            j = k
+    except (OSError, ValueError):
+        return None
+    if crcs:
+        out.extend(crcs)                                  # the scan's: records m..total, the newest
+    return out if len(out) == len(hot) else None
 
 
 def _tail_combine(old, new, tinfo):
@@ -2402,7 +2502,7 @@ def _tail_combine(old, new, tinfo):
     if not dropped:
         return oc, ((oh + new) if oh else new)
     ring = list(tinfo.get("ring") or ())
-    need = max(0, _TAIL_RECORDS - len(new))
+    need = max(0, max(1, _TAIL_RECORDS) - len(new))
     fill = ring[len(ring) - min(need, len(ring)):] if need else []
     nd = dropped - len(fill)
     if nd <= 0:                                           # the ring held every dropped record: nothing left the window
@@ -2584,8 +2684,9 @@ def _read_jsonl_entry_unlocked(path, on_fail=None, tail_ok=False, tail_from=None
                                                                     and (st.st_mtime == hit[0] or tail_from is not None)))
             unchanged_tail = (hit is not None and not tail_ok and hit[5] > 0 and st.st_size == hit[1]
                               and st.st_mtime == hit[0])            # a whole reader meets an unchanged tail entry
-            ncold, tinfo, keep_index = 0, None, None      # records before the tail-only window, the scan's tail mode, and the
-            #                                               first record an append brought (the window keeps it: see _tail_shape)
+            ncold, tinfo, keep_index, crcs = 0, None, None, None   # records before the tail-only window, the scan's tail mode, the
+            #                                               first record an append brought (the window keeps it: see _tail_shape),
+            #                                               and the records' CRCs (None for an entry that is not tail-only)
             if grown or unchanged_tail:
                 _, _, offset, tail, records, base0, gen0 = hit[:7]
                 fh.seek(max(0, offset - len(tail)))
@@ -2594,11 +2695,22 @@ def _read_jsonl_entry_unlocked(path, on_fail=None, tail_ok=False, tail_from=None
                     if tail_ok or base0 == 0:
                         offs = array.array("q", hit[7]) if len(hit) > 7 else array.array("q")
                         tinfo = _tail_scan_info(path, st.st_size, int(offs[0]) if offs else offset,
-                                                append_from=offset if records else None)
+                                                append_from=offset if records else None,
+                                                held_tail=type(records) is _TailRecords)
+                        pre = None
+                        if (tinfo is not None and records and type(records) is not _TailRecords
+                                and int(tinfo.get("keep_from") or 0) > offset):
+                            # an append so large the scan drops records before the window, to a list held whole: its records
+                            # would go to disk with no CRC, so theirs are taken first, each proved against the record held
+                            pre = _fill_crcs(fh, offs, records, len(records), None)
+                            fh.seek(offset)
+                            if pre is None:
+                                tinfo = None                  # the bytes do not prove the list: this read keeps it whole
                         keep_index = len(records) if (records and st.st_size - offset <= _TAIL_MIN_FILE_BYTES) else None
                         new, offset, nread = _scan_jsonl_stream(fh, offset, offs, limit=max(0, st.st_size - fh.tell()),
                                                                 tail=tinfo)   # the appended lines, one at a time
                         _count_read(path, nread)
+                        crcs = _crcs_after(records, tinfo, pre)   # the old entry's CRCs and the scan's (before `records` is replaced)
                         ncold, records = _tail_combine(records, new, tinfo)   # a NEW list — never extend the served one in place
                         base, gen, done = base0, gen0, True
                         kind = "restore" if restored is not None else "grown"
@@ -2612,6 +2724,7 @@ def _read_jsonl_entry_unlocked(path, on_fail=None, tail_ok=False, tail_from=None
                         records, offset, nread = _scan_jsonl_stream(fh, 0, offs, limit=st.st_size, tail=tinfo)
                         _count_read(path, nread)
                         ncold, records = _tail_combine([], records, tinfo)
+                        crcs = tinfo.get("crcs") if tinfo else None
                         base, gen, done, kind = 0, gen0, True, "upgrade"
                 else:
                     kind = "guard"                        # prefix changed → a rewrite → full re-read, a fresh generation
@@ -2628,12 +2741,14 @@ def _read_jsonl_entry_unlocked(path, on_fail=None, tail_ok=False, tail_from=None
                 records, offset, nread = _scan_jsonl_stream(fh, 0, offs, limit=st.st_size, tail=tinfo)   # line by line, to the size the stat saw
                 _count_read(path, nread)
                 ncold, records = _tail_combine([], records, tinfo)
+                crcs = tinfo.get("crcs") if tinfo else None
                 base, gen = 0, _next_gen()                # a from-zero read: a generation no cursor of this path can hold
             tail_from = max(0, offset - _JSONL_TAIL_GUARD)
             fh.seek(tail_from)
             tail = fh.read(offset - tail_from)
             _count_read(path, len(tail))                  # the guard capture is a read too (/perf's count is what was pulled)
-            records = _tail_shape(path, offs, ncold, records, offset, tail, keep_index=keep_index)   # a plain list, or the window
+            records = _tail_shape(path, offs, ncold, records, offset, tail, keep_index=keep_index, crcs=crcs,
+                                  fh=fh)          # a plain list, or the window over the indexed file
             if kind in _WHOLE_READ_KINDS:                 # a whole read: counted by kind and caller on /perf (T384), always on; the
                 try:                                      #  frame walk runs only here, on the rare whole read, never on a tail or an
                     fr = sys._getframe(1)                 #  append
