@@ -5700,11 +5700,12 @@ def chain_membership(leaf_path, candidate_files=None, states=None, leaf_override
                     _asm_ckpt_note(leaf_path, "restore", repr(e)[:120]); adapter = None
             elif _READER_TRACE:
                 sys.stderr.write("chain: no document for %s (rompuuid %s sdk_human %r cands %r)\n" % (leaf_path, rompuuid, sdk_human, [str(f) for f in candidate_files]))
-    if adapter is None:
-        adapter = FileAdapter(candidate_files, leaf_path, leaf_override=leaf_override, resume_links=links)
-    if _READER_TRACE:
+    if adapter is None:                                  # the whole walk over skeletons: the rewind hold asks it with the pending
+        adapter = _walk_with_skeletons(lambda w: _membership_of(FileAdapter(   #  cut on every feed build of an armed hold, on the
+            candidate_files, leaf_path, leaf_override=leaf_override, resume_links=links, walk_only=w)))   # pusher, partly under
+    if _READER_TRACE:                                    #  _goals_snap_lock: no read before the window (review find, 2026-10-07)
         sys.stderr.write("chain: %s %s\n" % (how, leaf_path))
-    return adapter if isinstance(adapter, dict) else _membership_of(adapter)
+    return adapter if isinstance(adapter, dict) else _membership_of(adapter)   # the walks above answer the membership itself
 
 
 def file_rewound(path, rompuuid=None, sdk_human=None, own=True):

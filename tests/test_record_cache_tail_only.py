@@ -869,3 +869,55 @@ class DocumentSeededWalksReadNothingBeforeTheWindow(Base):
         ref_rw2, ref_cm2 = self._ref(path)
         self.assertEqual(rw, ref_rw2)
         self.assertEqual(cm, ref_cm2, "the seeded membership equals the whole walk's after the appends")
+
+
+class RewindHoldReadsNothingBeforeTheWindow(Base):
+    """The rewind gesture's kept-chain walk (the kernel's _rewind_kept_uuids, review find, 2026-10-07): while a bare rollback's
+    hold is armed, every feed or chat build asks em.chain_membership with the pending cut and no session id, on the pusher
+    thread and, mid-pass, inside _goals_snap_lock. That always built a whole adapter, which over a tail-only leaf read every
+    record before the window off disk, once per gesture and again at take and dissolve. It now walks the skeletons."""
+
+    def setUp(self):
+        super().setUp()
+        self.saved = (km._sessions, km._sdk)
+        self.cut = ""
+        test = self
+
+        class Backend:
+            def pending_cut(self, sid):
+                return test.cut
+        km._sessions = lambda now, **kw: [{"sid": SID, "name": "web", "path": self.leaf(), "mtime": NOW, "anchor": SID}]
+        km._sdk = lambda: Backend()
+        km._rewind_kept_memo.clear()
+
+    def tearDown(self):
+        km._sessions, km._sdk = self.saved
+        km._rewind_kept_memo.clear()
+        super().tearDown()
+
+    def test_the_rewind_holds_kept_chain_reads_nothing_before_the_window(self):
+        path = self.leaf()
+        branch, nxt = write_forked(path, 6000)
+        rnd = random.Random(5)
+        self.cut = [_rec(i, rnd) for i in range(5990)][-1]["uuid"]   # a pending bare rollback near the end of the leaf
+        with knobs(0, 10, roots=[str(self.proj)]):
+            fresh()
+            ref = em.chain_membership(path, candidate_files=[path], leaf_override=self.cut)
+        self.assertTrue(branch <= ref["rewind"])
+        fresh()
+        with knobs(64 * 1024, 10, roots=[str(self.proj)]):
+            ent = em._read_jsonl_entry(path)
+            self.assertTrue(_tail(ent[4]) and ent[4].ncold > 100)
+            per_build = []
+            for k in range(3):
+                km._rewind_kept_memo.clear()                 # each build's memo key moves when a record lands (the take)
+                c0 = cold_records()
+                kept = km._rewind_kept_uuids(SID)
+                per_build.append(cold_records() - c0)
+                self.assertEqual(kept, ref["kept"], "build %d: the kept chain under the pending cut" % k)
+            self.assertEqual(per_build, [0, 0, 0], "records read before the window per build: %r" % per_build)
+            nxt = append_chain(path, nxt, 3)                 # the branch take's records land: the dissolve-time walk
+            c0 = cold_records()
+            km._rewind_kept_memo.clear()
+            self.assertIsNotNone(km._rewind_kept_uuids(SID))
+            self.assertEqual(cold_records() - c0, 0, "the walk after the take read nothing before the window")
