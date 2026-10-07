@@ -16,6 +16,7 @@ CLI:
 import collections
 import shlex
 import contextlib, copy, hashlib, json, os, pickle, re, secrets, shutil, signal, stat, sys, time, subprocess, threading, traceback, importlib.util
+import http.client, random, ssl, urllib.parse   # the direct Messages API road (_direct_api_run)
 
 SESSION_FILE_WRITES = {"all": 0, "by": {}}   # this module's writes of a session's keyed files since load: a count per session id
 #                                               (the goal store, its override journal and archive, the episode log) and one for the
@@ -1706,6 +1707,9 @@ def _log_judge_usage(judge, tier, model, fsid, wrap, sent=None, recv=None, err=F
                                 # 'login:<id>' (a stored login), so the cost rollups split by login; absent on rows
                                 # written before the stamp existed
                                 **({"auth": auth} if auth else {}),
+                                # 'api' on a call the judge sent to the Messages API itself (2026-10-06,
+                                # _direct_api_run); absent on a CLI child's row, as on every row before it
+                                **({"route": wrap["route"]} if wrap.get("route") else {}),
                                 "cost": wrap.get("total_cost_usd")}) + "\n")
     except Exception:
         pass
@@ -2376,6 +2380,279 @@ def _call_shape(model, sys_prompt, user, sent):
                                         int((time.time() - sent) * 1000))
 
 
+# ── the direct Messages API road for the high-volume Haiku index judges (2026-10-06) ─────────────────────────
+# The captioner (about 7,000 calls an hour at peak) and the gister (about 1,000) each started one `claude -p`
+# process per call, and a CLI start costs about a core-second before the request leaves (the measurement harness,
+# scripts/judge_direct_api_bench.py, replays a synthetic batch against a local stand-in API); on a shared machine
+# near its load line that start-up was most of the judges' CPU. A KEY-billed call on a Haiku model now goes from
+# this process straight to the Messages API instead, reusing keep-alive connections from a small shared pool (the
+# index pass makes a fresh thread pool every pass, so a per-thread connection would die with its thread), and
+# comes back as an envelope in the CLI's own shape, so everything downstream of the child in _judge_run_impl
+# (the error envelope, the limit and auth latches, the content-refusal matcher, the held key's one refresh and
+# one retry on a 401, the usage row, the served-model check) runs exactly as it does for a CLI child.
+# What the request keeps from the CLI's (read off CLI 2.1.284 against a stand-in server): the dated model id the
+# CLI resolves `haiku` to, max_tokens 32000, thinking disabled (the index tier's lever, see _judge_env),
+# temperature 1, no cache_control (DISABLE_PROMPT_CACHING), the judge's own system prompt and user text. What it
+# drops: the CLI's boilerplate around them (its billing line and agent line in the system prompt, and four
+# reminders it adds to the user turn: working directory and OS, the model's own name, a token budget, the date),
+# none of which the judge wrote or a caption uses, about 150 input tokens a call.
+# Who stays on the CLI: every other judge; any call billed to a login (only the CLI can use a subscription
+# login); a key-billed call with no held key (the box's key comes from a helper the CLI resolves itself); a model
+# that is not a Haiku this road can price, or one with adaptive thinking; a routing setting the CLI would honour
+# and this road does not (a proxy, custom headers, Bedrock or Vertex), said once on stderr; and every call when
+# ROMP_JUDGE_DIRECT_API=off. The archiver and the titler make calls of the same single-turn shape on the same
+# tier and are left on the CLI on purpose: widening is one entry each in _DIRECT_API_JUDGES.
+# The key: the held key (_KEY_SOURCE) as _judge_env resolved it for this call, sent only in the x-api-key header.
+# It is never logged, printed, written or put in this process's environment, and every reply is scrubbed
+# (_held_scrub) before anything reads it.
+# Retries: the CLI's SDK retried overloads and rate limits inside the child; this road does the same, bounded: up
+# to _DIRECT_API_RETRIES more attempts on 408/409/429/5xx/529 or a dropped connection, honouring retry-after and
+# x-should-retry, all inside the same CALL_ALARM_S the CLI child ran under. A call that runs to that alarm comes
+# back in the alarm-kill shape (empty output, exit -SIGALRM), as a killed child does.
+_DIRECT_API_JUDGES = frozenset({"captioner", "gister"})
+_DIRECT_API_ALIAS = {"haiku": "claude-haiku-4-5-20251001"}   # what CLI 2.1.284 sends for the bare alias
+_DIRECT_API_PRICES = {(4, 5): {"in": 1e-6, "out": 5e-6, "cache_w": 1.25e-6, "cache_r": 0.1e-6}}   # Haiku, $/token
+#   (the kernel's DEFAULT_MODEL_PRICES row and the CLI's own catalog agree): a Haiku version not listed here has no
+#   price this road can stamp on its usage row, so it stays on the CLI, whose envelope carries the cost
+_DIRECT_API_MAX_TOKENS = 32000     # the CLI's max_tokens for Haiku 4.5 (its modelUsage says maxOutputTokens 32000)
+_DIRECT_API_RETRIES = 3
+_DIRECT_API_RETRY_STATUS = frozenset({408, 409, 429, 500, 502, 503, 504, 529})
+_DIRECT_API_BACKOFF_S = (0.5, 8.0)   # first delay and ceiling, doubled per attempt, jittered +-25%
+_DIRECT_API_RETRY_AFTER_CAP_S = 30.0
+_DIRECT_API_ROUTE_ENV = ("ANTHROPIC_CUSTOM_HEADERS", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX",
+                         "CLAUDE_CODE_USE_FOUNDRY", "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy",
+                         "ALL_PROXY", "all_proxy")
+_DIRECT_API_SAID = set()           # stderr lines already said this process (one per distinct reason)
+_DIRECT_POOL = {}                  # (scheme, host, port) -> idle keep-alive connections, taken one per call
+_DIRECT_POOL_LOCK = threading.Lock()
+_DIRECT_POOL_IDLE_MAX = 16         # idle connections kept per host: the concurrency cap's ceiling (16)
+_DIRECT_SSL = []                   # the one TLS context every connection shares (made on first use)
+
+
+class _DirectReply:
+    """The direct road's answer in the shape _judge_run_impl reads off a finished CLI child."""
+
+    def __init__(self, stdout="", stderr="", returncode=0):
+        self.stdout, self.stderr, self.returncode = stdout, stderr, returncode
+
+
+def _direct_api_say(key, line):
+    if key not in _DIRECT_API_SAID:
+        _DIRECT_API_SAID.add(key)
+        sys.stderr.write("romp-judge: " + line + "\n")
+
+
+def _direct_api_switch_on():
+    """ROMP_JUDGE_DIRECT_API, read at call time: off / 0 / false / no puts every judge back on the CLI."""
+    return str(os.environ.get("ROMP_JUDGE_DIRECT_API") or "").strip().lower() not in ("off", "0", "false", "no")
+
+
+def _direct_api_model(model):
+    """(the API model id, its price row) when `model` is a Haiku this road can send and price, else None."""
+    fam, ver = _model_family_version(model)
+    if fam != "haiku" or ver == () or _adaptive_thinking(model):
+        return None
+    if ver is None:                                    # the bare alias: the id the CLI resolves it to
+        mid = _DIRECT_API_ALIAS.get(fam)
+        ver = _model_family_version(mid)[1] if mid else None
+    else:                                              # a pinned id is sent as pinned, less any [1m]-style suffix
+        mid = re.sub(r"\[.*$", "", str(model).strip())
+    price = _DIRECT_API_PRICES.get(ver)
+    return (mid, price) if mid and price else None
+
+
+def _direct_api_route(judge, tier, model, auth, held, env, fast_asked):
+    """The direct road's plan for this call ({model, price, scheme, host, port, path}), or None for the CLI."""
+    if judge not in _DIRECT_API_JUDGES or tier != "index" or fast_asked or not _direct_api_switch_on():
+        return None
+    if auth != "key":
+        return None                                    # a login bills through the CLI and nothing else
+    if not held:
+        _direct_api_say("no-held-key", "no held API key (the CLI resolves this box's key itself), so the captioner "
+                                       "and gister keep starting the CLI per call")
+        return None
+    blocked = sorted(k for k in _DIRECT_API_ROUTE_ENV if (env or {}).get(k))
+    if blocked:
+        _direct_api_say(("routing",) + tuple(blocked),
+                        "%s is set, which the CLI honours and the direct Messages API road does not, so the captioner "
+                        "and gister keep starting the CLI per call" % ", ".join(blocked))
+        return None
+    m = _direct_api_model(model)
+    if m is None:
+        return None
+    base = str((env or {}).get("ANTHROPIC_BASE_URL") or "https://api.anthropic.com").strip()
+    try:
+        u = urllib.parse.urlsplit(base)
+        port = u.port or (443 if u.scheme == "https" else 80)
+    except ValueError:
+        u, port = None, None
+    if u is None or u.scheme not in ("http", "https") or not u.hostname:
+        _direct_api_say(("base-url", base[:80]), "ANTHROPIC_BASE_URL is not an http(s) URL this road can use, so the "
+                                                 "captioner and gister keep starting the CLI per call")
+        return None
+    _direct_api_say(("on", m[0]), "captioner and gister calls on %s go straight to the Messages API, no CLI process "
+                                  "per call (ROMP_JUDGE_DIRECT_API=off restores the CLI)" % m[0])
+    return {"model": m[0], "price": m[1], "scheme": u.scheme, "host": u.hostname, "port": port,
+            "path": u.path.rstrip("/") + "/v1/messages"}
+
+
+def _direct_api_ssl():
+    with _DIRECT_POOL_LOCK:
+        if not _DIRECT_SSL:
+            _DIRECT_SSL.append(ssl.create_default_context())
+        return _DIRECT_SSL[0]
+
+
+def _direct_api_close(conn):
+    try:
+        conn.close()
+    except Exception:
+        pass
+
+
+def _direct_api_post(route, body, key, timeout):
+    """POST one request on an idle pooled keep-alive connection to the route's host (a new one when none is idle):
+    (status, headers, bytes). The connection goes back to the pool after a whole response. One the server already
+    closed (a stale keep-alive) gets ONE fresh connection at once, which is not an API retry; anything else raises
+    to the caller's bounded policy."""
+    k = (route["scheme"], route["host"], route["port"])
+    for fresh in (False, True):
+        conn = None
+        if not fresh:
+            with _DIRECT_POOL_LOCK:
+                idle = _DIRECT_POOL.get(k)
+                conn = idle.pop() if idle else None
+        reused = conn is not None
+        if conn is None:
+            if route["scheme"] == "https":
+                conn = http.client.HTTPSConnection(route["host"], route["port"], timeout=timeout,
+                                                   context=_direct_api_ssl())
+            else:
+                conn = http.client.HTTPConnection(route["host"], route["port"], timeout=timeout)
+        else:
+            conn.timeout = timeout
+            if conn.sock is not None:
+                conn.sock.settimeout(timeout)
+        try:
+            conn.request("POST", route["path"], body=body,
+                         headers={"x-api-key": key, "anthropic-version": "2023-06-01",
+                                  "content-type": "application/json", "accept": "application/json",
+                                  "user-agent": "romp-judge (direct Messages API)"})
+            resp = conn.getresponse()
+            data = resp.read()
+            hdrs = {str(h).lower(): v for h, v in resp.getheaders()}
+        except (http.client.RemoteDisconnected, http.client.CannotSendRequest, http.client.BadStatusLine,
+                BrokenPipeError, ConnectionResetError):
+            _direct_api_close(conn)
+            if reused:
+                continue
+            raise
+        except BaseException:
+            _direct_api_close(conn)
+            raise
+        if resp.will_close:
+            _direct_api_close(conn)
+        else:
+            with _DIRECT_POOL_LOCK:
+                idle = _DIRECT_POOL.setdefault(k, [])
+                if len(idle) < _DIRECT_POOL_IDLE_MAX:
+                    idle.append(conn)
+                    conn = None
+            if conn is not None:
+                _direct_api_close(conn)
+        return resp.status, hdrs, data
+    raise http.client.RemoteDisconnected("the API closed the connection")   # not reached: the fresh pass raises
+
+
+def _direct_api_envelope(route, data, ms, attempts):
+    """A 200 response's JSON, as the CLI's result envelope: the reply text, the API's own token counts, the cost
+    from them, and the served id under modelUsage (where _note_served_model reads it). A `refusal` stop is the
+    content refusal the CLI renders as "<model> can't help with this", an error envelope here as there."""
+    msg = json.loads(data.decode("utf-8", "replace"))
+    served = str(msg.get("model") or route["model"])
+    if msg.get("stop_reason") == "refusal":
+        return {"type": "result", "subtype": "error", "is_error": True, "route": "api",
+                "result": "%s can't help with this (stop_reason: refusal)" % served}
+    text = "".join(str(b.get("text") or "") for b in (msg.get("content") or [])
+                   if isinstance(b, dict) and b.get("type") == "text")
+    u = msg.get("usage") or {}
+    n = {f: int(u.get(f) or 0) for f in ("input_tokens", "output_tokens", "cache_creation_input_tokens",
+                                         "cache_read_input_tokens")}
+    p = route["price"]
+    cost = (n["input_tokens"] * p["in"] + n["output_tokens"] * p["out"]
+            + n["cache_creation_input_tokens"] * p["cache_w"] + n["cache_read_input_tokens"] * p["cache_r"])
+    return {"type": "result", "subtype": "success", "is_error": False, "result": text, "route": "api",
+            "stop_reason": msg.get("stop_reason"), "duration_ms": ms, "duration_api_ms": ms, "num_turns": 1,
+            "attempts": attempts, "usage": n, "total_cost_usd": cost,
+            "modelUsage": {served: {"inputTokens": n["input_tokens"], "outputTokens": n["output_tokens"],
+                                    "cacheReadInputTokens": n["cache_read_input_tokens"],
+                                    "cacheCreationInputTokens": n["cache_creation_input_tokens"], "costUSD": cost}}}
+
+
+def _direct_api_error_text(status, data):
+    """An API error response in the CLI's words where the latches key on them (a 401 reads "Invalid API key", the
+    words _is_auth_error and the held key's refresh look for), else "API Error: <status> <type>: <message>"."""
+    try:
+        e = (json.loads(data.decode("utf-8", "replace")) or {}).get("error") or {}
+        etype, emsg = str(e.get("type") or ""), str(e.get("message") or "")
+    except Exception:
+        etype, emsg = "", (data or b"")[:200].decode("utf-8", "replace")
+    if status == 401:
+        return "Invalid API key · Fix external API key (Messages API 401 %s)" % (etype or "authentication_error")
+    return ("API Error: %d %s: %s" % (status, etype or "error", emsg)).strip()[:400]
+
+
+def _direct_api_run(route, sys_prompt, user, key, deadline_s=None, sleep=time.sleep):
+    """ONE judge call over the direct Messages API road, returned as a _DirectReply shaped like the finished CLI
+    child it replaces: stdout is the CLI's JSON envelope (a result, or an error envelope), and a call that runs to
+    the alarm comes back empty with the alarm's exit code. Never raises; the key rides the header and nothing else."""
+    if not key:                                        # _direct_api_route sends only a held key: this is a belt
+        return _DirectReply(json.dumps({"type": "result", "subtype": "error", "is_error": True, "route": "api",
+                                        "result": "Not logged in · no API key held for the direct Messages API"}), "", 1)
+    deadline_s = CALL_ALARM_S if deadline_s is None else deadline_s
+    body = json.dumps({"model": route["model"], "max_tokens": _DIRECT_API_MAX_TOKENS, "system": sys_prompt or "",
+                       "messages": [{"role": "user", "content": user or ""}],
+                       "thinking": {"type": "disabled"}, "temperature": 1}).encode("utf-8")
+    t0 = time.monotonic()
+    attempt = 0
+    while True:
+        left = deadline_s - (time.monotonic() - t0)
+        if left <= 0:
+            return _DirectReply("", "the direct Messages API call ran to the %ds call alarm" % deadline_s, _KILL_RC)
+        try:
+            status, hdrs, data = _direct_api_post(route, body, key, left)
+            failure = None
+        except (TimeoutError, OSError, http.client.HTTPException) as e:
+            if isinstance(e, TimeoutError) or deadline_s - (time.monotonic() - t0) <= 0:
+                return _DirectReply("", "the direct Messages API call ran to the %ds call alarm (%s)"
+                                    % (deadline_s, type(e).__name__), _KILL_RC)
+            status, hdrs, data, failure = None, {}, b"", "API Error: Connection error (%s)" % type(e).__name__
+        if status == 200:
+            ms = int((time.monotonic() - t0) * 1000)
+            try:
+                return _DirectReply(json.dumps(_direct_api_envelope(route, data, ms, attempt + 1)), "", 0)
+            except Exception as e:                     # a 200 whose body is not a Messages response
+                return _DirectReply(json.dumps({"type": "result", "subtype": "error", "is_error": True, "route": "api",
+                                                "result": "API Error: unreadable response (%s)" % type(e).__name__}), "", 1)
+        should = str(hdrs.get("x-should-retry") or "").lower()
+        retry = (status is None or status in _DIRECT_API_RETRY_STATUS or should == "true") and should != "false"
+        if retry and attempt < _DIRECT_API_RETRIES:
+            delay = min(_DIRECT_API_BACKOFF_S[1], _DIRECT_API_BACKOFF_S[0] * (2 ** attempt)) * random.uniform(0.75, 1.25)
+            try:
+                ra = float(hdrs.get("retry-after"))
+                if 0 <= ra <= _DIRECT_API_RETRY_AFTER_CAP_S:
+                    delay = ra
+            except (TypeError, ValueError):
+                pass
+            if delay < deadline_s - (time.monotonic() - t0):
+                sleep(delay)
+                attempt += 1
+                continue
+        msg = failure or _direct_api_error_text(status, data)
+        return _DirectReply(json.dumps({"type": "result", "subtype": "error", "is_error": True, "route": "api",
+                                        "api_error_status": status, "attempts": attempt + 1, "result": msg}), "", 1)
+
+
 def _judge_run(model, sys_prompt, user, effort=None, judge=None, tier="triage", mark=None):
     """Run ONE judge model call (_judge_run_impl) and mark the stage INCOMPLETE when it comes back empty
     (the evidence gate's belt): a pause skip, the rate gate, a scratch refusal, a subprocess error, a
@@ -2581,8 +2858,16 @@ def _judge_run_impl(model, sys_prompt, user, effort=None, judge=None, tier="tria
             if fast_asked and not _is_login_auth(auth):
                 env = dict(env, **_fast_org_env())    # permission follows billing (the sessions' rule, T300)
             cmd = _judge_cmd(model, sys_prompt, effort, auth=auth, tier=tier, key_held=bool(held))
-            p = subprocess.run(cmd, input=user, capture_output=True, text=True, cwd=JUDGE_SCRATCH, env=env,
-                               timeout=CALL_ALARM_S + 5)
+            route = _direct_api_route(judge, tier, model, auth, held, env, fast_asked)
+
+            def _child(child_env):
+                # ONE model call: the direct Messages API road for a key-billed Haiku index judge (2026-10-06,
+                # _direct_api_route), else the CLI child; both answer in the CLI child's shape, read below
+                if route is not None:
+                    return _direct_api_run(route, sys_prompt, user, child_env.get(_KEY_SOURCE.env_name, ""))
+                return subprocess.run(cmd, input=user, capture_output=True, text=True, cwd=JUDGE_SCRATCH,
+                                      env=child_env, timeout=CALL_ALARM_S + 5)
+            p = _child(env)
             if held and _envelope_auth_refused(p):
                 # The API refused the held key (2026-10-05): ask the holder for another, which is either a value a
                 # sibling thread already fetched or ONE helper run when none ran in the last minute, then run THIS
@@ -2591,8 +2876,7 @@ def _judge_run_impl(model, sys_prompt, user, effort=None, judge=None, tier="tria
                 fresh, auth_note = _held_key_retry(held, judge or tier, fsid)
                 if fresh:
                     env = dict(env, **{_KEY_SOURCE.env_name: fresh})
-                    p = subprocess.run(cmd, input=user, capture_output=True, text=True, cwd=JUDGE_SCRATCH, env=env,
-                                       timeout=CALL_ALARM_S + 5)
+                    p = _child(env)
                     if _envelope_auth_refused(p):
                         try:
                             _KEY_SOURCE.refused(fresh, allow_run=False)
