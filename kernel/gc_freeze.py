@@ -45,6 +45,26 @@ and is dropped (never re-registered), never a pass per tick.
 
 A request that arrives during a reconcile waits that one collection; the idle boundary is the best
 moment for it, not a guarantee none arrives. Default on; `ROMP_GC_FREEZE=off` (or `0`/`false`) off.
+
+A third operation, the FULL-COLLECTION freeze (2026-10-07): the load fold-in keys on the record cache's inserts, and
+once the cache's decoded records were untracked (they never enter the walk at all) the heap that grows OUTSIDE the cache
+(about 16 GB tracked on the live kernel) was frozen only by the start-up freeze, so every organic full collection walked
+it: about 67 an hour averaging 5.9 s, longest 17.8 s, 11% of wall time. So the controller also hooks gc.callbacks and, on
+the "stop" of an ORGANIC generation-2 collection whose pause reached `full_freeze_ms`, calls gc.freeze() right there. At
+that instant every tracked object has just survived a full collection (the collector merged the young generations into
+the old and freed the unreachable), so the freeze pins no garbage; it is a pointer move, so it costs no pause, and the
+next full collection walks only what was promoted since. The pause threshold keys the freeze on the event that costs
+(an expensive walk) and leaves cheap full collections alone (the bench froze about once every 10 to 40 s while the cheap
+walks averaged about 250 ms; scripts/bench_gc_full_rate.py). What a freeze CAN pin is a cycle that
+forms LATER among objects it froze (alive at the freeze, cyclic garbage afterwards): those are not walked until an
+unfreeze, so once a full-collection freeze has run, a backstop reclaim (the same unfreeze/collect/re-freeze the fold-in
+backstop runs) is owed at the next idle tick when the organic full-collection pause summed since the last reclaim reaches
+`full_backstop_ratio` times the largest pause seen (the last reclaim's walk or an organic one, about the whole heap): its
+cost is bounded by what the collector already spends, keyed on measured pauses, never a clock. The third collection
+threshold is raised to `full_t2` with the freeze: once the long-lived heap is frozen, a full collection is cheap but
+CPython's quarter rule no longer holds it back (the long-lived total it divides is the small unfrozen part), so the
+generation-1 count gate is what bounds the rate. `ROMP_GC_FREEZE_FULL_MS=off` (or 0) restores the
+behaviour before this operation; `ROMP_GC_FREEZE=off` turns every operation off.
 """
 import gc as _gc_mod
 import os
@@ -56,6 +76,11 @@ DEFAULT_LOAD_TREES = 8            # record-cache inserts since the last freeze t
 MIN_LOAD_TREES = 1               # floored here: a threshold of 0 or below would fold in every idle cycle
 DEFAULT_BACKSTOP_FOLDINS = 1000  # a reclaim after this many load fold-ins since the last reclaim, bounding a cyclic release
 #                                  no ended ref caught; at the measured ~97 fold-ins an hour it fires about once in ten hours
+DEFAULT_FULL_FREEZE_MS = 250.0   # an organic full collection at least this long freezes its survivors (bench: scripts/bench_gc_full_rate.py)
+DEFAULT_FULL_T2 = 100          # the third collection threshold while the full freeze is on (CPython's default is 10)
+DEFAULT_FULL_BACKSTOP_RATIO = 10.0   # a backstop is owed once the organic full-collection pause since the last reclaim reaches this many
+#                                      times the largest whole-heap walk seen: the backstop then costs at most ~1/10 of what full
+#                                      collections spend (a count of freezes instead fired one every ~4 min at a 4 GB bench heap)
 _OFF = ("off", "0", "false")
 
 
@@ -80,14 +105,63 @@ def load_trees_from_env(env=None):
     return max(MIN_LOAD_TREES, n), None
 
 
+def full_freeze_ms_from_env(env=None):
+    """(full_freeze_ms, bad_raw): the ROMP_GC_FREEZE_FULL_MS knob. Unset or empty is the default; an off value (off, 0,
+    false) is None, the full-collection freeze disabled (today's behaviour before 2026-10-07); a positive number is the
+    pause threshold in ms; anything else falls back to the default with `bad_raw` set, said once by the caller, never
+    fatal at import (the #1735 rule for this module's knobs)."""
+    raw = (env if env is not None else os.environ).get("ROMP_GC_FREEZE_FULL_MS")
+    if raw is None or raw.strip() == "":
+        return DEFAULT_FULL_FREEZE_MS, None
+    v = raw.strip().lower()
+    if v in _OFF:
+        return None, None
+    try:
+        ms = float(v)
+    except (TypeError, ValueError):
+        return DEFAULT_FULL_FREEZE_MS, raw
+    if not ms > 0 or ms != ms or ms == float("inf"):
+        return (None, None) if ms == 0 else (DEFAULT_FULL_FREEZE_MS, raw)
+    return ms, None
+
+
+def full_t2_from_env(env=None):
+    """(full_t2, bad_raw): the ROMP_GC_FREEZE_FULL_T2 knob, the third collection threshold installed with the full freeze.
+    Unset or empty is the default; an off value is None (the threshold left as it is); a positive integer is the value;
+    anything else falls back to the default with `bad_raw` set (said once by the caller, never fatal)."""
+    raw = (env if env is not None else os.environ).get("ROMP_GC_FREEZE_FULL_T2")
+    if raw is None or raw.strip() == "":
+        return DEFAULT_FULL_T2, None
+    v = raw.strip().lower()
+    if v in _OFF:
+        return None, None
+    try:
+        n = int(v)
+    except (TypeError, ValueError):
+        return DEFAULT_FULL_T2, raw
+    return (n, None) if n > 0 else (DEFAULT_FULL_T2, raw)
+
+
 class GcFreeze:
     """The freeze controller. `gc` and `clock` are injected so a test drives a fake collector or a real one; the
     kernel passes the real `gc`. The `tick`/`_run` path runs on the pusher thread; `note_ended` runs on every
     thread that ends a session (the HTTP handler, housekeeping, a worker), so a small lock guards the ended list."""
 
     def __init__(self, enabled=True, load_trees=DEFAULT_LOAD_TREES, backstop_foldins=DEFAULT_BACKSTOP_FOLDINS,
-                 gc=_gc_mod, clock=time.perf_counter):
+                 gc=_gc_mod, clock=time.perf_counter, full_freeze_ms=None, full_backstop_ratio=DEFAULT_FULL_BACKSTOP_RATIO, full_t2=None):
         self.enabled = bool(enabled)
+        self.full_freeze_ms = float(full_freeze_ms) if full_freeze_ms else None   # None: the full-collection freeze is off
+        self.full_backstop_ratio = max(1.0, float(full_backstop_ratio))
+        self.full_t2 = int(full_t2) if full_t2 else None   # the third threshold installed with the full freeze; None leaves it
+        self._saved_threshold = None # the thresholds install_full_freeze replaced, restored by remove_full_freeze
+        self._full_t0 = None         # the open generation-2 collection's start (the collector serialises collections: one slot)
+        self._in_run = False         # True while _run issues its own collections: the run re-freezes itself, the callback stands down
+        self.full_freezes = 0        # freezes the gc callback ran after an expensive organic full collection
+        self._full_since_reclaim = 0 # of those, since the last reclaim (no backstop is owed while it is 0: nothing pinned)
+        self._full_ms_since_reclaim = 0.0   # organic full-collection pause summed since the last reclaim
+        self._full_ref_ms = 0.0      # the largest walk seen since (and including) the last reclaim: about the whole heap
+        self.last_full_ms = 0.0      # the pause of the organic full collection that last froze
+        self.callback_errors = 0     # failures inside gc_callback: counted, never raised into the collector
         self.load_trees = max(MIN_LOAD_TREES, int(load_trees))
         self.backstop_foldins = max(1, int(backstop_foldins))
         self._gc = gc
@@ -157,7 +231,7 @@ class GcFreeze:
             return self._run("initial", inserts, []) if inserts > 0 else None
         if owed:
             return self._run("release", inserts, owed)
-        if self._foldins >= self.backstop_foldins:
+        if self._foldins >= self.backstop_foldins or self.full_backstop_owed():
             return self._run("backstop", inserts, [])
         if (inserts - self._ins_mark) >= self.load_trees:
             return self._run("load", inserts, [])
@@ -172,6 +246,13 @@ class GcFreeze:
         alive is kept by a LIVE ROOT, not a cycle: a wasted pause, counted as a survivor and dropped (never re-registered).
         The re-read runs after the re-freeze, which is harmless: a freeze collects nothing, so a ref alive after the collect
         is alive after the freeze too."""
+        self._in_run = True
+        try:
+            return self._run_steps(kind, inserts, owed)
+        finally:
+            self._in_run = False
+
+    def _run_steps(self, kind, inserts, owed):
         t0 = self._clock()
         reclaimed = False
         if kind == "release":
@@ -203,12 +284,76 @@ class GcFreeze:
             self.last_kind = kind
             self.reclaims += 1
             self._foldins = 0
+            self._full_since_reclaim = 0
+            self._full_ms_since_reclaim = 0.0
+            self._full_ref_ms = self.last_ms         # the reclaim walked the whole heap: the new reference
         else:
             self.last_kind = "initial" if not was_frozen else "load"   # a cheap-collect release folds in like a load
             self.freezes += 1
             if was_frozen:
                 self._foldins += 1                   # a load fold-in; the initial freeze is not one
         return self.last_kind
+
+    def gc_callback(self, phase, info):
+        """The gc.callbacks hook for the full-collection freeze. Times each generation-2 collection from "start" to "stop"
+        and, when an ORGANIC one (not a collection _run issued) took at least `full_freeze_ms`, freezes right there, at the
+        one instant every tracked object is a survivor of a full walk. Like the kernel's perf hook it NEVER takes a lock
+        (an automatic collection runs on whichever thread crossed the threshold, possibly inside one of that thread's own
+        locked regions) and never raises into the collector: a failure is counted under `callback_errors`."""
+        try:
+            if info.get("generation") != 2:
+                return
+            if phase == "start":
+                self._full_t0 = self._clock()
+                return
+            t0, self._full_t0 = self._full_t0, None
+            if t0 is None or self._in_run or not self.enabled or not self.full_freeze_ms:
+                return
+            dt = (self._clock() - t0) * 1000.0
+            self._full_ms_since_reclaim += dt
+            if dt > self._full_ref_ms:
+                self._full_ref_ms = dt
+            if dt < self.full_freeze_ms:
+                return
+            self._gc.freeze()
+            self.frozen = True
+            self.full_freezes += 1
+            self._full_since_reclaim += 1
+            self.last_full_ms = dt
+        except Exception:
+            self.callback_errors += 1
+
+    def full_backstop_owed(self):
+        """Whether the full-collection freeze owes a backstop reclaim: a freeze ran since the last reclaim (so something
+        may be pinned) and the organic full-collection pause since then reached `full_backstop_ratio` times the largest walk."""
+        return (self._full_since_reclaim > 0 and self._full_ref_ms > 0
+                and self._full_ms_since_reclaim >= self.full_backstop_ratio * self._full_ref_ms)
+
+    def install_full_freeze(self):
+        """When the controller and the full-collection freeze are both on: gc_callback into gc.callbacks (once) and the
+        third collection threshold raised to `full_t2` (the first two kept). Returns whether it is installed. Off (either
+        switch) installs nothing and leaves the thresholds as they are: the collector as it was before 2026-10-07."""
+        if not (self.enabled and self.full_freeze_ms):
+            return False
+        if self.gc_callback not in self._gc.callbacks:
+            self._full_t0 = None
+            self._gc.callbacks.append(self.gc_callback)
+        if self.full_t2 and self._saved_threshold is None:
+            self._saved_threshold = tuple(self._gc.get_threshold())
+            t0, t1 = self._saved_threshold[0], self._saved_threshold[1]
+            self._gc.set_threshold(t0, t1, self.full_t2)
+        return True
+
+    def remove_full_freeze(self):
+        """gc_callback out of gc.callbacks and the thresholds install_full_freeze replaced put back; a no-op when absent."""
+        try:
+            self._gc.callbacks.remove(self.gc_callback)
+        except ValueError:
+            pass
+        self._full_t0 = None
+        if self._saved_threshold is not None:
+            self._gc.set_threshold(*self._saved_threshold)
+            self._saved_threshold = None
 
     def perf(self):
         """The /perf gc block's freeze sub-block: the state and the reconcile trade, so a reconcile collection is
@@ -219,7 +364,11 @@ class GcFreeze:
                 "collections": self.collections, "survivors": self.survivors, "lastReleaseSurvivors": self.last_release_survivors,
                 "lastReleaseSids": list(self.last_release_sids),
                 "endedPending": len(self._ended), "lastReconcileMs": round(self.last_ms, 1),
-                "lastReconcileKind": self.last_kind, "totalReconcileMs": round(self.total_ms, 1)}
+                "lastReconcileKind": self.last_kind, "totalReconcileMs": round(self.total_ms, 1),
+                "fullFreezeMs": self.full_freeze_ms, "fullFreezes": self.full_freezes, "fullT2": self.full_t2,
+                "fullSinceReclaim": self._full_since_reclaim, "fullBackstopRatio": self.full_backstop_ratio,
+                "fullMsSinceReclaim": round(self._full_ms_since_reclaim, 1), "fullRefMs": round(self._full_ref_ms, 1),
+                "lastFullMs": round(self.last_full_ms, 1), "callbackErrors": self.callback_errors}
 
 
 def pusher_tick(controller, idle, first, stats_fn, on_error):

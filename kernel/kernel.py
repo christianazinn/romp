@@ -1254,14 +1254,23 @@ _PERF_STATS = _PerfStats()
 _GC_FREEZE_ERRORS = [0]
 _GC_FREEZE_SAID = [False]
 _GC_FREEZE_LOAD_TREES, _gc_freeze_bad_knob = gcf.load_trees_from_env()   # parsed with a fallback, never a bare int() at import (#1735 high)
-_GC_FREEZE = gcf.GcFreeze(enabled=gcf.enabled_from_env(), load_trees=_GC_FREEZE_LOAD_TREES)   # the ended note (note_ended) is wired when the SDK backend loads (below)
-if _gc_freeze_bad_knob is not None:     # a bad ROMP_GC_FREEZE_LOAD_TREES fell back to the default: said once, counted, never fatal
-    _GC_FREEZE_ERRORS[0] += 1
-    try:
-        sys.stderr.write("gc-freeze: ROMP_GC_FREEZE_LOAD_TREES=%r is not a positive integer; using the default %d\n"
-                         % (_gc_freeze_bad_knob[:80], gcf.DEFAULT_LOAD_TREES))
-    except Exception:
-        pass
+# 2026-10-07: the FULL-COLLECTION freeze (gc_freeze.py's docstring): an organic full collection that paused at least
+# ROMP_GC_FREEZE_FULL_MS freezes its survivors from the collector's own stop callback, and the third collection threshold is
+# raised to ROMP_GC_FREEZE_FULL_T2 so the full collections left (now cheap) run less often. ROMP_GC_FREEZE_FULL_MS=off restores
+# the collector as it was before (no callback, thresholds untouched); ROMP_GC_FREEZE=off turns the whole controller off.
+_GC_FREEZE_FULL_MS, _gc_freeze_bad_full = gcf.full_freeze_ms_from_env()
+_GC_FREEZE_FULL_T2, _gc_freeze_bad_t2 = gcf.full_t2_from_env()
+_GC_FREEZE = gcf.GcFreeze(enabled=gcf.enabled_from_env(), load_trees=_GC_FREEZE_LOAD_TREES,   # the ended note (note_ended) is wired
+                          full_freeze_ms=_GC_FREEZE_FULL_MS, full_t2=_GC_FREEZE_FULL_T2)    #  when the SDK backend loads (below)
+for _knob, _bad, _default in (("ROMP_GC_FREEZE_LOAD_TREES", _gc_freeze_bad_knob, gcf.DEFAULT_LOAD_TREES),
+                              ("ROMP_GC_FREEZE_FULL_MS", _gc_freeze_bad_full, gcf.DEFAULT_FULL_FREEZE_MS),
+                              ("ROMP_GC_FREEZE_FULL_T2", _gc_freeze_bad_t2, gcf.DEFAULT_FULL_T2)):
+    if _bad is not None:     # a bad knob fell back to its default: said once, counted, never fatal
+        _GC_FREEZE_ERRORS[0] += 1
+        try:
+            sys.stderr.write("gc-freeze: %s=%r is not a positive number; using the default %s\n" % (_knob, _bad[:80], _default))
+        except Exception:
+            pass
 
 
 def _gc_freeze_tick(idle, first):
@@ -75898,6 +75907,8 @@ def main():
     signal.signal(signal.SIGTERM, _graceful_term)             # drain, don't die mid-flight (see _graceful_term)
     _PERF_STATS.install_gc_hook()                             # the collector's pauses on /perf (2026-09-16): before the boot warm and
     #                                                           the loops, so the boot's own full collections count (see gc_event)
+    _GC_FREEZE.install_full_freeze()                          # the full-collection freeze and its threshold (2026-10-07), after the perf hook
+    #                                                           so that hook's stop timing never includes the freeze; a no-op when off
     # romp holds no API key (credentials.py, 2026-09-08). A retired provider line in service.env, the marker
     # beside it, or a key in this process's environment stops the kernel HERE, before the bundler, the
     # postal bus or the SDK backend spawn anything that could inherit it. RuntimeError: the
