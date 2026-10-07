@@ -1104,8 +1104,17 @@ def cold_fold_reasons(path):
 
 
 def entry_whole_resident(path):
-    """True when the reader holds `path`'s WHOLE file in memory (an entry read from byte zero): a fold over it costs
-    no read. False for a tail entry or none."""
+    """True when the reader holds `path`'s WHOLE file in memory (an entry read from byte zero, every record decoded): a fold
+    over it costs no read. False for a tail entry, a tail-only one (2026-10-07: its records before the window are on disk,
+    so a fold from record 0 reads them) or none."""
+    with _JSONL_CACHE_LOCK:
+        ent = _JSONL_CACHE.get(str(path))
+    return ent is not None and ent[5] == 0 and type(ent[4]) is not _TailRecords
+
+
+def entry_indexed_whole(path):
+    """True when the reader's entry for `path` indexes the file from record 0 (a whole entry, or a tail-only one, whose
+    offsets start at record 0): what the assembly writer needs of it (_entry_offsets_gen). False for a tail entry or none."""
     with _JSONL_CACHE_LOCK:
         ent = _JSONL_CACHE.get(str(path))
     return ent is not None and ent[5] == 0
@@ -2062,6 +2071,29 @@ _COLD_STATS = {"passes": 0, "records": 0, "bytes": 0, "byCaller": {}, "rewrites"
 _COLD_STATS_LOCK = threading.Lock()
 
 
+_TAIL_ROOTS = [tuple(r.rstrip(os.sep) + os.sep for r in os.environ["ROMP_RECORD_CACHE_TAIL_ROOTS"].split(os.pathsep) if r)
+               if os.environ.get("ROMP_RECORD_CACHE_TAIL_ROOTS") else None]
+#                                   the directories whose files the rule may window (set_tail_roots, or the environment's
+#                                   ROMP_RECORD_CACHE_TAIL_ROOTS, os.pathsep-separated); None = the Claude transcripts
+#                                   root, PROJECTS, read at call time. The rule is for TRANSCRIPTS: their consumers read the tail and
+#                                   fold the rest (see above). Other large logs stay whole: the postal log (timeline/messages.jsonl,
+#                                   1.0 GB on the devbox that motivated this) is walked from record 0 by every parse (_load_postal_index)
+#                                   and by the kernel's postal readers, so windowing it would turn each walk into a disk pass.
+
+
+def set_tail_roots(roots):
+    """The directories whose files may be held tail-only (absolute paths); None restores the default, PROJECTS."""
+    _TAIL_ROOTS[0] = None if roots is None else tuple(str(r).rstrip(os.sep) + os.sep for r in roots)
+
+
+def _tail_eligible(path):
+    roots = _TAIL_ROOTS[0]
+    if roots is None:
+        roots = (str(PROJECTS).rstrip(os.sep) + os.sep,)
+    p = str(path)
+    return any(p.startswith(r) for r in roots)
+
+
 def tail_rule_on():
     """Whether large files are held tail-only (ROMP_RECORD_CACHE_TAIL_MB above 0)."""
     return _TAIL_BYTES > 0
@@ -2318,7 +2350,7 @@ def _tail_shape(path, offs, ncold, hot, end, guard, force=False):
     times _TAIL_BYTES (or `force`, a list converting to a window), a plain list when nothing lies before it, else a
     _TailRecords. A held span under _TAIL_MIN_FILE_BYTES, or the rule off, is never windowed."""
     total = ncold + len(hot)
-    if _TAIL_BYTES > 0 and total and hot:
+    if _TAIL_BYTES > 0 and total and hot and (ncold > 0 or _tail_eligible(path)):
         hot_bytes = end - int(offs[2 * ncold])
         span = end - int(offs[0])
         if span >= _TAIL_MIN_FILE_BYTES and (force or hot_bytes > _TAIL_SLIDE_FACTOR * _TAIL_BYTES):
@@ -2331,11 +2363,11 @@ def _tail_shape(path, offs, ncold, hot, end, guard, force=False):
     return _TailRecords(path, offs, ncold, hot, end, guard)
 
 
-def _tail_scan_info(size, span_start):
-    """The scan's tail mode for a read that will leave an entry holding records from byte `span_start` of a file of `size`
-    bytes: None when the rule is off or the held span stays under _TAIL_MIN_FILE_BYTES (held whole), else the window's
-    start byte and the record floor (_scan_jsonl_stream's `tail`)."""
-    if _TAIL_BYTES <= 0 or size - int(span_start) < _TAIL_MIN_FILE_BYTES:
+def _tail_scan_info(path, size, span_start):
+    """The scan's tail mode for a read that will leave an entry holding records from byte `span_start` of `path`, a file of
+    `size` bytes: None when the rule is off, the file is no transcript (_tail_eligible) or the held span stays under
+    _TAIL_MIN_FILE_BYTES (held whole), else the window's start byte and the record floor (_scan_jsonl_stream's `tail`)."""
+    if _TAIL_BYTES <= 0 or size - int(span_start) < _TAIL_MIN_FILE_BYTES or not _tail_eligible(path):
         return None
     return {"keep_from": max(0, int(size) - _TAIL_BYTES), "keep_last": _TAIL_RECORDS}
 
@@ -2542,7 +2574,7 @@ def _read_jsonl_entry_unlocked(path, on_fail=None, tail_ok=False, tail_from=None
                 if fh.read(len(tail)) == tail:            # the file really is our cached prefix + more
                     if tail_ok or base0 == 0:
                         offs = array.array("q", hit[7]) if len(hit) > 7 else array.array("q")
-                        tinfo = _tail_scan_info(st.st_size, int(offs[0]) if offs else offset)
+                        tinfo = _tail_scan_info(path, st.st_size, int(offs[0]) if offs else offset)
                         new, offset, nread = _scan_jsonl_stream(fh, offset, offs, limit=max(0, st.st_size - fh.tell()),
                                                                 tail=tinfo)   # the appended lines, one at a time
                         _count_read(path, nread)
@@ -2555,7 +2587,7 @@ def _read_jsonl_entry_unlocked(path, on_fail=None, tail_ok=False, tail_from=None
                     else:                                 # a whole reader over a tail entry: the whole file, same gen (a large
                         fh.seek(0)                        #  file tail-only: every record indexed, the window kept)
                         offs = array.array("q")
-                        tinfo = _tail_scan_info(st.st_size, 0)
+                        tinfo = _tail_scan_info(path, st.st_size, 0)
                         records, offset, nread = _scan_jsonl_stream(fh, 0, offs, limit=st.st_size, tail=tinfo)
                         _count_read(path, nread)
                         ncold, records = _tail_combine([], records, tinfo)
@@ -2571,7 +2603,7 @@ def _read_jsonl_entry_unlocked(path, on_fail=None, tail_ok=False, tail_from=None
             if not done:
                 fh.seek(0)
                 offs = array.array("q")
-                tinfo = _tail_scan_info(st.st_size, 0)    # a large file: decoded line by line, only the window kept
+                tinfo = _tail_scan_info(path, st.st_size, 0)    # a large file: decoded line by line, only the window kept
                 records, offset, nread = _scan_jsonl_stream(fh, 0, offs, limit=st.st_size, tail=tinfo)   # line by line, to the size the stat saw
                 _count_read(path, nread)
                 ncold, records = _tail_combine([], records, tinfo)
@@ -2618,6 +2650,8 @@ def _read_jsonl_entry_unlocked(path, on_fail=None, tail_ok=False, tail_from=None
     held = records.hot if type(records) is _TailRecords else records
     if _GC_UNTRACK_ON and type(held) is list and _gc.is_tracked(held):
         _PY_GC_UNTRACK(held)                      # the entry's outer list (a fresh list per read; its records were untracked at decode)
+    if _GC_UNTRACK_ON and held is not records and _gc.is_tracked(records):
+        _PY_GC_UNTRACK(records)                   # the window's holder: an array, the list above, a str and bytes, acyclic
     ent = (st.st_mtime, st.st_size, offset, tail, records, base, gen, offs)
     with _JSONL_CACHE_LOCK:
         _cache_insert_locked(path, ent)      # the count cap and the byte budget, LRU order (hot entries survive any cold flood)
@@ -3381,6 +3415,11 @@ class FileAdapter:
             else:
                 ent = _read_jsonl_entry(fp, tail_ok=False)
             recs = ent[4] if ent is not None else []
+            if seed is None and type(recs) is _TailRecords:
+                recs = list(recs)                        # a WHOLE adapter over a tail-only entry (2026-10-07): one streaming pass
+            #                                              off disk, into the list this adapter holds as it held the cache's whole
+            #                                              list before (by_uuid keeps nearly every record anyway), so the assembly
+            #                                              writer's walks over _src stay in memory; released with the entry (re-seat)
             self._src[str(fp)] = recs
             self._src_keys[str(fp)] = (ent[6], ent[5], ent[5] + len(recs)) if ent is not None else (None, 0, 0)
             if ent is not None:
@@ -5747,7 +5786,10 @@ def _asm_fold(entry, delta, leaf_recs, leaf_key, leaf_stem, rompuuid, postal_ind
     entry["n_qatts"] = len(ad.qatts)
     ogen, obase, ocount = entry["recs"][leaf_key]
     entry["recs"][leaf_key] = (ogen, obase, ocount + len(delta))   # commit LAST: a bail above re-slices the same
-    ad._src[leaf_key] = leaf_recs                 #  delta next visit and the uuid gate demotes it
+    held = ad._src.get(leaf_key)                  #  delta next visit and the uuid gate demotes it
+    if type(leaf_recs) is _TailRecords and type(held) is list and ad.seed is None:
+        leaf_recs = held + list(delta)            # a whole adapter keeps its own list (see FileAdapter: a NEW list, served ones stay)
+    ad._src[leaf_key] = leaf_recs
     ad._src_keys[leaf_key] = entry["recs"][leaf_key]
     _asm_stat("fold")
     return _asm_serve(entry)

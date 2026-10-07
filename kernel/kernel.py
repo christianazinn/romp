@@ -13255,7 +13255,7 @@ def _converge_assembly_leaf(key, sid, t0, flags=None):
         if _ASM_CONVERGE_FLAG.get(key) != st:               # parsed only under the other flag: no document the reader would unlink
             _ASM_CONVERGE_FLAG[key] = st; em.asm_converge_skip("flagMismatch")
         return False
-    if not em.asm_entry_whole(key, sid, human) or not em.entry_whole_resident(key):
+    if not em.asm_entry_whole(key, sid, human) or not em.entry_indexed_whole(key):   # offsets from record 0 (a tail-only entry has them)
         if _ASM_CONVERGE_NOENTRY.get(key) != st:           # no whole assembly entry, or the reader's record entry gone (the writer
             _ASM_CONVERGE_NOENTRY[key] = st; em.asm_converge_skip("noEntry")   #  needs both): nothing to write from, never a read
         return False
