@@ -2248,10 +2248,14 @@ The snapshot's fields, all plain numbers (`ms` is milliseconds of wall time):
   `msSum`, `msMax` and `msLast` (their summed, largest and last pause) and
   `collectedLast` (the objects the last one freed). `thresholds` and `counts`
   are `gc.get_threshold()` and `gc.get_count()`, repeated from `heap.gc` so
-  the block reads on its own (how near the next collection is); `frozen`
-  counts the objects moved out of the collector's reach by `gc.freeze`, which
-  it never scans (reading the count is a linear walk of the frozen generation,
-  about 7 ms per million frozen, paid by the `/perf` read); `errors` counts callback failures (counted, never raised
+  the block reads on its own (how near the next collection is);
+  `frozenAsOfCleanup` counts the objects moved out of the collector's reach by
+  `gc.freeze`, which it never scans, AS OF THE LAST CLEANUP (a reclaim), and
+  `frozenAsOfCleanupAt` is that cleanup's time (epoch seconds); both are null
+  until the first cleanup. Reading the count is a linear walk of the frozen
+  generation (about 7 ms per million frozen), so the freeze controller reads it
+  only inside a reclaim's pause, never on the `/perf` read and never at a freeze
+  (2026-10-07); `errors` counts callback failures (counted, never raised
   into the collector; the first in the process is said once on stderr, a
   line prefixed `perf: gc hook:`, the rest counted only); `hooked` says
   whether the kernel's `gc.callbacks` hook is installed, so zeros with
@@ -2284,7 +2288,8 @@ The snapshot's fields, all plain numbers (`ms` is milliseconds of wall time):
   measured ~97 fold-ins an hour), so a cycle released by an owner nobody
   registered is bounded by the next thousand loads, not the process lifetime. The
   sub-block carries `enabled`, `active` (whether a freeze is held now; named
-  apart from the integer `frozen` above, which is `gc.get_freeze_count()`),
+  apart from the integer `frozenAsOfCleanup` above, which this sub-block repeats with
+  `frozenAsOfCleanupAt`),
   `loadTrees` and `backstopFoldins` (the two thresholds), `freezes` and
   `reclaims` (a freeze ran one collection and a reclaim ran one, EXCEPT a full
   release that unfroze runs TWO generation-2 collections for its one reclaim, so
@@ -2332,6 +2337,23 @@ The snapshot's fields, all plain numbers (`ms` is milliseconds of wall time):
   stderr, as in `heap`; the tallies themselves need none. The kernel-samples
   rows carry the same generation-2 tallies as `gcGen2Collections` and
   `gcGen2MsSum`, cumulative, to difference per interval beside `rssKb`.
+  The FULL-COLLECTION freeze (2026-10-07; `ROMP_GC_FREEZE_FULL_MS`, default 250, `off`
+  restores the collector as before) freezes from the collector's own stop callback after
+  an organic full collection that paused at least `fullFreezeMs`, and raises the third
+  collection threshold to `fullT2` (`ROMP_GC_FREEZE_FULL_T2`, default 100). Its fields:
+  `fullFreezes` (freezes it ran), `lastFullMs` (the pause that last froze),
+  `fullSinceReclaim` (its freezes since the last reclaim), `fullMsSinceReclaim` and
+  `fullRefMs` (organic full-collection pause since the last reclaim, and the largest walk
+  seen, about the whole heap): a backstop reclaim is owed once the first reaches
+  `fullBackstopRatio` times the second. While one is owed nothing more is frozen
+  (`fullFreezeSkips`); `owedForS` says how long it has been owed (null when not), and once
+  it reaches `fullForceS` (`ROMP_GC_FREEZE_FULL_FORCE_S`, default 600, `off` waits for an
+  idle tick only) a BUSY pusher cycle runs it, counted in `forced`. A reclaim whose
+  collection did not actually run (another thread was inside a collection, so
+  `gc.collect()` returned at once) is re-frozen and left owed, counted in `reclaimSkips`. The same owed clock and
+  forced run cover the fold-in backstop (`backstopFoldins` load fold-ins), with or without
+  the full-collection freeze. `callbackErrors`
+  counts failures inside the callback, never raised into the collector.
 - `jobs`: the jobs thread, which runs the housekeeping (the sweeps, the
   reminder walk, the interrupt tick, the persists, the pause and retry
   family) off the pusher since 2026-09-13, so no browser frame waits on a

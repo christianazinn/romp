@@ -382,7 +382,7 @@ class _PerfStats:
                                    main installs once): per generation, collections, msSum / msMax / msLast
                                    (wall on the collecting thread) and collectedLast; thresholds and counts
                                    (gc.get_threshold / gc.get_count, repeated from heap.gc so the block reads
-                                   on its own), frozen (gc.get_freeze_count), errors (callback failures,
+                                   on its own), frozenAsOfCleanup/At (the frozen count at the last cleanup), errors (callback failures,
                                    counted, never raised) and hooked (whether this collector's hook is in
                                    gc.callbacks). Each split row on the rings carries the cycle's own delta
                                    as `gc` (n0, n1, n2 collections per generation and ms2), so a slow cycle
@@ -1206,7 +1206,11 @@ class _PerfStats:
                     # and the block still serves (the heap block's review find, 2026-09-15, applied here)
                     "thresholds": _gc_read("thresholds", lambda: list(gc.get_threshold())),
                     "counts": _gc_read("counts", lambda: list(gc.get_count())),
-                    "frozen": _gc_read("frozen", lambda: gc.get_freeze_count()),
+                    # the frozen count AS OF THE LAST CLEANUP and that cleanup's time, never gc.get_freeze_count() here (a walk
+                    # of the frozen list: seconds once the long-lived heap is frozen, every /perf read would stall the kernel for
+                    # it); the controller re-reads it inside each reclaim's pause; 2026-10-07
+                    "frozenAsOfCleanup": _gc_read("frozenAsOfCleanup", lambda: _GC_FREEZE.frozen_as_of_cleanup),
+                    "frozenAsOfCleanupAt": _gc_read("frozenAsOfCleanupAt", lambda: _GC_FREEZE.frozen_as_of_cleanup_at),
                     "errors": gc_errors,
                     "hooked": _gc_read("hooked", lambda: self.gc_event in gc.callbacks),
                     # #1735: the freeze controller's state and the reconcile trade, so a reconcile collection is told
@@ -1254,14 +1258,26 @@ _PERF_STATS = _PerfStats()
 _GC_FREEZE_ERRORS = [0]
 _GC_FREEZE_SAID = [False]
 _GC_FREEZE_LOAD_TREES, _gc_freeze_bad_knob = gcf.load_trees_from_env()   # parsed with a fallback, never a bare int() at import (#1735 high)
-_GC_FREEZE = gcf.GcFreeze(enabled=gcf.enabled_from_env(), load_trees=_GC_FREEZE_LOAD_TREES)   # the ended note (note_ended) is wired when the SDK backend loads (below)
-if _gc_freeze_bad_knob is not None:     # a bad ROMP_GC_FREEZE_LOAD_TREES fell back to the default: said once, counted, never fatal
-    _GC_FREEZE_ERRORS[0] += 1
-    try:
-        sys.stderr.write("gc-freeze: ROMP_GC_FREEZE_LOAD_TREES=%r is not a positive integer; using the default %d\n"
-                         % (_gc_freeze_bad_knob[:80], gcf.DEFAULT_LOAD_TREES))
-    except Exception:
-        pass
+# 2026-10-07: the FULL-COLLECTION freeze (gc_freeze.py's docstring): an organic full collection that paused at least
+# ROMP_GC_FREEZE_FULL_MS freezes its survivors from the collector's own stop callback, and the third collection threshold is
+# raised to ROMP_GC_FREEZE_FULL_T2 so the full collections left (now cheap) run less often. ROMP_GC_FREEZE_FULL_MS=off restores
+# the collector as it was before (no callback, thresholds untouched); ROMP_GC_FREEZE=off turns the whole controller off.
+_GC_FREEZE_FULL_MS, _gc_freeze_bad_full = gcf.full_freeze_ms_from_env()
+_GC_FREEZE_FULL_T2, _gc_freeze_bad_t2 = gcf.full_t2_from_env()
+_GC_FREEZE_FULL_FORCE_S, _gc_freeze_bad_force = gcf.full_force_s_from_env()   # an owed backstop runs on a busy cycle after this long
+_GC_FREEZE = gcf.GcFreeze(enabled=gcf.enabled_from_env(), load_trees=_GC_FREEZE_LOAD_TREES,   # the ended note (note_ended) is wired
+                          full_freeze_ms=_GC_FREEZE_FULL_MS, full_t2=_GC_FREEZE_FULL_T2,    #  when the SDK backend loads (below)
+                          full_force_s=_GC_FREEZE_FULL_FORCE_S)
+for _knob, _bad, _default in (("ROMP_GC_FREEZE_LOAD_TREES", _gc_freeze_bad_knob, gcf.DEFAULT_LOAD_TREES),
+                              ("ROMP_GC_FREEZE_FULL_MS", _gc_freeze_bad_full, gcf.DEFAULT_FULL_FREEZE_MS),
+                              ("ROMP_GC_FREEZE_FULL_T2", _gc_freeze_bad_t2, gcf.DEFAULT_FULL_T2),
+                              ("ROMP_GC_FREEZE_FULL_FORCE_S", _gc_freeze_bad_force, gcf.DEFAULT_FULL_FORCE_S)):
+    if _bad is not None:     # a bad knob fell back to its default: said once, counted, never fatal
+        _GC_FREEZE_ERRORS[0] += 1
+        try:
+            sys.stderr.write("gc-freeze: %s=%r is not a positive number; using the default %s\n" % (_knob, _bad[:80], _default))
+        except Exception:
+            pass
 
 
 def _gc_freeze_tick(idle, first):
@@ -1278,6 +1294,12 @@ def _gc_freeze_tick(idle, first):
             except Exception:
                 pass
     kind = gcf.pusher_tick(_GC_FREEZE, idle, first, em.record_cache_stats, on_error)
+    if kind == "forced":     # no idle cycle came while a backstop was owed: it ran on this busy cycle (one line per run)
+        try:
+            sys.stderr.write("gc-freeze: a backstop owed past %.0f s ran on a busy cycle in %.1f ms\n"
+                             % (_GC_FREEZE.full_force_s or 0, _GC_FREEZE.last_ms))
+        except Exception:
+            pass
     if kind == "release":    # #1735: a release means a session ended and the collector took (or was owed) a full-heap pause; name it (one per release, none per load)
         try:
             survivors = getattr(_GC_FREEZE, "last_release_survivors", 0)
@@ -63364,7 +63386,8 @@ def _pusher_cycle():
             _boot_health_first_cycle(time.monotonic() - _t_cycle)   # the boot's first cycle, on the record (a no-op after)
         elif not _BOOT_HEALTH_DONE[0]:
             _boot_health_row_backstop(time.monotonic())         # the jobs pass still open long after: the row without it
-        _gc_freeze_tick(_cycle_idle, first)                     # #1735: reconcile the freeze at the idle boundary (the guard is inside pusher_tick)
+        _gc_freeze_tick(_cycle_idle, first)                     # #1735: reconcile the freeze at the idle boundary, or run an owed full backstop
+        #                                                         past its bound on a busy one (2026-10-07); the guards are inside pusher_tick
 
 
 @contextlib.contextmanager
@@ -75898,6 +75921,8 @@ def main():
     signal.signal(signal.SIGTERM, _graceful_term)             # drain, don't die mid-flight (see _graceful_term)
     _PERF_STATS.install_gc_hook()                             # the collector's pauses on /perf (2026-09-16): before the boot warm and
     #                                                           the loops, so the boot's own full collections count (see gc_event)
+    _GC_FREEZE.install_full_freeze()                          # the full-collection freeze and its threshold (2026-10-07), after the perf hook
+    #                                                           so that hook's stop timing never includes the freeze; a no-op when off
     # romp holds no API key (credentials.py, 2026-09-08). A retired provider line in service.env, the marker
     # beside it, or a key in this process's environment stops the kernel HERE, before the bundler, the
     # postal bus or the SDK backend spawn anything that could inherit it. RuntimeError: the
