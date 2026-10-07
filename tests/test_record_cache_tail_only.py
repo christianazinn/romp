@@ -728,6 +728,35 @@ def golden_scenarios():
         os.environ.clear(); os.environ.update(saved_env)
 
 
+def _verdict_field_shapes():
+    """Shapes whose verdicts turn on the skeleton fields no golden scenario exercises (review find, 2026-10-07): a retry-storm
+    fork whose second assistant branch is an isApiErrorMessage echo, one whose second branch is a blank-text stub (the
+    assistant-text mark), and a parallel batch carrying an isMeta hook note. Synthetic ids and text."""
+    U = lambda n: "66666666-2222-3333-4444-%012d" % n
+    ts = lambda k: "2026-10-07T03:00:%02d.000Z" % k
+
+    def storm(second):
+        return [
+            {"type": "user", "uuid": U(1), "parentUuid": None, "timestamp": ts(0), "message": {"role": "user", "content": "do the thing"}},
+            {"type": "assistant", "uuid": U(2), "parentUuid": U(1), "timestamp": ts(1),
+             "message": {"id": "m1", "role": "assistant", "content": [{"type": "thinking", "thinking": "hm"}]}},
+            {"type": "assistant", "uuid": U(5), "parentUuid": U(2), "timestamp": ts(2),
+             "message": {"id": "m2", "role": "assistant", "content": [{"type": "text", "text": "the real reply"}]}},
+            dict({"type": "assistant", "uuid": U(6), "parentUuid": U(2), "timestamp": ts(3)}, **second),
+            {"type": "system", "subtype": "api_error", "uuid": U(3), "parentUuid": U(2), "timestamp": ts(4)},
+            {"type": "user", "uuid": U(4), "parentUuid": U(3), "timestamp": ts(5), "message": {"role": "user", "content": "next prompt"}},
+        ]
+    meta = _batch_shape()
+    meta.insert(5, {"type": "user", "uuid": "b-m", "parentUuid": "b-r1", "isMeta": True, "timestamp": "2026-10-07T01:00:12.500Z",
+                    "message": {"role": "user", "content": "a hook note the harness wrote"}})
+    return {
+        "storm_api_error_echo": storm({"isApiErrorMessage": True, "message": {"id": "m3", "role": "assistant",
+                                                                              "content": [{"type": "text", "text": "API Error: overloaded"}]}}),
+        "storm_blank_stub": storm({"message": {"id": "m3", "role": "assistant", "content": [{"type": "text", "text": "  \n "}]}}),
+        "batch_with_meta_note": meta,
+    }
+
+
 class SkeletonWalksEqualFullWalks(Base):
     """A walk over a tail-only entry's skeletons files every record as the walk over the full records does, for every graph
     shape the golden scenarios pin (compactions with intact and broken stitches, a detached manual compact, an eclipsed
@@ -737,6 +766,33 @@ class SkeletonWalksEqualFullWalks(Base):
     def _scenarios(self):
         out = {name: fn() for name, (fn, _states) in golden_scenarios().items()}
         out["parallel_batch"] = _batch_shape()
+        out.update(_verdict_field_shapes())
+        return out
+
+    def _mismatches(self):
+        """Every (scenario, layout) whose walk over skeletons differs from the walk over the full records, or refuses a field
+        (_SkelMiss), with the shape before the window; [] when the skeletons stand in for the records exactly."""
+        path = self.leaf()
+        out = []
+        with knobs(16 * 1024, 4, roots=[str(self.proj)]):
+            for name, recs in sorted(self._scenarios().items()):
+                for layout in ("continue", "back"):
+                    fresh()
+                    self._write(path, recs, layout)
+                    ent = em._read_jsonl_entry(path)
+                    self.assertTrue(_tail(ent[4]) and ent[4].ncold > len(recs), "the scenario is before the window")
+                    full = em.FileAdapter([path], path)
+                    c0 = cold_records()
+                    try:
+                        walk = em.FileAdapter([path], path, walk_only=True)
+                        got = (walk.chain_verdicts(), em._membership_of(walk), walk.leaf_uuid, walk.parent_of, walk._adopted)
+                    except em._SkelMiss as e:
+                        out.append((name, layout, "refused %s" % e)); continue
+                    self.assertEqual(cold_records(), c0, "the walk read nothing before the window")
+                    want = (full.chain_verdicts(), em._membership_of(full), full.leaf_uuid, full.parent_of, full._adopted)
+                    if got != want:
+                        diff = sorted(u for u in set(got[0]) | set(want[0]) if got[0].get(u) != want[0].get(u))
+                        out.append((name, layout, "verdicts differ on %s" % diff[:4]))
         return out
 
     def _write(self, path, recs, layout):
@@ -756,23 +812,43 @@ class SkeletonWalksEqualFullWalks(Base):
         Path(path).write_text("\n".join(lines) + "\n")
 
     def test_skeleton_walks_file_every_shape_as_the_full_walk(self):
-        path = self.leaf()
-        with knobs(16 * 1024, 4, roots=[str(self.proj)]):
-            for name, recs in sorted(self._scenarios().items()):
-                for layout in ("continue", "back"):
-                    with self.subTest(scenario=name, layout=layout):
-                        fresh()
-                        self._write(path, recs, layout)
-                        ent = em._read_jsonl_entry(path)
-                        self.assertTrue(_tail(ent[4]) and ent[4].ncold > len(recs), "the scenario is before the window")
-                        full = em.FileAdapter([path], path)
-                        c0 = cold_records()
-                        walk = em.FileAdapter([path], path, walk_only=True)
-                        self.assertEqual(cold_records(), c0, "the walk read nothing before the window")
-                        self.assertEqual(walk.chain_verdicts(), full.chain_verdicts())
-                        self.assertEqual(em._membership_of(walk), em._membership_of(full))
-                        self.assertEqual((walk.leaf_uuid, walk.parent_of, walk._adopted),
-                                         (full.leaf_uuid, full.parent_of, full._adopted))
+        self.assertEqual(self._mismatches(), [])
+
+    def test_a_broken_verdict_field_in_the_skeleton_is_caught(self):
+        """Review find (2026-10-07): the check above stayed green with isApiErrorMessage or isMeta dropped from the skeleton,
+        or the assistant-text mark broken, because no shape it walked depended on them; the verdict-field shapes now do. Each
+        mutation of the skeleton builder must make the check report a mismatch (a wrong verdict, or a refused field)."""
+        S0, A0, M0, K0 = em._SKEL_SCALARS, em._SkelRec._ALLOW, em._skel_text_mark, em._skel
+
+        def blank(field):                                 # the key kept in the allowed set, its value gone: answers "absent"
+            def mut(r):
+                sk = K0(r)
+                if type(sk) is em._SkelRec and dict.__contains__(sk, field) and em._SKEL_BARE.get(dict.get(sk, "type")) is not sk:
+                    dict.__delitem__(sk, field)
+                return sk
+            return {"_skel": mut}
+
+        def unkept(field):                                # the natural edit: the field leaves the kept list (and the allowed set)
+            sc = tuple(k for k in S0 if k != field)
+            return {"_SKEL_SCALARS": sc, "_ALLOW": frozenset(sc + ("message", "attachment", "compactMetadata"))}
+        mutations = {
+            "isApiErrorMessage blanked": blank("isApiErrorMessage"), "isApiErrorMessage unkept": unkept("isApiErrorMessage"),
+            "isMeta blanked": blank("isMeta"), "isMeta unkept": unkept("isMeta"),
+            "text mark without strip": {"_skel_text_mark": lambda t: ("x" if t else "") if type(t) is str else t},
+            "text mark always non-empty": {"_skel_text_mark": lambda t: "x" if type(t) is str else t},
+        }
+        for name, patch in mutations.items():
+            with self.subTest(mutation=name):
+                try:
+                    em._skel = patch.get("_skel", K0)
+                    em._skel_text_mark = patch.get("_skel_text_mark", M0)
+                    em._SKEL_SCALARS = patch.get("_SKEL_SCALARS", S0)
+                    em._SkelRec._ALLOW = patch.get("_ALLOW", A0)
+                    found = self._mismatches()
+                finally:
+                    em._SKEL_SCALARS, em._SkelRec._ALLOW, em._skel_text_mark, em._skel = S0, A0, M0, K0
+                    fresh()
+                self.assertTrue(found, "the skeleton-vs-full check caught the mutation")
 
     def test_a_skeleton_refuses_a_field_it_does_not_keep_and_the_walk_reruns_whole(self):
         r = {"type": "user", "uuid": "u1", "parentUuid": None, "toolUseResult": {"stdout": "x"},
