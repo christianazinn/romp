@@ -201,8 +201,9 @@ class LargeTranscriptHoldsItsTail(Base):
             window = size - got.hot_offset()
             self.assertLessEqual(window, 32 * MIB + 400 * 1024, "the window is the last 32 MiB (plus at most one record)")
             stats = em.record_cache_stats()
-            self.assertLess(stats["bytes"], int(3 * (32 * MIB + 400 * 1024)) + 16 * count + 1,
-                            "the cache weighs the window and the index, not the file: %d" % stats["bytes"])
+            skel = (getattr(em, "_SKEL_BYTES_PER_RECORD", 0) + 8) * count   # the walk skeleton of each older record (review fix)
+            self.assertLess(stats["bytes"], int(3 * (32 * MIB + 400 * 1024)) + 20 * count + skel + 1,
+                            "the cache weighs the window, the index and the skeletons, not the file: %d" % stats["bytes"])
             self.assertLess(held - base_now, 160 * MIB,
                             "tracemalloc: %.1f MB held after reading a %.1f MB file (whole: about 3 bytes a file byte)"
                             % ((held - base_now) / 1e6, size / 1e6))
@@ -594,3 +595,202 @@ class ChatScrollBack(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def write_forked(path, n, fork_at=40, branch=3, seed=5):
+    """A synthetic linear transcript of `n` records with a REWOUND branch: `branch` records hanging off record `fork_at`,
+    written right after it in file order (so they sit before the window of a large file), while the spine carries on from
+    record fork_at + 1. Returns (the branch's uuids, the next record index)."""
+    rnd = random.Random(seed)
+    out, bu = [], []
+    for i in range(n):
+        out.append(json.dumps(_rec(i, rnd)))
+        if i == fork_at:
+            parent = _rec(i, rnd)["uuid"]
+            for b in range(branch):
+                u = "22222222-2222-4333-8444-%012d" % b
+                kind = "user" if b % 2 == 0 else "assistant"
+                msg = ({"role": "user", "content": "a prompt the user rewound away %d" % b} if kind == "user" else
+                       {"role": "assistant", "content": [{"type": "text", "text": "a reply on the rewound line %d" % b}]})
+                out.append(json.dumps({"type": kind, "uuid": u, "parentUuid": parent, "timestamp": "2026-10-07T00:00:41.000Z",
+                                       "cwd": "/w/notes-api", "message": msg}))
+                bu.append(u); parent = u
+    Path(path).write_text("\n".join(out) + "\n")
+    return set(bu), n
+
+
+def append_chain(path, start, count, seed=9):
+    """`count` more spine records continuing the linear chain at record index `start`."""
+    rnd = random.Random(seed + start)
+    with open(path, "a") as f:
+        for i in range(start, start + count):
+            f.write(json.dumps(_rec(i, rnd)) + "\n")
+    return start + count
+
+
+def cold_records():
+    return em.cold_read_stats()["records"]
+
+
+class RoutineWalksReadNothingBeforeTheWindow(Base):
+    """The chain walks a judge pass runs whenever a session's leaf grew (review finds, 2026-10-07): each read every record
+    before a tail-only entry's window off disk, every pass. They now walk the entry's skeletons (the graph fields of each
+    older record, kept from the scan and the window's slides) and read nothing before the window per pass."""
+
+    def setUp(self):
+        super().setUp()
+        em._REWOUND_CACHE.clear()
+
+    def tearDown(self):
+        em._REWOUND_CACHE.clear()
+        super().tearDown()
+
+    def _ref_rewound(self, path):
+        with knobs(0, 10, roots=[str(self.proj)]):
+            fresh(); em._REWOUND_CACHE.clear()
+            out = em._rewound_walk(path)[0]
+        fresh(); em._REWOUND_CACHE.clear()
+        return out
+
+    def test_the_rewound_memo_road_reads_nothing_before_the_window_per_pass(self):
+        path = self.leaf()
+        branch, nxt = write_forked(path, 6000)
+        ref = self._ref_rewound(path)
+        self.assertEqual(ref, branch, "the reference walk files the branch as rewound")
+        with knobs(64 * 1024, 10, roots=[str(self.proj)]):
+            ent = em._read_jsonl_entry(path)
+            self.assertTrue(_tail(ent[4]) and ent[4].ncold > 100, "the leaf is held tail-only, its branch before the window")
+            self.assertEqual(em.rewound_uuids(path, drop=False), ref, "the first walk equals the whole walk")
+            per_pass = []
+            for k in range(3):
+                nxt = append_chain(path, nxt, 3)          # the session wrote: the memo is retired and the walk runs again
+                c0 = cold_records()
+                got = em.rewound_uuids(path, drop=False)
+                per_pass.append(cold_records() - c0)
+                self.assertEqual(got, ref, "pass %d: the walk over skeletons files the same rewound set" % k)
+            self.assertEqual(per_pass, [0, 0, 0], "records read before the window per pass: %r" % per_pass)
+            self.assertTrue(_tail(em._JSONL_CACHE[path][4]), "the entry stayed tail-only")
+        self.assertEqual(self._ref_rewound(path), ref)
+
+
+def _batch_shape():
+    """A parallel tool batch (three calls of one model message, results parented at their own calls) and a rewound prompt,
+    in the shape tests/test_parallel_tool_batch.py pins (synthetic ids)."""
+    t = "2026-10-07T01:00:%02d.000Z"
+    msg = "msg_skel_batch"
+
+    def call(i, uid, parent):
+        return {"type": "assistant", "uuid": uid, "parentUuid": parent, "timestamp": t % i,
+                "message": {"id": msg, "role": "assistant", "content": [
+                    {"type": "tool_use", "id": "toolu_b%d" % i, "name": "Bash", "input": {"command": "make lint %d" % i}}]}}
+
+    def result(i, uid, call_uid):
+        return {"type": "user", "uuid": uid, "parentUuid": call_uid, "sourceToolAssistantUUID": call_uid, "promptId": "p-b",
+                "timestamp": t % (10 + i), "toolUseResult": {"stdout": "ok %d" % i},
+                "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_b%d" % i,
+                                                         "content": "ok %d" % i}]}}
+    return [
+        {"type": "user", "uuid": "b-p", "parentUuid": None, "timestamp": t % 0, "promptId": "p-b",
+         "message": {"role": "user", "content": "run the three checks"}},
+        call(1, "b-c1", "b-p"), call(2, "b-c2", "b-c1"), call(3, "b-c3", "b-c2"),
+        result(1, "b-r1", "b-c1"), result(3, "b-r3", "b-c3"), result(2, "b-r2", "b-c2"),
+        {"type": "assistant", "uuid": "b-a", "parentUuid": "b-r2", "timestamp": t % 30,
+         "message": {"id": "msg_skel_reply", "role": "assistant", "content": [{"type": "thinking", "thinking": "hm"},
+                                                                              {"type": "text", "text": "All three pass."}]}},
+        {"type": "user", "uuid": "b-x", "parentUuid": "b-a", "timestamp": t % 31,
+         "message": {"role": "user", "content": [{"type": "text", "text": "a prompt rewound away"},
+                                                 {"type": "image", "source": {"type": "base64", "data": "AAAA"}}]}},
+        {"type": "user", "uuid": "b-y", "parentUuid": "b-a", "timestamp": t % 32,
+         "message": {"role": "user", "content": "the prompt that replaced it"}},
+    ]
+
+
+def golden_scenarios():
+    """The golden scenarios' builders (tests/test_event_model_golden.py SINGLE_FILE), loaded WITHOUT re-executing the event
+    model: that module loads it by path under the shared name, which load_source re-executes into this test's own module
+    object (resetting its knobs and caches), so it is run here with a loader that hands back the module already loaded.
+    The environment it sets for its own state root is restored."""
+    import types
+    saved_env, saved_mod = dict(os.environ), sys.modules.get("romp_load")
+    stub = types.ModuleType("romp_load")
+    stub.load_source = lambda name, path: em
+    sys.modules["romp_load"] = stub
+    try:
+        ns = {"__name__": "golden_scenarios_for_tail_only", "__file__": os.path.join(HERE, "test_event_model_golden.py")}
+        src = Path(HERE, "test_event_model_golden.py").read_text()
+        exec(compile(src, ns["__file__"], "exec"), ns)
+        return ns["SINGLE_FILE"]
+    finally:
+        if saved_mod is not None:
+            sys.modules["romp_load"] = saved_mod
+        else:
+            sys.modules.pop("romp_load", None)
+        os.environ.clear(); os.environ.update(saved_env)
+
+
+class SkeletonWalksEqualFullWalks(Base):
+    """A walk over a tail-only entry's skeletons files every record as the walk over the full records does, for every graph
+    shape the golden scenarios pin (compactions with intact and broken stitches, a detached manual compact, an eclipsed
+    retry storm, rewinds, broken chains, a /clear, queued prompts, slash commands) and a parallel tool batch, with the
+    shape BEFORE the window; and a skeleton asked for a field it does not keep refuses, so the walk is re-run whole."""
+
+    def _scenarios(self):
+        out = {name: fn() for name, (fn, _states) in golden_scenarios().items()}
+        out["parallel_batch"] = _batch_shape()
+        return out
+
+    def _write(self, path, recs, layout):
+        rnd = random.Random(11)
+        lines = [json.dumps(r) for r in recs]
+        last = next((r["uuid"] for r in reversed(recs) if r.get("uuid")), None)
+        prev = last if layout == "continue" else None
+        for i in range(1200):                             # about 600 KB of filler: the scenario sits before a 16 KiB window
+            r = _rec(100000 + i, rnd)
+            r["uuid"] = "33333333-2222-4333-8444-%012d" % i
+            r["parentUuid"] = prev
+            prev = r["uuid"]
+            lines.append(json.dumps(r))
+        if layout == "back":                              # the leaf returns to the scenario's line: the filler is a /clear branch
+            lines.append(json.dumps({"type": "user", "uuid": "back-1", "parentUuid": last, "timestamp": "2026-10-07T02:00:00.000Z",
+                                     "message": {"role": "user", "content": "back on the first line"}}))
+        Path(path).write_text("\n".join(lines) + "\n")
+
+    def test_skeleton_walks_file_every_shape_as_the_full_walk(self):
+        path = self.leaf()
+        with knobs(16 * 1024, 4, roots=[str(self.proj)]):
+            for name, recs in sorted(self._scenarios().items()):
+                for layout in ("continue", "back"):
+                    with self.subTest(scenario=name, layout=layout):
+                        fresh()
+                        self._write(path, recs, layout)
+                        ent = em._read_jsonl_entry(path)
+                        self.assertTrue(_tail(ent[4]) and ent[4].ncold > len(recs), "the scenario is before the window")
+                        full = em.FileAdapter([path], path)
+                        c0 = cold_records()
+                        walk = em.FileAdapter([path], path, walk_only=True)
+                        self.assertEqual(cold_records(), c0, "the walk read nothing before the window")
+                        self.assertEqual(walk.chain_verdicts(), full.chain_verdicts())
+                        self.assertEqual(em._membership_of(walk), em._membership_of(full))
+                        self.assertEqual((walk.leaf_uuid, walk.parent_of, walk._adopted),
+                                         (full.leaf_uuid, full.parent_of, full._adopted))
+
+    def test_a_skeleton_refuses_a_field_it_does_not_keep_and_the_walk_reruns_whole(self):
+        r = {"type": "user", "uuid": "u1", "parentUuid": None, "toolUseResult": {"stdout": "x"},
+             "message": {"role": "user", "model": "m", "content": [{"type": "tool_result", "tool_use_id": "t", "content": "big"}]}}
+        s = em._skel(r)
+        self.assertEqual((s.get("uuid"), s.get("promptId"), s["message"]["content"][0].get("tool_use_id")), ("u1", None, "t"))
+        for probe in (lambda: s.get("toolUseResult"), lambda: s["cwd"], lambda: "toolUseResult" in s,
+                      lambda: s["message"].get("model"), lambda: s["message"]["content"][0].get("content")):
+            with self.assertRaises(em._SkelMiss):
+                probe()
+        before = em.cold_read_stats()["skeleton"]["misses"]
+        seen = []
+
+        def build(walk_only):
+            seen.append(walk_only)
+            if walk_only:
+                return s.get("toolUseResult")
+            return "whole"
+        self.assertEqual(em._walk_with_skeletons(build), "whole")
+        self.assertEqual(seen, [True, False])
+        self.assertEqual(em.cold_read_stats()["skeleton"]["misses"], before + 1)

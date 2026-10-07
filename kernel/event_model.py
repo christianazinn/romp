@@ -791,7 +791,9 @@ def _entry_weight(ent) -> int:
         if type(recs) is _TailRecords:                    # tail-only (2026-10-07): the window's bytes, plus the offsets and CRCs
             held = max(0, size - recs.hot_offset())       #  of every record (20 bytes a record, held as they are, not decoded)
             offs, crcs = recs.offs, recs.crcs
-            return int(held * RECORD_CACHE_RESIDENT_PER_FILE_BYTE) + len(offs) * offs.itemsize + len(crcs) * crcs.itemsize
+            sk = recs.skel                                #  and the walk skeletons of the records before the window (_skel)
+            return int(held * RECORD_CACHE_RESIDENT_PER_FILE_BYTE) + len(offs) * offs.itemsize + len(crcs) * crcs.itemsize \
+                + (min(len(sk), recs.ncold) * (_SKEL_BYTES_PER_RECORD + 8) if sk is not None else 0)
         if base <= 0:
             held = size
         else:
@@ -1991,7 +1993,7 @@ def _scan_jsonl_stream(fh, base_offset, offsets=None, limit=None, tail=None):
     at (the ring then holds at most the bytes between it and keep_from). The offsets of every record, kept or not, go into
     `offsets`."""
     records = []
-    keep_from = ring = crcs = None
+    keep_from = ring = crcs = dskel = None
     ring_from = 0
     if tail is not None:
         keep_from = int(tail.get("keep_from") or 0)
@@ -1999,6 +2001,7 @@ def _scan_jsonl_stream(fh, base_offset, offsets=None, limit=None, tail=None):
         crcs = tail["crcs"] = array.array("I")           # the CRC-32 of every parsed record's bytes, aligned with `offsets`
         ring = tail["ring"] = collections.deque(maxlen=max(1, int(tail.get("keep_last") or 0)))   # at least the newest
         tail["dropped"] = 0
+        dskel = tail["skel"] = [] if _SKEL_ON else None  # the walk skeleton of every dropped record, in order (see _skel)
     last_dropped = None
     seen = 0                                              # bytes iterated so far, complete lines and the trailing partial alike
     consumed = 0                                          # bytes of complete lines: what the next read resumes after
@@ -2027,6 +2030,8 @@ def _scan_jsonl_stream(fh, base_offset, offsets=None, limit=None, tail=None):
                 _gc_untrack_json(rec)                     # out of the cyclic collector's walk while it is hot (see _gc_untrack_json)
             if keep_from is not None and base_offset + at < keep_from:
                 tail["dropped"] += 1                      # before the window: indexed, not kept (the ring holds the newest few)
+                if dskel is not None:
+                    dskel.append(_skel(rec))              # what the chain walks read of it, from the record in hand (no re-read)
                 if base_offset + at >= ring_from:
                     ring.append(rec)
                 last_dropped = rec
@@ -2150,8 +2155,9 @@ def cold_read_stats():
     """recordCache.coldReads for /perf: the passes that read records before a tail-only entry's window, their records and
     bytes, per caller, and the rewrites they refused."""
     with _COLD_STATS_LOCK:
-        out = {k: v for k, v in _COLD_STATS.items() if k != "byCaller"}
+        out = {k: v for k, v in _COLD_STATS.items() if k not in ("byCaller", "skeleton")}
         out["byCaller"] = {k: dict(v) for k, v in _COLD_STATS["byCaller"].items()}
+        out["skeleton"] = dict(_COLD_STATS.get("skeleton") or {"walks": 0, "records": 0, "misses": 0})
         return out
 
 
@@ -2165,9 +2171,10 @@ class _TailRecords:
     Deliberately not a list subclass: the C json encoder and other C fast paths read a list subclass's storage directly,
     which here would be the window alone, a silent truncation. A caller that needs a real list fails loudly instead.
     Immutable once built, like every list the reader serves (the reader builds a new one per append)."""
-    __slots__ = ("path", "offs", "ncold", "hot", "guard_off", "guard", "crcs", "ident", "__weakref__")
+    __slots__ = ("path", "offs", "ncold", "hot", "guard_off", "guard", "crcs", "ident", "skel", "__weakref__")
 
     def __init__(self, path, offs, ncold, hot, guard_off, guard, crcs, ident):
+        self.skel = None                                  # the walk skeletons of records 0..ncold (see _skel), or None
         self.path = path
         self.offs = offs
         self.ncold = int(ncold)
@@ -2361,6 +2368,273 @@ class _RecordsView:
         if not 0 <= i < n:
             raise IndexError("record index out of range")
         return self.parent[self.start + i]
+
+
+# ───── the walk skeleton of a tail-only entry's older records (2026-10-07, review fix) ─────
+# The chain walks (the judges' rewound reconcile, file_rewound, chain_membership, the document chain check) build an adapter
+# over a leaf's records every pass a session's leaf grew, and read only each record's GRAPH fields. Over a tail-only entry
+# their adapter took every record before the window off disk, so each pass re-read and re-decoded the transcript (a review
+# measured 0.6 to 0.8 s and 168 MiB per pass for a 200 MB leaf; on a 1.9 GiB leaf, seconds and gigabytes). A tail-only
+# entry therefore also keeps, for every record before its window, a SKELETON: a small dict holding only the fields those
+# walks read (ids, parent links, type, the flags, the compaction segment, a queued prompt, the block ids, a user record's
+# text, and whether an assistant record's text is non-empty). Skeletons are built from records already in memory: the
+# scan's dropped records as it decodes them, and the window's records as they slide out of it, so building them reads
+# nothing more off disk, and an append shares the earlier entry's list. A walk-only adapter (FileAdapter walk_only=True)
+# ingests the skeletons and the window's real records: no read per pass.
+#
+# A skeleton refuses to answer a field it does not keep: get, [] and `in` raise _SkelMiss for any key outside its kept set,
+# so a walk that starts reading a new field fails loudly in the tests (and, in production, the walk's caller falls back to
+# the full read and counts it under coldReads.skeletonMisses) rather than silently seeing None. ROMP_RECORD_CACHE_SKELETON=0
+# turns skeletons off (the walks then read before the window as before).
+_SKEL_ON = os.environ.get("ROMP_RECORD_CACHE_SKELETON", "1") != "0"
+
+
+class _SkelMiss(LookupError):
+    """A walk asked a skeleton record for a field it does not keep (see the block above)."""
+
+
+class _Skel(dict):
+    """A dict that answers only its kept keys (_ALLOW): a kept key that is absent answers as absent, any other key raises
+    _SkelMiss. Subclasses name the kept set per level (record, message, block, attachment, compaction metadata)."""
+    __slots__ = ()
+    _ALLOW = frozenset()
+
+    def get(self, k, default=None):
+        if dict.__contains__(self, k):
+            return dict.__getitem__(self, k)
+        if k in self._ALLOW:
+            return default
+        raise _SkelMiss(k)
+
+    def __getitem__(self, k):
+        if dict.__contains__(self, k):
+            return dict.__getitem__(self, k)
+        if k in self._ALLOW:
+            raise KeyError(k)
+        raise _SkelMiss(k)
+
+    def __contains__(self, k):
+        if dict.__contains__(self, k):
+            return True
+        if k in self._ALLOW:
+            return False
+        raise _SkelMiss(k)
+
+
+_SKEL_SCALARS = ("type", "subtype", "uuid", "parentUuid", "logicalParentUuid", "timestamp", "promptId", "isCompactSummary",
+                 "isMeta", "isApiErrorMessage", "sourceToolUseID")
+
+
+class _SkelRec(_Skel):
+    __slots__ = ()
+    _ALLOW = frozenset(_SKEL_SCALARS + ("message", "attachment", "compactMetadata"))
+
+
+class _SkelMsg(_Skel):
+    __slots__ = ()
+    _ALLOW = frozenset(("id", "content"))
+
+
+class _SkelBlock(_Skel):
+    __slots__ = ()
+    _ALLOW = frozenset(("type", "id", "name", "tool_use_id", "text"))
+
+
+class _SkelAtt(_Skel):
+    __slots__ = ()
+    _ALLOW = frozenset(("type", "prompt"))
+
+
+class _SkelCM(_Skel):
+    __slots__ = ()
+    _ALLOW = frozenset(("preservedSegment",))
+
+
+_SKEL_WORDS = {}                  # the small vocabulary skeletons repeat (types, subtypes, roles, tool names), one object each
+
+
+def _skel_word(v):
+    if type(v) is str and len(v) <= 64:
+        w = _SKEL_WORDS.get(v)
+        if w is not None:
+            return w
+        if len(_SKEL_WORDS) < 8192:
+            _SKEL_WORDS[v] = v
+    return v
+
+
+def _skel_text_mark(t):
+    """An assistant (or other non-user) text, reduced to what the walks read of it: whether it holds a non-blank character
+    (_text_of(...).strip(), joined across blocks, is non-empty exactly when one block's text is)."""
+    if type(t) is not str:
+        return t
+    return "x" if t.strip() else ""
+
+
+_SKEL_BARE = {}                   # type -> the one shared skeleton of a record with no uuid (a walk indexes nothing for it)
+
+
+def _skel_bare(r):
+    t = r.get("type")
+    key = t if type(t) is str and len(t) <= 64 else None
+    s = _SKEL_BARE.get(key) if key is not None else None
+    if s is None:
+        s = _SkelRec()
+        dict.__setitem__(s, "type", t)
+        if "uuid" in r:
+            dict.__setitem__(s, "uuid", r["uuid"])        # a present but empty uuid stays present, as the parse sees it
+        if key is not None and "uuid" not in r and len(_SKEL_BARE) < 256:
+            _SKEL_BARE[key] = s
+    return s
+
+
+_SKEL_BYTES_PER_RECORD = 600      # a skeleton's measured weight (581 bytes a record over the synthetic transcript mix the tests
+#                                   write, 2026-10-07): what _entry_weight adds per record before the window
+
+
+def _skel(r):
+    """The walk skeleton of one decoded record (see the block above); a record that is not a dict is kept as it is."""
+    if type(r) is not dict:
+        return r
+    if not r.get("uuid") and r.get("type") != "attachment":
+        return _skel_bare(r)                              # no graph node: the walks count it in read order and read nothing else
+    s = _SkelRec()
+    put = dict.__setitem__
+    for k in _SKEL_SCALARS:
+        if k in r:
+            v = r[k]
+            put(s, k, _skel_word(v) if k in ("type", "subtype") else v)
+    user = r.get("type") == "user"
+    if "message" in r:
+        m = r["message"]
+        if isinstance(m, dict):
+            sm = _SkelMsg()
+            if "id" in m:
+                put(sm, "id", m["id"])
+            if "content" in m:
+                c = m["content"]
+                if isinstance(c, str):
+                    put(sm, "content", c if user else _skel_text_mark(c))
+                elif isinstance(c, list):
+                    out = []
+                    for b in c:
+                        if isinstance(b, dict):
+                            sb = _SkelBlock()
+                            if "type" in b:
+                                put(sb, "type", _skel_word(b["type"]))
+                            if "id" in b:
+                                put(sb, "id", b["id"])
+                            if "name" in b:
+                                put(sb, "name", _skel_word(b["name"]))
+                            if "tool_use_id" in b:
+                                put(sb, "tool_use_id", b["tool_use_id"])
+                            if "text" in b:
+                                put(sb, "text", b["text"] if user else _skel_text_mark(b["text"]))
+                            out.append(sb)
+                        else:
+                            out.append(b)
+                    put(sm, "content", out)
+                else:
+                    put(sm, "content", c)
+            m = sm
+        put(s, "message", m)
+    if "attachment" in r:
+        a = r["attachment"]
+        if isinstance(a, dict):
+            sa = _SkelAtt()
+            if "type" in a:
+                put(sa, "type", _skel_word(a["type"]))
+            if "prompt" in a and a.get("type") == "queued_command":
+                put(sa, "prompt", a["prompt"])
+            a = sa
+        put(s, "attachment", a)
+    if "compactMetadata" in r:
+        cm = r["compactMetadata"]
+        if isinstance(cm, dict):
+            scm = _SkelCM()
+            if "preservedSegment" in cm:
+                put(scm, "preservedSegment", cm["preservedSegment"])
+            cm = scm
+        put(s, "compactMetadata", cm)
+    return s
+
+
+def _skel_entry(old, ncold_combined, hot_combined, dropped_skel, dropped_n, scan_start, final):
+    """The skeleton list for `final`, the _TailRecords a read just built (index i < final.ncold is the skeleton of record i),
+    from what the read had in memory and never off disk: the earlier entry's skeletons (`old`, the entry the read appended
+    to, when it is a _TailRecords whose skeleton is complete; its list is EXTENDED in place when no later entry has grown it,
+    since every holder reads only below its own ncold), the earlier entry's window records that went cold, the scan's
+    skeletons of the records it dropped (`dropped_skel`, `dropped_n` of them, from record `scan_start` on), and the combined
+    window's records the final shape slid out (`hot_combined`, which starts at record `ncold_combined`). None when a source
+    is missing (skeletons off, an earlier entry without one): the walks then read before the window as before."""
+    if not _SKEL_ON or type(final) is not _TailRecords:
+        return None
+    want = final.ncold
+    if type(old) is _TailRecords:
+        oc, oh = old.ncold, old.hot
+        osk = old.skel
+        if osk is None or len(osk) < oc:
+            return None
+        out = osk if len(osk) == oc else osk[:oc]
+    else:
+        oc, oh = 0, (old or [])
+        out = []
+    if len(out) > want:                                   # (never: a window only moves forward) a fresh prefix, the old list kept
+        return out[:want]
+    i = len(out)
+    while i < want:
+        if i < oc + len(oh):
+            out.append(_skel(oh[i - oc]))
+        elif i < scan_start + dropped_n:
+            k = i - scan_start
+            if dropped_skel is None or k >= len(dropped_skel):
+                return None
+            out.append(dropped_skel[k])
+        else:
+            j = i - ncold_combined
+            if j < 0 or j >= len(hot_combined):
+                return None
+            out.append(_skel(hot_combined[j]))
+        i += 1
+    return out
+
+
+def _walk_ready(recs):
+    """Whether a tail-only entry carries a skeleton for every record before its window."""
+    sk = recs.skel
+    return _SKEL_ON and sk is not None and len(sk) >= recs.ncold
+
+
+def _walk_list(recs):
+    """The records a chain walk ingests from a tail-only entry: the skeletons of the records before the window, then the
+    window's own records, one list of references (nothing decoded, nothing read); counted under coldReads.skeleton."""
+    out = recs.skel[:recs.ncold]
+    out.extend(recs.hot)
+    with _COLD_STATS_LOCK:
+        row = _COLD_STATS.setdefault("skeleton", {"walks": 0, "records": 0, "misses": 0})
+        row["walks"] += 1; row["records"] += recs.ncold
+    return out
+
+
+_SKEL_MISS_NOTED = set()
+
+
+def _walk_with_skeletons(build):
+    """build(walk_only) for a chain walk: over skeletons first; a walk that asked a skeleton for a field it does not keep
+    (_SkelMiss) is run again over the full records, counted under coldReads.skeleton.misses and named once on stderr, so a
+    new field read in a walk costs a disk pass and says so, never a wrong verdict."""
+    try:
+        return build(True)
+    except _SkelMiss as e:
+        with _COLD_STATS_LOCK:
+            row = _COLD_STATS.setdefault("skeleton", {"walks": 0, "records": 0, "misses": 0})
+            row["misses"] += 1
+        key = str(e)
+        if key not in _SKEL_MISS_NOTED and len(_SKEL_MISS_NOTED) < 64:
+            _SKEL_MISS_NOTED.add(key)
+            print("romp event-model: a chain walk read %s, which record skeletons do not keep; walked the full records "
+                  "(coldReads.skeleton.misses)" % key, file=sys.stderr)
+        return build(False)
 
 
 def _first_within(offs, lo, hi, end, nbytes):
@@ -2684,6 +2958,7 @@ def _read_jsonl_entry_unlocked(path, on_fail=None, tail_ok=False, tail_from=None
                                                                     and (st.st_mtime == hit[0] or tail_from is not None)))
             unchanged_tail = (hit is not None and not tail_ok and hit[5] > 0 and st.st_size == hit[1]
                               and st.st_mtime == hit[0])            # a whole reader meets an unchanged tail entry
+            sk_old, sk_start = None, 0                    # the entry a read appends to and the record its scan starts at (_skel_entry)
             ncold, tinfo, keep_index, crcs = 0, None, None, None   # records before the tail-only window, the scan's tail mode, the
             #                                               first record an append brought (the window keeps it: see _tail_shape),
             #                                               and the records' CRCs (None for an entry that is not tail-only)
@@ -2711,6 +2986,7 @@ def _read_jsonl_entry_unlocked(path, on_fail=None, tail_ok=False, tail_from=None
                                                                 tail=tinfo)   # the appended lines, one at a time
                         _count_read(path, nread)
                         crcs = _crcs_after(records, tinfo, pre)   # the old entry's CRCs and the scan's (before `records` is replaced)
+                        sk_old, sk_start = records, len(records)
                         ncold, records = _tail_combine(records, new, tinfo)   # a NEW list — never extend the served one in place
                         base, gen, done = base0, gen0, True
                         kind = "restore" if restored is not None else "grown"
@@ -2747,8 +3023,12 @@ def _read_jsonl_entry_unlocked(path, on_fail=None, tail_ok=False, tail_from=None
             fh.seek(tail_from)
             tail = fh.read(offset - tail_from)
             _count_read(path, len(tail))                  # the guard capture is a read too (/perf's count is what was pulled)
+            sk_ncold, sk_hot = ncold, records
             records = _tail_shape(path, offs, ncold, records, offset, tail, keep_index=keep_index, crcs=crcs,
                                   fh=fh)          # a plain list, or the window over the indexed file
+            if type(records) is _TailRecords:     # the walk skeletons of the records before the window, from memory (see _skel)
+                records.skel = _skel_entry(sk_old, sk_ncold, sk_hot, tinfo.get("skel") if tinfo else None,
+                                           int(tinfo.get("dropped") or 0) if tinfo else 0, sk_start, records)
             if kind in _WHOLE_READ_KINDS:                 # a whole read: counted by kind and caller on /perf (T384), always on; the
                 try:                                      #  frame walk runs only here, on the rare whole read, never on a tail or an
                     fr = sys._getframe(1)                 #  append
@@ -3482,7 +3762,9 @@ class FileAdapter:
     ancestors and drop out for free; `/clear` leaves no parent link so the walk
     stops there and pre-clear history drops out naturally."""
 
-    def __init__(self, candidate_files, leaf_path, leaf_override=None, resume_links=None, seed=None):
+    def __init__(self, candidate_files, leaf_path, leaf_override=None, resume_links=None, seed=None, walk_only=False):
+        self.walk_only = bool(walk_only)   # a chain walk's adapter (2026-10-07): only the graph is read, so a tail-only entry's
+        #                                    records before its window are its walk skeletons (see _skel), never a disk read
         self.seed = seed         # the assembly checkpoint's pre-cut graph (T323 stage 4): uuids, verdicts, types, the kept
         #                          chain, the gate facts and the read-counter floor of every record before the cut, so the
         #                          walks and gates over the tail answer as the whole graph would; None for a whole read
@@ -3551,7 +3833,9 @@ class FileAdapter:
             else:
                 ent = _read_jsonl_entry(fp, tail_ok=False)
             recs = ent[4] if ent is not None else []
-            if seed is None and type(recs) is _TailRecords:
+            if walk_only and type(recs) is _TailRecords and _walk_ready(recs):
+                recs = _walk_list(recs)                  # the skeletons before the window and the window's records, from memory
+            elif seed is None and type(recs) is _TailRecords:
                 recs = list(recs)                        # a WHOLE adapter over a tail-only entry (2026-10-07): one streaming pass
             #                                              off disk, into the list this adapter holds as it held the cache's whole
             #                                              list before (by_uuid keeps nearly every record anyway), so the assembly
@@ -5474,11 +5758,14 @@ def _rewound_walk(path):
     Its own, never re-fetched from the cache after the walk: an append and a refresh between the two would memoize pre-append
     verdicts at the post-append witness (T391 round one, low 1)."""
     key = str(path)
-    ad = FileAdapter([key], key)
-    if not ad.by_uuid and Path(path).stat().st_size > 0:
-        raise OSError("transcript read yielded no records")
-    verdicts = dict(ad.chain_verdicts())
-    return {u for u, v in verdicts.items() if v == "rewind"}, ad._src_keys.get(key, (None, 0, 0))
+
+    def build(walk_only):                                 # over a tail-only entry, the walk skeletons: no disk read per pass,
+        ad = FileAdapter([key], key, walk_only=walk_only)  #  however often the leaf grows (review find, 2026-10-07)
+        if not ad.by_uuid and Path(path).stat().st_size > 0:
+            raise OSError("transcript read yielded no records")
+        verdicts = dict(ad.chain_verdicts())
+        return {u for u, v in verdicts.items() if v == "rewind"}, ad._src_keys.get(key, (None, 0, 0))
+    return _walk_with_skeletons(build)
 
 
 def rewound_uuids(path, drop=True):

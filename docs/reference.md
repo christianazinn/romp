@@ -2704,8 +2704,9 @@ The snapshot's fields, all plain numbers (`ms` is milliseconds of wall time):
   (their files' sizes) and the two knobs; `coldReads` counts the reads of
   records before a window: `passes` (one per streaming pass or single-record
   read), `records`, `bytes`, `byCaller` (the same per first calling function
-  outside the event model) and `rewrites` (reads refused because the file was
-  rewritten under the index).
+  outside the event model), `rewrites` (reads refused because the file was
+  rewritten under the index) and `skeleton` (walks served by record skeletons,
+  their records, and misses).
 - `asmCheckpoint`: the assembly documents since boot: `written`, `restored`,
   `fallbacks` per reason (`version`, `rows` (a version-6 document whose atom
   row fails its shape check at load, or fails its decode at the first read
@@ -3445,6 +3446,18 @@ every record.
   the assembly's atoms, or the lazy atoms a document restored, and hydrates
   bodies by offset as before. Each such read is counted under
   `recordCache.coldReads` by caller.
+- The chain walks read nothing before the window. Each older record also
+  keeps a skeleton: only the fields the rewind, membership and document-chain
+  walks read (ids, parent links, type, the flags, the compaction segment, a
+  queued prompt, the content blocks' ids, a user record's text, and whether an
+  assistant record's text is non-empty), about 600 bytes a record, counted in
+  the entry's weight. Skeletons are built from records already in memory (the
+  scan's dropped records and the window's records as it slides), never by a
+  read, so the judges' per-pass walks over a growing leaf cost no disk pass. A
+  skeleton asked for a field it does not keep raises; the walk is then run
+  over the full records once and counted under `coldReads.skeleton.misses`
+  (`walks` and `records` count the walks skeletons served).
+  `ROMP_RECORD_CACHE_SKELETON=0` turns skeletons off.
 - A read before the window checks, on each open, that the file is the one
   indexed (its device and inode) and that the entry's 64-byte guard stands, and
   checks each record's CRC before decoding it. A file rewritten, replaced or
