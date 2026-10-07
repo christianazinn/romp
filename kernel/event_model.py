@@ -2159,6 +2159,7 @@ def cold_read_stats():
         out = {k: v for k, v in _COLD_STATS.items() if k not in ("byCaller", "skeleton")}
         out["byCaller"] = {k: dict(v) for k, v in _COLD_STATS["byCaller"].items()}
         out["skeleton"] = dict(_COLD_STATS.get("skeleton") or {"walks": 0, "records": 0, "misses": 0})
+        out["wholeLists"] = dict(_WHOLE_STATS)
         return out
 
 
@@ -2657,6 +2658,53 @@ def _walk_with_skeletons(build):
             print("romp event-model: a chain walk read %s, which record skeletons do not keep; walked the full records "
                   "(coldReads.skeleton.misses)" % key, file=sys.stderr)
         return build(False)
+
+
+_WHOLE_HOLDERS = {}               # path -> weak references to whole adapters holding a materialized list of its tail-only entry
+_WHOLE_HOLDERS_LOCK = threading.Lock()
+_WHOLE_STATS = {"shared": 0, "extended": 0, "built": 0}   # /perf recordCache.coldReads.wholeLists: lists reused, reused and
+#                                   extended by an append's records, and built by a streaming pass
+
+
+def _whole_register(path, adapter):
+    """Record `adapter` as holding a whole list of `path`'s records (FileAdapter._src[path]), for _whole_list to share."""
+    with _WHOLE_HOLDERS_LOCK:
+        refs = [r for r in _WHOLE_HOLDERS.get(path, ()) if r() is not None and r() is not adapter]
+        refs.append(weakref.ref(adapter))
+        _WHOLE_HOLDERS[path] = refs[-4:]
+        if len(_WHOLE_HOLDERS) > 512:                    # paths whose adapters are all gone
+            for k in [k for k, v in _WHOLE_HOLDERS.items() if not any(r() is not None for r in v)]:
+                del _WHOLE_HOLDERS[k]
+
+
+def _whole_list(path, ent):
+    """The whole list a WHOLE adapter ingests from a tail-only entry `ent` of `path` (review find, 2026-10-07: each whole
+    adapter decoded a private full copy off disk, so two over one file held two copies and each paid a streaming pass).
+    A live whole adapter already holding the records of the same generation from base 0 lends its list: as it is when it
+    covers every record, or extended by the newer records (the window's, from memory) after an append. Lists an adapter
+    holds are never mutated (a fold builds a new one), so sharing one is safe. Else one streaming pass, as before."""
+    recs, gen, n = ent[4], ent[6], len(ent[4])
+    if ent[5] == 0:
+        with _WHOLE_HOLDERS_LOCK:
+            holders = [r() for r in _WHOLE_HOLDERS.get(path, ())]
+        best = None
+        for ad in reversed(holders):
+            if ad is None:
+                continue
+            held, key = ad._src.get(path), ad._src_keys.get(path)
+            if type(held) is list and key and len(key) == 3 and key[0] == gen and key[1] == 0 and key[2] == len(held) <= n:
+                if best is None or len(held) > len(best):
+                    best = held
+        if best is not None:
+            k = len(best)
+            with _COLD_STATS_LOCK:
+                _WHOLE_STATS["shared" if k == n else "extended"] += 1
+            if k == n:
+                return best
+            return best + list(recs[k:])                  # the records an append brought: inside the window, from memory
+    with _COLD_STATS_LOCK:
+        _WHOLE_STATS["built"] += 1
+    return list(recs)
 
 
 def _first_within(offs, lo, hi, end, nbytes):
@@ -3856,14 +3904,20 @@ class FileAdapter:
             else:
                 ent = _read_jsonl_entry(fp, tail_ok=False)
             recs = ent[4] if ent is not None else []
+            whole_from_tail = False
             if walk_only and type(recs) is _TailRecords and _walk_ready(recs):
                 recs = _walk_list(recs)                  # the skeletons before the window and the window's records, from memory
             elif seed is None and type(recs) is _TailRecords:
-                recs = list(recs)                        # a WHOLE adapter over a tail-only entry (2026-10-07): one streaming pass
-            #                                              off disk, into the list this adapter holds as it held the cache's whole
-            #                                              list before (by_uuid keeps nearly every record anyway), so the assembly
-            #                                              writer's walks over _src stay in memory; released with the entry (re-seat)
+                recs = _whole_list(str(fp), ent)         # a WHOLE adapter over a tail-only entry (2026-10-07): a list this adapter
+                whole_from_tail = True                   #  holds as it held the cache's whole list before (by_uuid keeps nearly
+            #                                              every record anyway), so the assembly writer's walks over _src stay in
+            #                                              memory; released with the entry (re-seat). One streaming pass off disk,
+            #                                              or the list a live whole adapter over the same entry already holds
+            #                                              (_whole_list: one copy per transcript, not one per adapter)
             self._src[str(fp)] = recs
+            if whole_from_tail:
+                _whole_register(str(fp), self)
+                whole_from_tail = False
             self._src_keys[str(fp)] = (ent[6], ent[5], ent[5] + len(recs)) if ent is not None else (None, 0, 0)
             if ent is not None:
                 self._src_stat[str(fp)] = (ent[1], ent[0])    # the reader's (size, mtime) for this very read

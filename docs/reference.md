@@ -3442,7 +3442,10 @@ every record.
 - Who reads before the window: a fold with no cursor to resume from (a refold
   from record 0) streams the file once; the assembly's whole parse streams it
   into its adapter, which keeps its own list until the entry is re-seated on its
-  document, so the document writer never walks the disk. Chat scroll-back reads
+  document, so the document writer never walks the disk. A second whole adapter
+  over the same entry (a rebuild beside the old one) shares that list, extended
+  from the window after an append, rather than reading and holding a second copy
+  (`coldReads.wholeLists`: shared, extended, built). Chat scroll-back reads
   the assembly's atoms, or the lazy atoms a document restored, and hydrates
   bodies by offset as before. Each such read is counted under
   `recordCache.coldReads` by caller.

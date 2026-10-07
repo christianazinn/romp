@@ -979,3 +979,36 @@ class ARefusedReadDropsItsEntry(Base):
             with self.assertRaises(em.TailRecordsRead):
                 held[j]
             self.assertIs(self._read(path), fresh_ent, "the fresh entry stands")
+
+
+class WholeAdaptersShareOneList(Base):
+    """A whole adapter over a tail-only entry (review find, 2026-10-07) decoded a private full copy off disk, so two whole
+    adapters over one transcript held two copies (and each paid a streaming pass), where the cache's single whole list had
+    been shared before. A second whole adapter over the same entry generation now shares the first one's list, and after an
+    append extends it with the window's newer records from memory."""
+
+    def test_a_second_whole_adapter_shares_the_first_ones_records_and_reads_nothing(self):
+        with knobs(32 * 1024, 4, roots=[str(self.proj)]):
+            path = self.leaf()
+            _, nxt = write_transcript(path, 300 * 1024)
+            self.assertTrue(_tail(em._read_jsonl_entry(path)[4]))
+            a1 = em.FileAdapter([path], path)
+            c0 = cold_records()
+            a2 = em.FileAdapter([path], path)
+            self.assertEqual(cold_records() - c0, 0, "the second whole adapter read nothing before the window")
+            self.assertIs(a2._src[path][0], a1._src[path][0], "the two share the records before the window: one copy")
+            write_transcript(path, 4 * 1024, start=nxt, mode="a")
+            c0 = cold_records()
+            a3 = em.FileAdapter([path], path)
+            self.assertEqual(cold_records() - c0, 0, "after an append, the shared list is extended from the window")
+            self.assertIs(a3._src[path][0], a1._src[path][0])
+            self.assertEqual(a3._src[path], plain(path), "every record, in order")
+            self.assertEqual(a3._src_keys[path], (em._JSONL_CACHE[path][6], 0, len(plain(path))))
+            del a1, a2, a3
+            fresh()
+            write_transcript(path, 4 * 1024, start=nxt + 1000, mode="a")
+            em._read_jsonl_entry(path)
+            c0 = cold_records()
+            a4 = em.FileAdapter([path], path)
+            self.assertGreater(cold_records() - c0, 0, "a new generation with no live holder streams its own list")
+            self.assertEqual(a4._src[path], plain(path))
