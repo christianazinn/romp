@@ -3145,7 +3145,7 @@ def _read_jsonl_entry_unlocked(path, on_fail=None, tail_ok=False, tail_from=None
     return ent
 
 
-def fold_records(cache, path, init, step, on=None, ckpt=None, drop_after=None):
+def fold_records(cache, path, init, step, on=None, ckpt=None, drop_after=None, step_reads=True):
     """Fold a JSONL file's records into a carried state, APPEND-INCREMENTALLY (issue 903, 2026-09-03):
     the states/transcript readers re-read their whole file behind an (mtime,size) key that every append
     invalidates — O(file) per push for every working session. The reader serves the parsed records of a
@@ -3184,6 +3184,10 @@ def fold_records(cache, path, init, step, on=None, ckpt=None, drop_after=None):
     that returned; the user's rule: nothing stays resident that nobody looks at). The cursor and its checkpoint stand;
     a later fold of an unchanged file re-reads it once, a growing file keeps its records, and a live session's main
     transcript keeps them while a fold over it cannot restore from its document (see _drop_quiescent_entry).
+
+    `step_reads` False (2026-10-07) says `step` reads nothing of the record it is handed (rewound_uuids' step retires the
+    memo whatever arrived): any record past the cursor applies it ONCE with None, and a refold is init() plus that one
+    step, so neither walks the records (off disk, for a tail-only entry) nor reads a tail entry whole to find out.
 
     Lives here (moved from the kernel, 2026-09-03) so the judge's readers can fold too — the
     background-task pairing below is shared by both."""
@@ -3246,6 +3250,10 @@ def fold_records(cache, path, init, step, on=None, ckpt=None, drop_after=None):
             kind = kind or "append"
         else:
             kind = None
+    if kind is None and not step_reads:                   # a step that reads no record (rewound_uuids' retiring step): a refold
+        state, start, kind = init(), len(recs), "refold"  #  is the step applied once if any record exists, never a walk of every
+        if total > 0:                                     #  record off a tail-only entry's disk, nor a whole read of a tail entry
+            state = step(state, None)                     #  (2026-10-07: the memo's first call after a restart read the file)
     if kind is None:
         if base > 0:                                      # a refold needs every record: the entry is a tail, so read whole
             del failed[:]
@@ -3269,9 +3277,13 @@ def fold_records(cache, path, init, step, on=None, ckpt=None, drop_after=None):
                     rf = _CKPT_STATS["refolds"].setdefault(ckpt, {"count": 0, "bytes": 0})   #  and weighed per fold on /perf (T377).
                     rf["count"] += 1; rf["bytes"] += got   #  Diagnostic: the delta is over the path's process-wide counter, so another
         #                                                    thread's read of the same file inside this call lands in it
-    for r in recs[start:]:
-        if isinstance(r, dict):
-            state = step(state, r)
+    if not step_reads:
+        if start < len(recs):
+            state = step(state, None)                     # appended records: the step once, whatever they hold
+    else:
+        for r in recs[start:]:
+            if isinstance(r, dict):
+                state = step(state, r)
     if len(cache) > 256:
         # Past 256 cursors the dict is swept of the ones that cannot serve a hit (2026-09-17). It was CLEARED here, "bounded by
         # the session count", but a fold dict is keyed per FILE, and the chat build's agent-gist dict holds one cursor per agent
@@ -5881,7 +5893,9 @@ def rewound_uuids(path, drop=True):
     key = str(path)
     had = _REWOUND_CACHE.get(key)
     kinds = []
-    state = fold_records(_REWOUND_CACHE, key, lambda: None, lambda st, o: None, on=kinds.append, ckpt="rewoundUuids")
+    state = fold_records(_REWOUND_CACHE, key, lambda: None, lambda st, o: None, on=kinds.append, ckpt="rewoundUuids",
+                         step_reads=False)                # the step retires the memo whatever a record holds: never a walk
+    #                                                       of the records to find that out (2026-10-07)
     if isinstance(state, dict) and isinstance(state.get("uuids"), list):
         with _CKPT_LOCK:
             _REWOUND_STATS["served"] += 1

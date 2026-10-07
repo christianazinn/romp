@@ -660,7 +660,10 @@ class RoutineWalksReadNothingBeforeTheWindow(Base):
         with knobs(64 * 1024, 10, roots=[str(self.proj)]):
             ent = em._read_jsonl_entry(path)
             self.assertTrue(_tail(ent[4]) and ent[4].ncold > 100, "the leaf is held tail-only, its branch before the window")
+            c0 = cold_records()
             self.assertEqual(em.rewound_uuids(path, drop=False), ref, "the first walk equals the whole walk")
+            self.assertEqual(cold_records() - c0, 0, "the first call after a restart (no memo to restore) read nothing "
+                                                     "before the window: its retiring fold steps no record")
             per_pass = []
             for k in range(3):
                 nxt = append_chain(path, nxt, 3)          # the session wrote: the memo is retired and the walk runs again

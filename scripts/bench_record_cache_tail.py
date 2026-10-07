@@ -26,6 +26,12 @@ an auto-nudge or interrupt parse that upgrades a restored tail entry). Then --cy
   - every tenth cycle a whole adapter over one transcript (FileAdapter with no document: the kernel's thread-message and
     anchor reads, and a parse demoted to whole), and, offset by five, a fold with no cursor over one transcript (a refold
     from record 0, as after a drop).
+Every cycle also runs the three chain walks a review found reading older records off disk on every pass (2026-10-07), each
+on the first transcript appended that cycle, and records per pass the records and bytes read before a window and the wall
+time: `rewound` (the judges' memo road, em.rewound_uuids, retired by the append), `seeded` (the document road,
+em.file_rewound with the session id, then em.chain_membership as the judges call it), and `rewindHold` (the rewind gesture's
+kept chain, em.chain_membership with a pending cut and no session id). Each is warmed once per transcript at the boot, as the
+judges' first pass after a restart would (counted apart, `warm`).
 Per cycle it records the wall time, the bytes the reader pulled off disk, the record cache's weight (/perf recordCache.bytes,
 the kernel's own estimate of resident bytes), the resident size and its high-water mark (VmRSS, VmHWM), and, where the
 checkout has the rule, the reads before a window. --repo picks the checkout whose event model runs: the base for
@@ -316,13 +322,45 @@ def _run(em, paths, ckpt, cycles, label, max_rss_gb, seed):
         em._read_jsonl_incremental(p)                   # the boot's whole readers (an interrupt or auto-nudge parse's upgrade)
         guard()
     sample(0, t0, r0, c0, "boot")
+    scen_rows = []
+
+    def scenario(c, name, p, fn):
+        s0, t = cold0(), time.monotonic()
+        err = None
+        try:
+            fn()
+        except Exception as e:                          # noqa: BLE001  a walk that fails is a row, never a stopped bench
+            err = repr(e)[:160]
+        s1 = cold0()
+        ent = em._JSONL_CACHE.get(p)
+        scen_rows.append({"cycle": c, "scenario": name, "file": os.path.basename(p), "wallS": round(time.monotonic() - t, 4),
+                          "coldRecords": s1["records"] - s0["records"], "coldBytes": s1["bytes"] - s0["bytes"],
+                          "ncold": getattr(ent[4], "ncold", 0) if ent is not None else None, "error": err})
+
+    cuts = {}
+
+    def walks(c, p):
+        sid = os.path.basename(p)[:-6]
+        scenario(c, "rewound", p, lambda: em.rewound_uuids(p, drop=False))
+        scenario(c, "seeded", p, lambda: (em.file_rewound(p, rompuuid=sid, sdk_human=False),
+                                          em.chain_membership(p, candidate_files=[p], rompuuid=sid, sdk_human=False)))
+        scenario(c, "rewindHold", p, lambda: em.chain_membership(p, candidate_files=[p], leaf_override=cuts.get(p)))
+
+    for p in paths:                                     # the judges' first pass after the restart: one walk of each per file
+        cuts[p] = writers[p].parent
+        walks(0, p)
+    for r in scen_rows:
+        r["scenario"] += ":warm"
     n = len(paths)
     for c in range(1, cycles + 1):
         t0, r0, c0 = time.monotonic(), em.read_bytes_total(), cold0()
         what = []
+        first = None
         for i, p in enumerate(paths):
             if (i + c) % 3 == 0:
+                first = first or p
                 w = writers[p]
+                cuts[p] = w.parent                      # a pending bare rollback at the record before this cycle's appends
                 recs = w.tool_round()
                 if c % 3 == 0:
                     recs += w.reply() + w.prompt()
@@ -332,6 +370,8 @@ def _run(em, paths, ckpt, cycles, label, max_rss_gb, seed):
             tree = parse(em, p)
             em.hydrate([a for t in tree["turns"][-2:] for a in t["atoms"]])
         guard()
+        if first is not None:
+            walks(c, first)                             # the judges' walks over a leaf that grew this cycle
         if c % 5 == 2:
             p = paths[(c // 5) % n]
             tree = parse(em, p)
@@ -349,7 +389,7 @@ def _run(em, paths, ckpt, cycles, label, max_rss_gb, seed):
             what.append("refold from 0")
         sample(c, t0, r0, c0, "+".join(what) or "steady")
     disk = sum(os.path.getsize(p) for p in paths)
-    out = {"label": label, "files": n, "diskBytes": disk, "cycles": cycles, "rows": rows,
+    out = {"label": label, "files": n, "diskBytes": disk, "cycles": cycles, "rows": rows, "walks": scen_rows,
            "recordCount": sum(len(em._JSONL_CACHE[p][4]) for p in paths if p in em._JSONL_CACHE),
            "tailBytes": getattr(em, "_TAIL_BYTES", None), "tailRecords": getattr(em, "_TAIL_RECORDS", None)}
     print(json.dumps(out))
@@ -384,15 +424,35 @@ def summarize(files, live_gib, live_cache_gb, live_rss_gb):
             "tail-only entries (end)": rows[-1]["tailOnly"],
             "records": d.get("recordCount"),
         }
+    def walk_agg(d, out):
+        ws = d.get("walks") or []
+        for name in ("rewound", "seeded", "rewindHold"):
+            for kind, sel in (("per pass", name), ("warm, once per file", name + ":warm")):
+                rs = [r for r in ws if r["scenario"] == sel]
+                if not rs:
+                    out["%s %s: records read before window (median/max)" % (name, kind)] = "n/a"
+                    continue
+                out["%s %s: records read before window (median/max)" % (name, kind)] = "%d / %d (n=%d)" % (
+                    statistics.median(r["coldRecords"] for r in rs), max(r["coldRecords"] for r in rs), len(rs))
+                out["%s %s: MB read before window (median/max)" % (name, kind)] = "%.1f / %.1f" % (
+                    statistics.median(r["coldBytes"] for r in rs) / 1e6, max(r["coldBytes"] for r in rs) / 1e6)
+                out["%s %s: wall s (median/max)" % (name, kind)] = "%.3f / %.3f" % (
+                    statistics.median(r["wallS"] for r in rs), max(r["wallS"] for r in rs))
+                errs = sum(1 for r in rs if r.get("error"))
+                if errs:
+                    out["%s %s: errors" % (name, kind)] = str(errs)
+        return out
     labels = [l for l in ("before", "after") if l in runs] + [l for l in runs if l not in ("before", "after")]
-    table = {l: agg(runs[l]) for l in labels}
-    keys = list(next(iter(table.values())).keys())
+    table = {l: walk_agg(runs[l], agg(runs[l])) for l in labels}
+    keys = []
+    for l in labels:
+        keys += [k for k in table[l] if k not in keys]
     print("| measure | " + " | ".join(labels) + " |")
     print("|---|" + "---|" * len(labels))
     for k in keys:
         cells = []
         for l in labels:
-            v = table[l][k]
+            v = table[l].get(k, "n/a")
             cells.append(("%.3f" % v) if isinstance(v, float) else str(v))
         print("| %s | %s |" % (k, " | ".join(cells)))
     if "after" in runs and "before" in runs:
@@ -405,9 +465,11 @@ def summarize(files, live_gib, live_cache_gb, live_rss_gb):
         print("EXTRAPOLATION (not a measurement) to %.1f GiB of live transcripts in 23 files:" % live_gib)
         before_w = live_gib * GIB * 3.0
         live_records = live_gib * GIB / per_rec
-        after_w = 23 * tb * 3.0 + live_records * 20          # offsets (16 bytes) and a CRC (4) a record
+        skel_b = 608                                       # the walk skeleton of each older record (600 bytes and its pointer)
+        after_w = 23 * tb * 3.0 + live_records * (20 + skel_b)   # offsets (16 bytes), a CRC (4) and a skeleton a record
         print("  cache weight whole (3 bytes a file byte): %.1f GB (tonight's measured cache: %.1f GB in 59 entries)" % (before_w / 1e9, live_cache_gb))
-        print("  cache weight tail-only: 23 windows of %d MiB x 3 + %.1f M records x 20 B of index = %.2f GB" % (tb // MIB, live_records / 1e6, after_w / 1e9))
+        print("  cache weight tail-only: 23 windows of %d MiB x 3 + %.1f M records x %d B of index and skeleton = %.2f GB" % (
+            tb // MIB, live_records / 1e6, 20 + skel_b, after_w / 1e9))
         print("  bench ratio after/before (cache, end of run): %.4f -> %.2f GB of tonight's %.1f GB" % (
             a["cache GB (end)"] / b["cache GB (end)"], live_cache_gb * a["cache GB (end)"] / b["cache GB (end)"], live_cache_gb))
         print("  resident: tonight %.1f GB with a %.1f GB cache; the same heap with a tail-only cache: about %.1f GB "
