@@ -5664,6 +5664,8 @@ def _asm_gates(entry, leaf_path, candidate_files, links):
             delta = []
         elif count > ocount:
             delta = recs[ocount - base:]        # the records past what the entry folded (the reader's generation proves the prefix)
+            if type(delta) is not list:
+                delta = list(delta)             # a lag past a tail-only window: read once, then walked by the gates and the fold
         else:
             return _asm_demote("rewrite")
     if delta is None:
