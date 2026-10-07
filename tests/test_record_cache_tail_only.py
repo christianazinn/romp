@@ -1130,5 +1130,66 @@ class TheFileRunsWhole(unittest.TestCase):
         self.assertEqual(guards, [len(tree.body) - 1], "the main guard is the file's last top-level statement")
 
 
+
+class TheAssemblyConvergePassOverATailOnlyLeaf(Base):
+    """The kernel's assembly converge pass (kernel._converge_assembly, review find, 2026-10-07: only its predicate,
+    entry_indexed_whole, was tested over a tail-only leaf). An idle leaf the boot parsed whole, held tail-only, gets its
+    assembly document written by the pass from the entry in memory: no record read before the window, the entry stays
+    tail-only, and the document restores. A planted control with the pass's old predicate (a whole RESIDENT entry) skips the
+    leaf as having nothing to write from, so this test fails if the pass stops serving tail-only leaves."""
+
+    def parse(self, path):
+        return em.parse_session(path, rompuuid=SID, name="impl", dir="/TESTDIR", candidate_files=[path],
+                                states=None, postal_log=[], now=NOW)
+
+    def _pass(self, path):
+        for name, val in (("CKPT_CONVERGE_MS", 5000.0), ("CKPT_CONVERGE_BYTES", em._CKPT_CYCLE_CAP_DEFAULT), ("ASM_CONVERGE", True)):
+            saved = getattr(km, name); setattr(km, name, val); self.addCleanup(setattr, km, name, saved)
+        km._ASM_CONVERGE_DONE.clear(); km._ASM_CONVERGE_BLIP.clear(); km._ASM_CONVERGE_NOENTRY.clear()
+        em._ASM_CKPT_STATS["converge"] = {"writes": 0, "bytes": 0, "deferred": 0, "candidates": 0, "skipped": {}}
+        km._begin_checkpoint_cycle()
+        c0 = cold_records()
+        n = km._converge_assembly(time.time(), time.monotonic())
+        return n, cold_records() - c0, dict(em.asm_checkpoint_stats()["converge"])
+
+    def _setup(self):
+        path = self.leaf()
+        recs = transcript(NOW - 86400, turns=160, compact_every=40)
+        Path(path).write_text("".join(json.dumps(r) + "\n" for r in recs))
+        old = time.time() - 600
+        os.utime(path, (old, old))                     # idle past the quiescence window: the converge pass's leaf, not the settle's
+        return path
+
+    def test_the_converge_pass_writes_the_document_from_a_tail_only_entry_and_reads_nothing(self):
+        path = self._setup()
+        with knobs(16 * 1024, 4, roots=[str(self.proj)]):
+            tree = self.parse(path)
+            ent = em._JSONL_CACHE.get(path)
+            self.assertTrue(ent is not None and _tail(ent[4]) and ent[5] == 0, "the boot's whole parse left a tail-only entry")
+            self.assertFalse(em._asm_ckpt_file(path).exists())
+            n, cold, conv = self._pass(path)
+            self.assertEqual((n, conv["writes"]), (1, 1), "the pass wrote the leaf's document: %r" % conv)
+            self.assertTrue(em._asm_ckpt_file(path).exists())
+            self.assertEqual(cold, 0, "the pass read nothing before the window")
+            self.assertTrue(_tail(em._JSONL_CACHE[path][4]), "the entry stayed tail-only")
+            ref = _strip_tree(tree)
+            fresh()
+            restored = self.parse(path)
+            em.hydrate(restored, SID)
+            self.assertEqual(_strip_tree(restored), ref, "a fresh process restores from the pass's document")
+
+    def test_planted_the_old_predicate_skips_the_leaf(self):
+        path = self._setup()
+        with knobs(16 * 1024, 4, roots=[str(self.proj)]):
+            self.parse(path)
+            saved = em.entry_indexed_whole
+            em.entry_indexed_whole = em.entry_whole_resident          # the pass's predicate before tail-only entries
+            self.addCleanup(setattr, em, "entry_indexed_whole", saved)
+            n, cold, conv = self._pass(path)
+            self.assertEqual(n, 0)
+            self.assertEqual(conv["skipped"].get("noEntry"), 1, "the planted predicate finds nothing to write from: %r" % conv)
+            self.assertFalse(em._asm_ckpt_file(path).exists())
+
+
 if __name__ == "__main__":
     unittest.main()
