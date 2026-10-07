@@ -787,6 +787,11 @@ def _entry_weight(ent) -> int:
     pop subtract what they added."""
     try:
         size, base = int(ent[1]), int(ent[5])
+        recs = ent[4] if len(ent) > 4 else None
+        if type(recs) is _TailRecords:                    # tail-only (2026-10-07): the window's bytes, plus the offset index of
+            held = max(0, size - recs.hot_offset())       #  every record (16 bytes a record, held as they are, not decoded)
+            offs = recs.offs
+            return int(held * RECORD_CACHE_RESIDENT_PER_FILE_BYTE) + len(offs) * offs.itemsize
         if base <= 0:
             held = size
         else:
@@ -1926,7 +1931,7 @@ def _scan_jsonl_bytes(data, base_offset, offsets=None):
     return records, base_offset + end + 1
 
 
-def _scan_jsonl_stream(fh, base_offset, offsets=None, limit=None):
+def _scan_jsonl_stream(fh, base_offset, offsets=None, limit=None, tail=None):
     """(records, consumed, bytes_read) for the jsonl from `fh`'s CURRENT position to its end, decoded line by line off
     the open binary file: the parsed objects of every COMPLETE line, the byte offset just past the last complete line
     (a trailing line with no newline yet is a writer caught mid-append and is left for the next read, as
@@ -1962,8 +1967,20 @@ def _scan_jsonl_stream(fh, base_offset, offsets=None, limit=None):
     \\r under both. Splitting the concatenation equals concatenating the splits, since b"\\n" is itself a boundary, so
     records, consumed offset and offsets are identical for every input, valid or not (review find, 2026-09-15: the
     first cut split at b"\\n" alone and documented the bare-\\r case as a difference; parity costs one splitlines call
-    per line). tests/test_reader_stream_peak.py pins the equivalence, the bare-\\r case included."""
+    per line). tests/test_reader_stream_peak.py pins the equivalence, the bare-\\r case included.
+
+    `tail` (2026-10-07, the tail-only rule above _TailRecords): a dict with "keep_from", a byte offset, and "keep_last", a
+    count. A record starting before keep_from is decoded (the count and the offsets stay the reference's) but not kept: it
+    goes into a ring of the last keep_last such records, tail["ring"], and is counted in tail["dropped"], so a large read
+    never holds more than the window and the ring. The offsets of every record, kept or not, go into `offsets`."""
     records = []
+    keep_from = ring = None
+    if tail is not None:
+        keep_from = int(tail.get("keep_from") or 0)
+        ring = tail["ring"] = collections.deque(maxlen=max(0, int(tail.get("keep_last") or 0)))
+        tail["dropped"] = 0
+        if not ring.maxlen:
+            ring = None
     seen = 0                                              # bytes iterated so far, complete lines and the trailing partial alike
     consumed = 0                                          # bytes of complete lines: what the next read resumes after
     remaining = limit
@@ -1989,11 +2006,358 @@ def _scan_jsonl_stream(fh, base_offset, offsets=None, limit=None):
                 continue
             if _GC_UNTRACK_ON:
                 _gc_untrack_json(rec)                     # out of the cyclic collector's walk while it is hot (see _gc_untrack_json)
-            records.append(rec)
+            if keep_from is not None and base_offset + at < keep_from:
+                tail["dropped"] += 1                      # before the window: indexed, not kept (the ring holds the newest few)
+                if ring is not None:
+                    ring.append(rec)
+            else:
+                records.append(rec)
             if offsets is not None:
                 offsets.append(base_offset + at); offsets.append(len(piece))
         consumed = seen
     return records, base_offset + consumed, seen
+
+
+# ───────────────────────── tail-only entries for large files (2026-10-07) ─────────────────────────
+# The record cache held every live transcript WHOLE: about 3 bytes of memory per file byte, so 23 live transcripts of 0.7
+# to 1.9 GiB (20.2 GiB on disk) weighed about 61 GiB against a 64 GiB budget and the kernel reached 85 to 92 GB resident
+# within hours of each restart. The comment above RECORD_CACHE_BUDGET_FLOOR_BYTES named the remedy: a working set past the
+# cap is not a budget problem; hold a large transcript's tail only.
+#
+# The rule. A file whose held span (the bytes from its first held record to the consumed end) reaches _TAIL_MIN_FILE_BYTES
+# keeps in memory only its newest records: the last _TAIL_BYTES of the file or the last _TAIL_RECORDS records, whichever
+# holds more. Every record before that window stays INDEXED (its byte offset and length, 16 bytes a record, the array the
+# entry always carried as ent[7]) but not decoded. The entry's records field is then a _TailRecords: a read-only sequence
+# of the SAME length, indexing and order as the whole list it replaces, which serves a record inside the window from
+# memory and one before it by reading its bytes off disk (one seek-read, or a sequential streaming pass for a run of them,
+# freeing each record as the caller moves on). Nothing about the entry's shape changes: base, gen, the offsets and the
+# count are exactly a whole read's, so every consumer (the folds and their cursors, the checkpoint writer, the assembly's
+# gates and its whole parse, the chat build) sees the complete record list and no consumer can get a truncated view.
+#
+# The window follows appends: each append adds its records to the window, and once the window holds more than one and a half
+# times _TAIL_BYTES it slides forward to _TAIL_BYTES (the hysteresis keeps the hot list from being re-cut on every append).
+# A from-zero read of a large file never builds the whole list either: the scan decodes every line (the record count and
+# the offsets must be the reference scanner's exactly), keeps the ones inside the window and a ring of the last
+# _TAIL_RECORDS before it, and drops the rest as it goes, so the read peaks at the window plus one line.
+#
+# What reads before the window. A fold whose cursor stands inside the window (every fold the pusher runs every cycle, on
+# a file whose entry stays put) steps appended records from memory. A refold from record 0 (a fold with no cursor and no
+# state to restore, bgAll after a drop) streams the file once and frees as it goes. The assembly's whole parse ingests
+# every record into its adapter, as it always did; its records come off disk instead of out of the cache. Chat scroll-back
+# reads the atoms the assembly built (or the lazy pre-cut atoms an assembly checkpoint restored), never the record cache.
+# Every such read is counted under /perf recordCache.coldReads by the caller that asked (the first frame outside this
+# module), so a consumer that turned a cached walk into a disk walk shows up by name rather than as unexplained CPU.
+#
+# Correctness of a read before the window rests on the file being the one the entry indexed: transcripts are append-only,
+# and each pass that reads before the window first verifies the entry's witness (the up-to-64 bytes before its consumed
+# offset, the reader's own guard) on disk. A file rewritten since the read fails that check and the read raises
+# TailRecordsRead naming the path: loud, never a wrong record (the next read of the file through the reader sees the
+# rewrite and re-reads it, as before). ROMP_RECORD_CACHE_TAIL_MB=0 turns the rule off: every entry whole, as before.
+_TAIL_BYTES = int(float(os.environ.get("ROMP_RECORD_CACHE_TAIL_MB", "32")) * 1024 * 1024)
+_TAIL_RECORDS = int(os.environ.get("ROMP_RECORD_CACHE_TAIL_RECORDS", "2000") or 0)
+_TAIL_MIN_FILE_BYTES = 2 * _TAIL_BYTES            # a file whose held span is under this is held whole (no window)
+_TAIL_SLIDE_FACTOR = 1.5                          # the window slides once it holds this many times _TAIL_BYTES
+_COLD_CHUNK_BYTES = 4 * 1024 * 1024               # a streaming pass reads before the window in runs of about this many bytes
+_COLD_STATS = {"passes": 0, "records": 0, "bytes": 0, "byCaller": {}, "rewrites": 0}   # /perf recordCache.coldReads
+_COLD_STATS_LOCK = threading.Lock()
+
+
+def tail_rule_on():
+    """Whether large files are held tail-only (ROMP_RECORD_CACHE_TAIL_MB above 0)."""
+    return _TAIL_BYTES > 0
+
+
+class TailRecordsRead(RuntimeError):
+    """A record before a tail-only entry's window was asked for and the file no longer holds the bytes the entry indexed
+    (it was rewritten since the read): raised, never answered with a wrong record."""
+
+
+def _caller_outside_module():
+    """The first frame's function name outside this module, past the whole-read passthrough family and synthetic scopes
+    (the attribution the whole-read row uses), or "?"."""
+    try:
+        fr = sys._getframe(2)
+        while fr is not None and (fr.f_code.co_filename == __file__ or fr.f_code in _WHOLE_READ_PASSTHROUGH
+                                  or _synthetic_scope(fr)):
+            fr = fr.f_back
+        return fr.f_code.co_name if fr is not None else "?"
+    except Exception:
+        return "?"
+
+
+def _count_cold(who, nrec, nbytes, passes=1):
+    with _COLD_STATS_LOCK:
+        _COLD_STATS["passes"] += passes; _COLD_STATS["records"] += nrec; _COLD_STATS["bytes"] += nbytes
+        row = _COLD_STATS["byCaller"].setdefault(who, {"passes": 0, "records": 0, "bytes": 0})
+        row["passes"] += passes; row["records"] += nrec; row["bytes"] += nbytes
+
+
+def cold_read_stats():
+    """recordCache.coldReads for /perf: the passes that read records before a tail-only entry's window, their records and
+    bytes, per caller, and the rewrites they refused."""
+    with _COLD_STATS_LOCK:
+        out = {k: v for k, v in _COLD_STATS.items() if k != "byCaller"}
+        out["byCaller"] = {k: dict(v) for k, v in _COLD_STATS["byCaller"].items()}
+        return out
+
+
+class _TailRecords:
+    """The records of a large file whose cache entry holds only its newest records (see the block above): a read-only
+    sequence with the whole list's length, indexing, slicing and iteration. Index i is the file's record base + i, as in
+    any entry. `offs` holds (byte offset, byte length) for EVERY record from index 0 (the entry's ent[7]); the first
+    `ncold` are read from disk on demand, the rest are `hot`, a plain list in memory. `guard_off` and `guard` are the
+    entry's witness (its consumed offset and the bytes before it), verified on disk before any read before the window.
+
+    Deliberately not a list subclass: the C json encoder and other C fast paths read a list subclass's storage directly,
+    which here would be the window alone, a silent truncation. A caller that needs a real list fails loudly instead.
+    Immutable once built, like every list the reader serves (the reader builds a new one per append)."""
+    __slots__ = ("path", "offs", "ncold", "hot", "guard_off", "guard", "__weakref__")
+
+    def __init__(self, path, offs, ncold, hot, guard_off, guard):
+        self.path = path
+        self.offs = offs
+        self.ncold = int(ncold)
+        self.hot = hot
+        self.guard_off = int(guard_off)
+        self.guard = bytes(guard)
+
+    def __len__(self):
+        return self.ncold + len(self.hot)
+
+    def __bool__(self):
+        return self.ncold > 0 or bool(self.hot)
+
+    def __repr__(self):
+        return "<tail records of %s: %d before the window, %d in memory>" % (self.path, self.ncold, len(self.hot))
+
+    def hot_offset(self):
+        """The byte offset of the first record held in memory (the consumed end when the window is empty)."""
+        return int(self.offs[2 * self.ncold]) if self.hot else self.guard_off
+
+    def __getitem__(self, i):
+        n = self.ncold + len(self.hot)
+        if isinstance(i, slice):
+            start, stop, step = i.indices(n)
+            if step != 1:
+                return [self[j] for j in range(start, stop, step)]   # never asked of the reader's lists; correct if it is
+            if stop <= start:
+                return []
+            if start >= self.ncold:
+                return self.hot[start - self.ncold:stop - self.ncold]   # inside the window: a plain list, as before
+            return _RecordsView(self, start, stop)
+        try:
+            i = i.__index__()
+        except AttributeError:
+            raise TypeError("record indices must be integers or slices, not %s" % type(i).__name__)
+        if i < 0:
+            i += n
+        if not 0 <= i < n:
+            raise IndexError("record index out of range")
+        if i >= self.ncold:
+            return self.hot[i - self.ncold]
+        return self._read_cold(i, i + 1, _caller_outside_module())[0]
+
+    def __iter__(self):
+        return self._iter_range(0, self.ncold + len(self.hot))
+
+    def __reversed__(self):
+        return self._reversed_range(0, self.ncold + len(self.hot))
+
+    def _iter_range(self, start, stop):
+        if start < self.ncold:
+            who = _caller_outside_module()
+            for batch in self._cold_batches(start, min(stop, self.ncold), who):
+                yield from batch
+                del batch
+        if stop > self.ncold:
+            yield from self.hot[max(0, start - self.ncold):stop - self.ncold]
+
+    def _reversed_range(self, start, stop):
+        if stop > self.ncold:
+            yield from reversed(self.hot[max(0, start - self.ncold):stop - self.ncold])
+        if start < self.ncold:
+            who = _caller_outside_module()
+            hi = min(stop, self.ncold)
+            while hi > start:                                  # runs of about _COLD_CHUNK_BYTES, newest first
+                lo = hi - 1
+                while lo > start and int(self.offs[2 * hi - 2]) + int(self.offs[2 * hi - 1]) - int(self.offs[2 * lo - 2]) \
+                        <= _COLD_CHUNK_BYTES:
+                    lo -= 1
+                batch = self._read_cold(lo, hi, who)
+                yield from reversed(batch)
+                del batch
+                hi = lo
+
+    def _verify(self, fh):
+        """The entry's witness on disk: the bytes before its consumed offset are the ones it captured."""
+        g = self.guard
+        if not g:
+            return True
+        fh.seek(max(0, self.guard_off - len(g)))
+        return fh.read(len(g)) == g
+
+    def _refuse(self):
+        with _COLD_STATS_LOCK:
+            _COLD_STATS["rewrites"] += 1
+        raise TailRecordsRead("%s: the file was rewritten since its records were indexed; re-read it through the reader"
+                              % self.path)
+
+    def _decode_run(self, fh, lo, hi):
+        """Records lo..hi (all before the window) from ONE contiguous read, decoded the way the scanner decoded them."""
+        offs = self.offs
+        a0 = int(offs[2 * lo])
+        a1 = int(offs[2 * hi - 2]) + int(offs[2 * hi - 1])
+        fh.seek(a0)
+        blob = fh.read(a1 - a0)
+        if len(blob) != a1 - a0:
+            self._refuse()
+        out = []
+        for j in range(lo, hi):
+            at = int(offs[2 * j]) - a0
+            piece = blob[at:at + int(offs[2 * j + 1])].strip()
+            try:
+                rec = json.loads(piece.decode("utf-8", "replace"))
+            except Exception:
+                self._refuse()                                   # it decoded when it was indexed: the bytes moved
+            out.append(rec)
+        return out, a1 - a0
+
+    def _read_cold(self, lo, hi, who):
+        with open(self.path, "rb") as fh:
+            if not self._verify(fh):
+                self._refuse()
+            out, n = self._decode_run(fh, lo, hi)
+        _count_read(self.path, n + len(self.guard))
+        _count_cold(who, hi - lo, n)
+        return out
+
+    def _cold_batches(self, lo, hi, who):
+        """Records lo..hi before the window, in runs of about _COLD_CHUNK_BYTES off one open file: the streaming pass a
+        refold or a whole parse takes. Each run is handed over and released before the next is read."""
+        if hi <= lo:
+            return
+        nrec = nbytes = 0
+        try:
+            with open(self.path, "rb") as fh:
+                if not self._verify(fh):
+                    self._refuse()
+                nbytes += len(self.guard)
+                offs = self.offs
+                j = lo
+                while j < hi:
+                    k = j + 1
+                    a0 = int(offs[2 * j])
+                    while k < hi and int(offs[2 * k]) + int(offs[2 * k + 1]) - a0 <= _COLD_CHUNK_BYTES:
+                        k += 1
+                    batch, n = self._decode_run(fh, j, k)
+                    nrec += k - j; nbytes += n
+                    yield batch
+                    j = k
+        finally:
+            _count_read(self.path, nbytes)
+            _count_cold(who, nrec, nbytes)
+
+
+class _RecordsView:
+    """A slice of a _TailRecords that starts before its window (records start..stop): iterable as many times as asked, each
+    iteration a streaming pass, never a list of every record. Indexing and slicing answer as the slice of a list would."""
+    __slots__ = ("parent", "start", "stop")
+
+    def __init__(self, parent, start, stop):
+        self.parent, self.start, self.stop = parent, int(start), int(stop)
+
+    def __len__(self):
+        return self.stop - self.start
+
+    def __bool__(self):
+        return self.stop > self.start
+
+    def __repr__(self):
+        return "<records %d..%d of %r>" % (self.start, self.stop, self.parent)
+
+    def __iter__(self):
+        return self.parent._iter_range(self.start, self.stop)
+
+    def __reversed__(self):
+        return self.parent._reversed_range(self.start, self.stop)
+
+    def __getitem__(self, i):
+        n = self.stop - self.start
+        if isinstance(i, slice):
+            start, stop, step = i.indices(n)
+            if step != 1:
+                return [self[j] for j in range(start, stop, step)]
+            return self.parent[self.start + start:self.start + max(start, stop)]
+        i = i.__index__()
+        if i < 0:
+            i += n
+        if not 0 <= i < n:
+            raise IndexError("record index out of range")
+        return self.parent[self.start + i]
+
+
+def _window_start(offs, total, end, ncold):
+    """The first record index the window keeps for a file of `total` records ending (consumed) at byte `end`: the records
+    inside the last _TAIL_BYTES, or the last _TAIL_RECORDS, whichever is more, never before `ncold` (a window only moves
+    forward) and always at least the last record."""
+    lo, hi = ncold, total                                 # the smallest i with end - offs[2i] <= _TAIL_BYTES (binary search)
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if end - int(offs[2 * mid]) <= _TAIL_BYTES:
+            hi = mid
+        else:
+            lo = mid + 1
+    i_bytes = lo
+    i = min(i_bytes, max(0, total - max(1, _TAIL_RECORDS)))
+    return max(ncold, min(i, max(0, total - 1)))
+
+
+def _tail_shape(path, offs, ncold, hot, end, guard, force=False):
+    """The records field for an entry holding `ncold` records before the window and `hot` in memory, with every record's
+    offsets in `offs`, consumed to `end` with witness `guard`: the window slid when it has grown past _TAIL_SLIDE_FACTOR
+    times _TAIL_BYTES (or `force`, a list converting to a window), a plain list when nothing lies before it, else a
+    _TailRecords. A held span under _TAIL_MIN_FILE_BYTES, or the rule off, is never windowed."""
+    total = ncold + len(hot)
+    if _TAIL_BYTES > 0 and total and hot:
+        hot_bytes = end - int(offs[2 * ncold])
+        span = end - int(offs[0])
+        if span >= _TAIL_MIN_FILE_BYTES and (force or hot_bytes > _TAIL_SLIDE_FACTOR * _TAIL_BYTES):
+            w = _window_start(offs, total, end, ncold)
+            if w > ncold:
+                hot = hot[w - ncold:]
+                ncold = w
+    if ncold <= 0:
+        return hot
+    return _TailRecords(path, offs, ncold, hot, end, guard)
+
+
+def _tail_scan_info(size, span_start):
+    """The scan's tail mode for a read that will leave an entry holding records from byte `span_start` of a file of `size`
+    bytes: None when the rule is off or the held span stays under _TAIL_MIN_FILE_BYTES (held whole), else the window's
+    start byte and the record floor (_scan_jsonl_stream's `tail`)."""
+    if _TAIL_BYTES <= 0 or size - int(span_start) < _TAIL_MIN_FILE_BYTES:
+        return None
+    return {"keep_from": max(0, int(size) - _TAIL_BYTES), "keep_last": _TAIL_RECORDS}
+
+
+def _tail_combine(old, new, tinfo):
+    """(ncold, hot) for an entry whose earlier records were `old` (a list, a _TailRecords or []) and whose read just scanned
+    `new` under tail mode `tinfo`: what the scan dropped before the window makes every earlier record cold too, less the
+    newest dropped ones the ring gives back to keep _TAIL_RECORDS in memory. A NEW hot list; neither input is touched."""
+    if type(old) is _TailRecords:
+        oc, oh = old.ncold, old.hot
+    else:
+        oc, oh = 0, (old or [])
+    dropped = int(tinfo.get("dropped") or 0) if tinfo else 0
+    if not dropped:
+        return oc, ((oh + new) if oh else new)
+    ring = list(tinfo.get("ring") or ())
+    need = max(0, _TAIL_RECORDS - len(new))
+    fill = ring[len(ring) - min(need, len(ring)):] if need else []
+    nd = dropped - len(fill)
+    if nd <= 0:                                           # the ring held every dropped record: nothing left the window
+        return oc, oh + fill + new
+    return oc + len(oh) + nd, fill + new
 
 
 def _entry_offsets_gen(path):
@@ -2170,6 +2534,7 @@ def _read_jsonl_entry_unlocked(path, on_fail=None, tail_ok=False, tail_from=None
                                                                     and (st.st_mtime == hit[0] or tail_from is not None)))
             unchanged_tail = (hit is not None and not tail_ok and hit[5] > 0 and st.st_size == hit[1]
                               and st.st_mtime == hit[0])            # a whole reader meets an unchanged tail entry
+            ncold, tinfo = 0, None                        # records before the tail-only window, and the scan's tail mode
             if grown or unchanged_tail:
                 _, _, offset, tail, records, base0, gen0 = hit[:7]
                 fh.seek(max(0, offset - len(tail)))
@@ -2177,19 +2542,23 @@ def _read_jsonl_entry_unlocked(path, on_fail=None, tail_ok=False, tail_from=None
                 if fh.read(len(tail)) == tail:            # the file really is our cached prefix + more
                     if tail_ok or base0 == 0:
                         offs = array.array("q", hit[7]) if len(hit) > 7 else array.array("q")
-                        new, offset, nread = _scan_jsonl_stream(fh, offset, offs, limit=max(0, st.st_size - fh.tell()))   # the appended lines, one at a time
+                        tinfo = _tail_scan_info(st.st_size, int(offs[0]) if offs else offset)
+                        new, offset, nread = _scan_jsonl_stream(fh, offset, offs, limit=max(0, st.st_size - fh.tell()),
+                                                                tail=tinfo)   # the appended lines, one at a time
                         _count_read(path, nread)
-                        records = (records + new) if records else new   # a NEW list — never extend the served one in place
+                        ncold, records = _tail_combine(records, new, tinfo)   # a NEW list — never extend the served one in place
                         base, gen, done = base0, gen0, True
                         kind = "restore" if restored is not None else "grown"
                         if restored is not None and tail_from is None:
                             with _CKPT_LOCK:
                                 _CKPT_STATS["restored"] += 1
-                    else:                                 # a whole reader over a tail entry: the whole file, same gen
-                        fh.seek(0)
+                    else:                                 # a whole reader over a tail entry: the whole file, same gen (a large
+                        fh.seek(0)                        #  file tail-only: every record indexed, the window kept)
                         offs = array.array("q")
-                        records, offset, nread = _scan_jsonl_stream(fh, 0, offs, limit=st.st_size)
+                        tinfo = _tail_scan_info(st.st_size, 0)
+                        records, offset, nread = _scan_jsonl_stream(fh, 0, offs, limit=st.st_size, tail=tinfo)
                         _count_read(path, nread)
+                        ncold, records = _tail_combine([], records, tinfo)
                         base, gen, done, kind = 0, gen0, True, "upgrade"
                 else:
                     kind = "guard"                        # prefix changed → a rewrite → full re-read, a fresh generation
@@ -2202,13 +2571,16 @@ def _read_jsonl_entry_unlocked(path, on_fail=None, tail_ok=False, tail_from=None
             if not done:
                 fh.seek(0)
                 offs = array.array("q")
-                records, offset, nread = _scan_jsonl_stream(fh, 0, offs, limit=st.st_size)   # line by line, to the size the stat saw
+                tinfo = _tail_scan_info(st.st_size, 0)    # a large file: decoded line by line, only the window kept
+                records, offset, nread = _scan_jsonl_stream(fh, 0, offs, limit=st.st_size, tail=tinfo)   # line by line, to the size the stat saw
                 _count_read(path, nread)
+                ncold, records = _tail_combine([], records, tinfo)
                 base, gen = 0, _next_gen()                # a from-zero read: a generation no cursor of this path can hold
             tail_from = max(0, offset - _JSONL_TAIL_GUARD)
             fh.seek(tail_from)
             tail = fh.read(offset - tail_from)
             _count_read(path, len(tail))                  # the guard capture is a read too (/perf's count is what was pulled)
+            records = _tail_shape(path, offs, ncold, records, offset, tail)   # a plain list, or the window over the indexed file
             if kind in _WHOLE_READ_KINDS:                 # a whole read: counted by kind and caller on /perf (T384), always on; the
                 try:                                      #  frame walk runs only here, on the rare whole read, never on a tail or an
                     fr = sys._getframe(1)                 #  append
@@ -2243,8 +2615,9 @@ def _read_jsonl_entry_unlocked(path, on_fail=None, tail_ok=False, tail_from=None
         if on_fail is not None and not isinstance(e, FileNotFoundError):
             on_fail(e)
         return None
-    if _GC_UNTRACK_ON and _gc.is_tracked(records):
-        _PY_GC_UNTRACK(records)                   # the entry's outer list (a fresh list per read; its records were untracked at decode)
+    held = records.hot if type(records) is _TailRecords else records
+    if _GC_UNTRACK_ON and type(held) is list and _gc.is_tracked(held):
+        _PY_GC_UNTRACK(held)                      # the entry's outer list (a fresh list per read; its records were untracked at decode)
     ent = (st.st_mtime, st.st_size, offset, tail, records, base, gen, offs)
     with _JSONL_CACHE_LOCK:
         _cache_insert_locked(path, ent)      # the count cap and the byte budget, LRU order (hot entries survive any cold flood)
