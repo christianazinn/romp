@@ -2128,7 +2128,8 @@ class TailRecordsRead(OSError):
     """A record before a tail-only entry's window was asked for and the file no longer holds the bytes the entry indexed
     (it was rewritten since the read): raised, never answered with a wrong record. An OSError, so every handler that
     treats a failed read of the file as a failed read (the reader's own pop and on_fail, the assembly's fallback to a
-    whole parse) treats this one the same way; the next read through the reader sees the rewrite and reads afresh."""
+    whole parse) treats this one the same way. Raising it drops the reader's cached entry of the same generation
+    (_TailRecords._drop_entry), so the next read through the reader reads the file afresh even when its stat did not move."""
 
 
 def _caller_outside_module():
@@ -2171,10 +2172,12 @@ class _TailRecords:
     Deliberately not a list subclass: the C json encoder and other C fast paths read a list subclass's storage directly,
     which here would be the window alone, a silent truncation. A caller that needs a real list fails loudly instead.
     Immutable once built, like every list the reader serves (the reader builds a new one per append)."""
-    __slots__ = ("path", "offs", "ncold", "hot", "guard_off", "guard", "crcs", "ident", "skel", "__weakref__")
+    __slots__ = ("path", "offs", "ncold", "hot", "guard_off", "guard", "crcs", "ident", "skel", "gen", "__weakref__")
 
     def __init__(self, path, offs, ncold, hot, guard_off, guard, crcs, ident):
         self.skel = None                                  # the walk skeletons of records 0..ncold (see _skel), or None
+        self.gen = None                                   # the reader's generation for the entry (set by the reader): _refuse drops
+        #                                                   the cached entry of the same generation, the lineage that indexed it
         self.path = path
         self.offs = offs
         self.ncold = int(ncold)
@@ -2267,8 +2270,27 @@ class _TailRecords:
     def _refuse(self):
         with _COLD_STATS_LOCK:
             _COLD_STATS["rewrites"] += 1
+        self._drop_entry()
         raise TailRecordsRead("%s: the file was rewritten since its records were indexed; re-read it through the reader"
                               % self.path)
+
+    def _drop_entry(self):
+        """Pop the reader's cached entry for this path when it is of this view's generation (this view, or a later append
+        of the same lineage, which carried the same CRCs forward), so the next read re-reads the file from zero under a
+        fresh generation instead of raising again until a restart (review find, 2026-10-07: a byte-identical copy restored
+        with its mtime, or a same-length edit followed by an append, left the entry refusing on every read). An entry
+        another reader already re-read (a fresh generation) is left alone. Bounded wait on the cache lock: a refusal never
+        hangs a reader."""
+        if self.gen is None or not _JSONL_CACHE_LOCK.acquire(timeout=2.0):
+            return
+        try:
+            ent = _JSONL_CACHE.get(self.path)
+            if ent is not None and ent[6] == self.gen:
+                _cache_pop_locked(self.path)
+                with _COLD_STATS_LOCK:
+                    _COLD_STATS["dropped"] = _COLD_STATS.get("dropped", 0) + 1
+        finally:
+            _JSONL_CACHE_LOCK.release()
 
     def _decode_run(self, fh, lo, hi):
         """Records lo..hi (all before the window) from ONE contiguous read, decoded the way the scanner decoded them."""
@@ -3027,6 +3049,7 @@ def _read_jsonl_entry_unlocked(path, on_fail=None, tail_ok=False, tail_from=None
             records = _tail_shape(path, offs, ncold, records, offset, tail, keep_index=keep_index, crcs=crcs,
                                   fh=fh)          # a plain list, or the window over the indexed file
             if type(records) is _TailRecords:     # the walk skeletons of the records before the window, from memory (see _skel)
+                records.gen = gen
                 records.skel = _skel_entry(sk_old, sk_ncold, sk_hot, tinfo.get("skel") if tinfo else None,
                                            int(tinfo.get("dropped") or 0) if tinfo else 0, sk_start, records)
             if kind in _WHOLE_READ_KINDS:                 # a whole read: counted by kind and caller on /perf (T384), always on; the

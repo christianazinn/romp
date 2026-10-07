@@ -3463,7 +3463,9 @@ every record.
   checks each record's CRC before decoding it. A file rewritten, replaced or
   edited in place since it was indexed (even at equal length with its last bytes
   unchanged) raises an error naming the path (an OSError) instead of serving a
-  wrong record, and the next read through the reader reads it afresh. A
+  wrong record; the refusal drops the cached entry of that generation, so the
+  next read through the reader reads it afresh even when the file's size and
+  modification time did not change (counted under `coldReads.dropped`). A
   transcript that grows past the threshold in one kernel life has no CRCs for
   the records it held whole: their bytes are read once and each must decode to
   the record in memory before its CRC is taken, or the entry stays whole.

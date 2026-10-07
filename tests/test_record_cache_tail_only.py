@@ -921,3 +921,61 @@ class RewindHoldReadsNothingBeforeTheWindow(Base):
             km._rewind_kept_memo.clear()
             self.assertIsNotNone(km._rewind_kept_uuids(SID))
             self.assertEqual(cold_records() - c0, 0, "the walk after the take read nothing before the window")
+
+
+class ARefusedReadDropsItsEntry(Base):
+    """A refusal drops the reader's entry of its generation (review find, 2026-10-07): before, nothing removed it, so a file
+    replaced by a byte-identical copy that kept its mtime, or edited in place at equal length and then appended to, raised
+    TailRecordsRead on every read (folds, parses, walks) until the entry was evicted or the kernel restarted."""
+    _read = TheWindow._read
+    _edit_in_place = TheWindow._edit_in_place
+
+    def test_a_copy_restored_with_its_mtime_raises_once_then_reads_afresh(self):
+        with knobs(32 * 1024, 4, roots=[str(self.proj)]):
+            path = self.leaf()
+            write_transcript(path, 300 * 1024)
+            ent = self._read(path)
+            self.assertTrue(_tail(ent[4]))
+            st = os.stat(path)
+            tmp = path + ".tmp"
+            shutil.copy2(path, tmp)                                        # the same bytes and mtime (cp -p, rsync -a)
+            os.replace(tmp, path)
+            os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns))
+            self.assertIs(self._read(path), ent, "same mtime and size: the reader serves the held entry")
+            with self.assertRaises(em.TailRecordsRead):
+                list(em.FileAdapter([path], path)._src[path])
+            again = self._read(path)
+            self.assertIsNot(again, ent, "the refusal dropped the entry: the next read re-read the file")
+            self.assertNotEqual(again[6], ent[6], "under a fresh generation")
+            self.assertEqual(list(again[4]), plain(path))
+            self.assertEqual(len(em.FileAdapter([path], path).by_uuid), len({r["uuid"] for r in plain(path)}))
+
+    def test_an_edit_then_an_append_raises_once_then_reads_afresh(self):
+        with knobs(32 * 1024, 4, roots=[str(self.proj)]):
+            path = self.leaf()
+            _, nxt = write_transcript(path, 300 * 1024)
+            ent = self._read(path)
+            j = next(i for i in range(ent[4].ncold) if i % 4 == 1)
+            st = os.stat(path)
+            self._edit_in_place(path, j)
+            os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns))            # the edit itself goes unseen by the stat
+            write_transcript(path, 4 * 1024, start=nxt, mode="a")          # an append before the next stat
+            grown = self._read(path)
+            self.assertEqual(grown[6], ent[6], "the reader took it as an append, under the same generation")
+            with self.assertRaises(em.TailRecordsRead):
+                grown[4][j]
+            again = self._read(path)
+            self.assertNotEqual(again[6], ent[6], "the refusal dropped the entry: a fresh generation")
+            self.assertEqual(list(again[4]), plain(path), "the re-read serves the file as it now is, every record")
+
+    def test_a_refusal_leaves_an_entry_another_reader_already_re_read(self):
+        with knobs(32 * 1024, 4, roots=[str(self.proj)]):
+            path = self.leaf()
+            write_transcript(path, 300 * 1024)
+            held = self._read(path)[4]
+            j = next(i for i in range(held.ncold) if i % 4 == 1)
+            self._edit_in_place(path, j)
+            fresh_ent = self._read(path)                                   # a new mtime: re-read, a fresh generation
+            with self.assertRaises(em.TailRecordsRead):
+                held[j]
+            self.assertIs(self._read(path), fresh_ent, "the fresh entry stands")
