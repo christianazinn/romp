@@ -76,7 +76,10 @@ about every 2 h and stretching, the tracked heap back on the no-fix curve by 9.7
 anything is frozen, a cleanup is also owed `full_cleanup_max_s` (ROMP_GC_FREEZE_CLEANUP_MAX_S, default 3000 s) after the
 last cleanup (or the first freeze), its owed clock starting at that moment; with the forced path that is at most an hour
 under sustained load. A lower ratio would still scale with the walk; a reference taken from the cheap collections would owe
-a whole-heap walk every few minutes. The cap costs one whole-heap walk per interval and nothing else. The third collection
+a whole-heap walk every few minutes. The cap costs one whole-heap walk per interval and nothing else. Bench (1 GB, 25
+min, one request in 5 leaving a cycle that lives 5 s, survivors growing 3% of the heap a minute; scripts/bench_gc_full_rate.py
+--cleanup-max-s): no cap, peak dead-uncollected cycles 2,092 MiB, peak RSS 4,268 MiB, 2 cleanups (longest 19.1 s), paused
+4.0% + 1.5% in cleanups; cap 300 s, 827 MiB, 2,929 MiB, 5 cleanups (longest 9.7 s), paused 4.0% + 2.6%. The third collection
 threshold is raised to `full_t2` with the freeze: once the long-lived heap is frozen, a full collection is cheap but
 CPython's quarter rule no longer holds it back (the long-lived total it divides is the small unfrozen part), so the
 generation-1 count gate is what bounds the rate. `ROMP_GC_FREEZE_FULL_MS=off` (or 0) restores the
