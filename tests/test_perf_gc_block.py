@@ -60,7 +60,7 @@ FREEZE_KEYS = {"enabled", "active", "loadTrees", "backstopFoldins", "freezes", "
                # the full-collection freeze (2026-10-07)
                "fullFreezeMs", "fullFreezes", "fullT2", "fullSinceReclaim", "fullBackstopRatio", "fullMsSinceReclaim",
                "fullRefMs", "lastFullMs", "callbackErrors", "fullFreezeSkips", "fullForceS", "forced", "owedForS",
-               "reclaimSkips", "frozenAsOfCleanup", "frozenAsOfCleanupAt"}
+               "reclaimSkips", "frozenAsOfCleanup", "frozenAsOfCleanupAt", "cleanupMaxS"}
 GEN_KEYS = {"collections", "msSum", "msMax", "msLast", "collectedLast"}
 ROW_GC_KEYS = {"n0", "n1", "n2", "ms2"}
 
