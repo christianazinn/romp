@@ -45,6 +45,7 @@ EVENT_MODEL_ALLOWED = {
     # record-level helpers over jsonl rows and postal/state rows
     "_skel",                                            # a raw record's walk skeleton, built by the reader as it decodes (never lazy)
     "_hydrated_keep",                                   # the hydration memo's copy of a raw record read for a lazy atom (never an atom)
+    "_asm_record_whole",                                # the assembly gates' per-record rules over a delta's raw records (from _asm_gates)
     "_norm_message", "_content", "_text_of", "author_of", "_record_origin", "_is_tool_result", "_scan_bg_tasks", "_bg_step",
     "_bg_finish", "scan_bg_tasks_cached", "task_store_plan", "_load_postal_index", "postal_pairs", "injected_source",
     "strip_harness_preamble", "parse_teammate_message", "_absorbed", "_absorbed_atom", "_landing_t", "chain_verdicts",

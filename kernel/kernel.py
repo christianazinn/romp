@@ -13260,7 +13260,9 @@ def _converge_assembly(now, t0):
         if time.monotonic() - t0 > CKPT_CONVERGE_MS / 1000.0:   #  hours, left every older idle leaf out: 19 of the 25 boundary leaves
             break                                          #  without a document on the devbox); the cycle's wall: the rest wait
         try:
-            r = _converge_assembly_leaf(leaf, sid, t0, flags=flags, floor=not tried)
+            r = _converge_assembly_leaf(leaf, sid, t0, flags=flags, floor=not tried and leaf in _ASM_CONVERGE_OWED)
+            #                                                the floor (a cycle alone, over the budget) is an OWED leaf's: one the budget
+            #                                                deferred on an earlier pass, so a write over the budget still waits a cycle
         except Exception:                                  # one leaf's raise (a stat, a backend hook) leaves the rest their turn
             sys.stderr.write("assembly converge: %s\n" % traceback.format_exc()); continue
         if r is None:
