@@ -13083,6 +13083,25 @@ def _stored_tree_under(path, sid, human):
     return hit[1] if hit else None
 
 
+def _asm_reseat_after_write(leaf, sid, human):
+    """After an assembly document was written for `leaf`: when the event model released the session's whole entry at the
+    write (a tail-only leaf, em.asm_reseat_due), the parse store's trees over the leaf go too, and the leaf is parsed again
+    at once, a restore from the document just written (2026-10-08). Those trees were built from the whole entry, so each held
+    every body of the transcript; an idle leaf's tree was served for the life of the process (the store keys on the file's
+    stat), keeping the released entry's records alive whatever the record cache counted. The re-parse fills the store
+    again, so the feed's cache-only read (_parse_cached) never meets an empty slot."""
+    try:
+        if not em.asm_reseat_due(leaf, sid, human):
+            return False
+        jd.parse_cache_drop_leaf(str(leaf))
+        _BG_TOPS_CACHE.pop(str(sid), None)                 # its pinned parse is the dropped tree (identity is its version)
+        _parse(leaf, sid, time.time())
+        return True
+    except Exception:
+        sys.stderr.write("assembly re-seat: %s\n" % traceback.format_exc())
+        return False
+
+
 def _stored_tree(path, sid):
     """The parse store's tree for a session's leaf when it holds one (the kernel's display parse under its own human flag,
     else the judges'), never a parse of its own: the assembly writer takes it for the document's turns section (T323
@@ -13300,6 +13319,7 @@ def _converge_assembly_leaf(key, sid, t0, flags=None):
             size = 0
         em.asm_converge_stat("writes"); em.asm_converge_stat("bytes", size); em.checkpoint_cycle_charge(size - est)
         _ASM_CONVERGE_DONE[key] = st
+        _asm_reseat_after_write(key, sid, human)
         return True
     em.checkpoint_cycle_charge(-est)                       # nothing written: the take goes back
     reason = reasons[-1] if reasons else "failed"          # the writer's own reason (round one, low 6)
@@ -13415,6 +13435,7 @@ def _persist_checkpoints(now):
         try:                                   # the assembly document for the leaf (T323 stage 4a): from a whole entry
             if em.asm_checkpoint_write(leaf, sid, _display_sdk_human(sid), tree=_stored_tree(leaf, sid)):   # with a compaction
                 written += 1                   #  boundary, else a counted skip; the store's tree, when it holds one, gives the
+                _asm_reseat_after_write(leaf, sid, _display_sdk_human(sid))
         #                                          document its turns section (T323 stage 4c: a restore builds the turns without an
         #                                          atom); never a parse of its own (the settle reads no leaf whole)
         except Exception:

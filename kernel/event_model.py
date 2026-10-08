@@ -2126,6 +2126,101 @@ def tail_rule_on():
     return _TAIL_BYTES > 0
 
 
+# ───── the window pinned to a restored assembly entry's cut (2026-10-08) ─────
+# A restored assembly entry (_asm_restore) parses its leaf from the document's cut: its adapter ingests, and holds by uuid, every
+# record past the cut, and every restore after a demotion reads that span again. Where the span reaches back before the record
+# window, each of those reads went to disk record by record (coldReads), and the adapter held a private copy of what it read. So
+# while such an entry stands, the window of its leaf never starts after the cut: a read keeps every record from the cut on
+# (_tail_scan_info) and an append never slides past it (_tail_shape). The records the window keeps are the very dicts the adapter
+# holds, so the pin costs the uuid-less records and nothing else, and the churn bound (_restore_bounded) keeps the span under
+# its share of the pre-cut bytes. The pin is owned by a token the entry holds (entry["pin"]): released with the entry
+# (_asm_release), and gone with it if the entry is dropped by any other road (the registry holds the token weakly).
+_TAIL_PINS = {}                   # str(path) -> tuple of (weakref to a pin token, byte offset): replaced whole on every change
+_TAIL_PINS_LOCK = threading.Lock()
+
+
+class _PinToken:
+    """What a restored assembly entry holds for its window pin (see the block above); weakly referenced by the registry."""
+    __slots__ = ("path", "off", "__weakref__")
+
+    def __init__(self, path, off):
+        self.path, self.off = path, int(off)
+
+
+def _tail_pin(path):
+    """The byte offset before which `path`'s record window may not start, or None: the earliest cut among the live restored
+    entries over it."""
+    pins = _TAIL_PINS.get(str(path))
+    if not pins:
+        return None
+    live = [off for ref, off in pins if ref() is not None]
+    return min(live) if live else None
+
+
+def _tail_pin_set(path, off):
+    """Pin `path`'s window at byte `off`; returns the token the caller's entry holds."""
+    tok = _PinToken(str(path), off)
+    with _TAIL_PINS_LOCK:
+        keep = tuple(x for x in _TAIL_PINS.get(tok.path, ()) if x[0]() is not None)
+        _TAIL_PINS[tok.path] = keep + ((weakref.ref(tok), tok.off),)
+    return tok
+
+
+def _tail_pin_clear(tok):
+    """Release the pin `tok` holds (a no-op for None or a pin already gone)."""
+    if tok is None:
+        return
+    with _TAIL_PINS_LOCK:
+        keep = tuple(x for x in _TAIL_PINS.get(tok.path, ()) if x[0]() is not None and x[0]() is not tok)
+        if keep:
+            _TAIL_PINS[tok.path] = keep
+        else:
+            _TAIL_PINS.pop(tok.path, None)
+
+
+def _widen_entry_to(path, off):
+    """Bring a tail-only record entry's window back to byte `off` (a pin just set, _tail_pin) when the window had already slid
+    past it: the records between are read off disk ONCE (counted under coldReads by the caller, as any read before a window)
+    and the entry is re-inserted holding them, so every later restore and refold over the pinned span reads memory. Same
+    generation, offsets, CRCs and witness: only the window's start moves back. A no-op when there is no tail-only entry, the
+    window already reaches `off`, or the entry changed meanwhile. Returns the records brought back."""
+    path = str(path)
+    with _read_stripe(path):
+        with _JSONL_CACHE_LOCK:
+            ent = _JSONL_CACHE.get(path)
+        if ent is None or type(ent[4]) is not _TailRecords:
+            return 0
+        recs = ent[4]
+        i = _first_within(recs.offs, 0, recs.ncold, recs.guard_off, max(0, recs.guard_off - int(off)))
+        if i >= recs.ncold or i <= 0:
+            return 0                                      # the window reaches the pin already (or the pin is the file's start)
+        try:
+            gap = recs._read_cold(i, recs.ncold, _caller_outside_module())
+        except OSError:
+            return 0                                      # a refused read drops the entry itself (TailRecordsRead): nothing to widen
+        new = _TailRecords(path, recs.offs, i, gap + list(recs.hot), recs.guard_off, recs.guard, recs.crcs, recs.ident)
+        new.gen = recs.gen
+        if recs.skel is not None:
+            new.skel = recs.skel[:i]
+            new.skel_bytes = max(0, int(recs.skel_bytes) - sum(_skel_bytes(x) for x in recs.skel[i:recs.ncold]))
+            if _GC_UNTRACK_ON and _gc.is_tracked(new.skel):
+                _PY_GC_UNTRACK(new.skel)
+        if _GC_UNTRACK_ON and _gc.is_tracked(new.hot):
+            _PY_GC_UNTRACK(new.hot)
+        with _JSONL_CACHE_LOCK:
+            if _JSONL_CACHE.get(path) is not ent:
+                return 0                                  # another read replaced it: that read decided the window
+            _cache_insert_locked(path, ent[:4] + (new,) + ent[5:])
+        with _COLD_STATS_LOCK:
+            _COLD_STATS["widened"] = _COLD_STATS.get("widened", 0) + (recs.ncold - i)
+        return recs.ncold - i
+
+
+def tail_pin_stats():
+    """{path: pinned offset} for every path with a live pin (/perf recordCache.tailOnly.pins counts them)."""
+    return {p: v for p in list(_TAIL_PINS) for v in (_tail_pin(p),) if v is not None}
+
+
 class TailRecordsRead(OSError):
     """A record before a tail-only entry's window was asked for and the file no longer holds the bytes the entry indexed
     (it was rewritten since the read): raised, never answered with a wrong record. An OSError, so every handler that
@@ -2801,6 +2896,9 @@ def _tail_shape(path, offs, ncold, hot, end, guard, force=False, keep_index=None
             w = _window_start(offs, total, end, ncold)
             if keep_index is not None:
                 w = max(ncold, min(w, int(keep_index)))
+            pin = _tail_pin(path)
+            if pin is not None and w > ncold:             # never past a restored assembly entry's cut (_tail_pin)
+                w = max(ncold, min(w, _first_within(offs, ncold, total, end, max(0, end - pin))))
             if w > ncold:
                 have = len(crcs) if crcs is not None else 0
                 if have < total:                          # a first conversion: the records held whole have no CRCs yet
@@ -2837,6 +2935,9 @@ def _tail_scan_info(path, size, span_start, append_from=None, held_tail=False):
     keep_from = max(0, int(size) - _TAIL_BYTES)
     if append_from is not None and int(size) - int(append_from) <= _TAIL_MIN_FILE_BYTES:
         keep_from = min(keep_from, int(append_from))
+    pin = _tail_pin(path)
+    if pin is not None and pin >= int(span_start):
+        keep_from = min(keep_from, pin)               # a restored assembly entry's cut: kept from there on (_tail_pin)
     return {"keep_from": keep_from, "keep_last": _TAIL_RECORDS,
             "ring_from": max(0, int(size) - _TAIL_MIN_FILE_BYTES)}   # the floor's reach (see _window_start): the ring's too
 
@@ -6049,6 +6150,29 @@ _ASM_KEYLOCKS = {}                 # key -> Lock; never pruned (a Lock is tiny, 
 #                                    key's lock mid-flight would let two folds interleave)
 _ASM_STATS = {"full": 0, "fold": 0, "serve": 0, "restore": 0, "bypass": 0, "fallback": 0}   # observability + tests (restore
 #                                                                                             seeded: a row without it means zero)
+_ASM_RESEAT_DUE = {}               # key -> True: a whole entry asm_checkpoint_write released after writing its document (a
+#                                    tail-only leaf, _asm_release_at_write): the next parse of the key restores it with the
+#                                    re-seat's churn bound, and a refusal keeps the whole parse that follows whole (as a re-seat
+#                                    the restore did not serve). Popped by that parse, or by asm_reseat_due's caller
+
+
+def _asm_release_at_write(leaf_path):
+    """Whether asm_checkpoint_write releases the whole entry it wrote a document from at once (see there): a leaf the tail-only
+    rule windows. Other leaves keep the re-seat at their next parse, as before (their entries hold what their record entries
+    hold, which the record cache counts)."""
+    return tail_rule_on() and _tail_eligible(leaf_path) and _ASM_RELEASE_AT_WRITE
+
+
+_ASM_RELEASE_AT_WRITE = os.environ.get("ROMP_ASM_RELEASE_AT_WRITE", "1") != "0"
+
+
+def asm_reseat_due(leaf_path, rompuuid, sdk_human=False):
+    """Whether asm_checkpoint_write released this session's whole entry over `leaf_path` after its last write (and no parse
+    has restored it yet): the caller then drops the parse store's trees over the leaf, which hold the released entry's
+    bodies, and re-parses (a restore from the document just written)."""
+    key = (os.path.realpath(str(leaf_path)), str(rompuuid), bool(sdk_human))
+    with _ASM_LOCK:
+        return bool(_ASM_RESEAT_DUE.get(key))
 
 
 def _asm_stat(key, n=1):
@@ -6064,12 +6188,34 @@ _TS_REPAIRED_SEEN = set()    # record uuids already counted in ts-repair — dis
 
 
 _ASM_DEMOTE_TL = threading.local()   # the calling thread's last demotion reason: what _assemble reads to pick the road after it
+_ASM_RESTORE_AFTER_DEMOTE_TAIL = ("kept", "uuid-known", "recs-gone", "boundary", "summary", "no-leaf-slot")
+#                                   (2026-10-08) further demotions a RESTORED entry of a tail-only leaf takes to the restore road rather than
+#                                   the whole parse: for such a leaf the whole parse streams every record off disk (the deploy of 2026-10-07:
+#                                   7.9 GB in 47 minutes through four routine callers' parses) and leaves a whole entry holding them. Each
+#                                   reason here is a property of the FOLD's carry (the delta cannot be absorbed into the entry in hand: a
+#                                   kept-set change under an old tail record, a uuid the graph knows, a compaction or its summary in the
+#                                   tail), and the restore does not fold: it re-parses the tail from the document's cut through a fresh
+#                                   seeded adapter, exactly the boot's restore over the same document and tail, behind the same chain
+#                                   proof (_tail_chains_onto_the_document: a compaction anchored into the pre-cut interior, a summary or a
+#                                   reused uuid parented before the cut, a re-rooted tail all refuse to the whole parse). The reasons that
+#                                   can re-classify a PRE-CUT atom (a prompt id of the twins family or an adopted boundary's, a skill link
+#                                   to an old payload, a stamp sorting before the cut) are not here: the document holds those atoms fixed,
+#                                   so only a whole parse answers them.
 _ASM_RESTORE_AFTER_DEMOTE = ("descent", "rewrite", "nonleaf", "reseat")   # the demotions the document still stands for (T402): the
 #                                   tail moved (a spur, a rewind, a fork), the leaf's record entry was replaced, a lineage file moved; the
 #                                   load's own checks refuse a document that no longer fits. `reseat` (2026-09-24) is a whole entry whose
 #                                   own document now stands (asm_checkpoint_write): re-seated on it, the folds after walk the tail alone.
 #                                   Every other reason (a new boundary or summary in the tail, a prompt id, a skill link, a stamp out of
 #                                   order, ...) keeps the whole parse.
+
+
+def _restore_bounded(leaf_path):
+    """Whether every restore of `leaf_path`'s entry carries the churn bound (the `reseated` flag, _asm_gates' tailShare), not
+    only a re-seat's (2026-10-08): a leaf the tail-only rule windows. Its restored entry's adapter holds every record past the
+    document's cut, and so does the record window pinned to that cut (_tail_pin), so a cut frozen for the life of the process
+    held a tail that only grew; under the bound the tail past the cut stays under the share of the pre-cut bytes and the
+    whole parse that follows the share writes the next cut."""
+    return tail_rule_on() and _tail_eligible(leaf_path)
 
 
 def _asm_demote(reason):
@@ -6099,6 +6245,8 @@ def _asm_release(entry):
     ix = entry.get("index") if entry else None
     if ix is not None:
         ix.release()
+    if entry:
+        _tail_pin_clear(entry.get("pin"))            # the window pinned to its cut slides again (_tail_pin)
 
 
 def _asm_serve(entry):
@@ -6927,6 +7075,25 @@ def asm_index_stats():
 #   resident is len(_MAT_LRU) with the entries of collected lists included until they expire at the cap (_mat_trim) or are released;
 #   released and expired are the counters those two roads bump (the LRU's weak ownership, measured 2026-09-15)
 _ASM_CKPT_CAP = 16 * 1024 * 1024   # a document past this is not written (counted): that session parses whole as today
+_ASM_CKPT_CAP_SHARE = 16           # a TAIL-ONLY leaf's cap (2026-10-08): a document up to 1/16 of its pre-cut bytes, never under
+#                                    _ASM_CKPT_CAP. A document costs about 1.3 percent of the transcript compressed (a synthetic
+#                                    403 MB leaf: 5.3 MB), so the flat cap refused every leaf past about 1.2 GB: on the devbox that
+#                                    motivated tail-only, every settle of the 0.7 to 1.9 GiB leaves skipped `oversize` (8 of 8 in
+#                                    the deploy's first hour, 162 in 11 hours on the build before), their assembly entries stayed
+#                                    WHOLE for the life of the process (every decoded record and body held, whatever the record
+#                                    cache counted) and every demotion re-read the whole leaf off disk. For such a leaf the
+#                                    alternative to a document is that whole entry and that read, so the document is the cheaper
+#                                    one up to a large fraction of the transcript; 1/16 keeps a boot's load well under the parse it
+#                                    replaces (decompressing and decoding a document is about a tenth of a whole parse per byte).
+
+
+def _asm_ckpt_cap_for(leaf_path, pre_bytes):
+    """The largest compressed document asm_checkpoint_write writes for `leaf_path` whose pre-cut lineage holds `pre_bytes`:
+    _ASM_CKPT_CAP, or for a leaf the tail-only rule windows (tail_rule_on, _tail_eligible) the larger of it and
+    pre_bytes / _ASM_CKPT_CAP_SHARE (see the constant)."""
+    if not tail_rule_on() or not _tail_eligible(leaf_path):
+        return _ASM_CKPT_CAP
+    return max(_ASM_CKPT_CAP, int(pre_bytes) // _ASM_CKPT_CAP_SHARE)
 _ASM_CKPT_STATS = {"written": 0, "restored": 0, "fallbacks": {}, "skipped": {}, "hydratedBytes": 0, "hydratedAtoms": 0,
                    "restoreMs": {"load": 0.0, "verify": 0.0, "index": 0.0, "seed": 0.0, "total": 0.0},   # the restore's parts since boot, ms
                    #                     (`total` is the whole of _asm_restore, entry to return, so the unnamed remainder, the tail's
@@ -7897,7 +8064,7 @@ def asm_checkpoint_write(leaf_path, rompuuid, sdk_human=False, tree=None, reason
         except TypeError:
             return skip("unencodable")
         data = gzip.compress(text.encode("utf-8"), compresslevel=6)   # identities and hashes compress about five to one; the
-        if len(data) > _ASM_CKPT_CAP:                                  #  bytes a boot reads are the compressed ones
+        if len(data) > _asm_ckpt_cap_for(leaf_path, cut_off_total):   #  bytes a boot reads are the compressed ones
             return skip("oversize")
         try:
             cp.parent.mkdir(parents=True, exist_ok=True)
@@ -7944,6 +8111,23 @@ def asm_checkpoint_write(leaf_path, rompuuid, sdk_human=False, tree=None, reason
         #                                                   re-seat would freeze it (review low 1); the rewrite after the heal marks it
         with _ASM_CKPT_LOCK:
             _ASM_CKPT_STATS["written"] += 1
+        if entry["reseat"] and _asm_release_at_write(leaf_path):
+            # a TAIL-ONLY leaf's whole entry is released NOW (2026-10-08), not at the next parse: an idle leaf is never parsed
+            # again (the parse store serves its tree while the file stands), so its entry kept every decoded record and body
+            # for the life of the process, outside the record cache's count (the deploy of 2026-10-07: 355 million allocations
+            # at half an hour, the whole build's count, with the cache counting a quarter). The next parse restores from this
+            # document as the re-seat would have (_assemble reads _ASM_RESEAT_DUE: the churn bound rides it); the caller drops
+            # the parse store's trees over the leaf (asm_reseat_due tells it), since those hold the same bodies
+            with _ASM_LOCK:
+                if _ASM_CACHE.get(key) is entry:
+                    _ASM_CACHE.pop(key, None)
+                    _ASM_RESEAT_DUE[key] = True
+                    released = entry
+                else:
+                    released = None
+            if released is not None:
+                _asm_release(released)
+                _asm_stat("reseat:atWrite")
         return True
 
 
@@ -8430,6 +8614,24 @@ def _asm_restore_inner(key, leaf_path, candidate_files, links, rompuuid, postal_
     if doc is None:
         return None
     asm_sidecar_refresh(leaf_path, doc)                   # an older sidecar gains the inputs list here (round one, low 2)
+    pin = None
+    f_ = (doc.get("files") or {}).get(Path(leaf_path).stem) or {}
+    if f_.get("cut") and not f_.get("skip") and tail_rule_on() and _tail_eligible(leaf_path):
+        pin = _tail_pin_set(str(Path(leaf_path)), int(f_["cut"][0]))   # before the tail's first read: kept from the cut on
+        _widen_entry_to(str(Path(leaf_path)), pin.off)    # a window that slid past the cut already comes back to it, once
+    served = None
+    try:
+        served = _asm_restore_from_doc(key, leaf_path, candidate_files, links, rompuuid, postal_index, sdk_human, reseated,
+                                       doc, pin)
+        return served
+    finally:
+        if served is None:
+            _tail_pin_clear(pin)                          # refused: nothing stands on the document, the window slides again
+
+
+def _asm_restore_from_doc(key, leaf_path, candidate_files, links, rompuuid, postal_index, sdk_human, reseated, doc, pin):
+    """_asm_restore_inner past the document's load: the restored entry served, or None (see there). `pin` is the window pin
+    the entry takes ownership of (_tail_pin), or None."""
     try:
         _t0 = time.perf_counter()
         seed, landed = _seed_from_doc(doc)
@@ -8491,7 +8693,7 @@ def _asm_restore_inner(key, leaf_path, candidate_files, links, rompuuid, postal_
                  "skipped": {f["path"]: (f["size"], f["mtime"]) for f in doc["files"].values() if f.get("skip")},
                  "docPre": sum((int(f["size"]) if f.get("skip") else int((f.get("cut") or [0])[0])) for f in doc["files"].values()),
                  "docCutOff": int(((doc["files"].get(Path(leaf_path).stem) or {}).get("cut") or [0])[0]),
-                 "path": str(leaf_path)}                   # as handed: the reader's key for the same leaf
+                 "path": str(leaf_path), "pin": pin}       # as handed: the reader's key for the same leaf; the window pin
         #        docPre: the pre-cut bytes over the lineage; docCutOff: the leaf's cut offset. The fold's gate demotes this entry
         #        to a whole parse when the tail past the cut reaches the share (tailShare), so the settle rewrites the cut
         if reseated:
@@ -8744,7 +8946,9 @@ def _assemble(leaf_path, candidate_files, links, rompuuid, postal_index, sdk_hum
                 # not fit; the tail read from the cut covers the moved leaf. The first instrumented boot (T398) paid two whole
                 # parses under g:descent inside the auto-nudge tick where a restore would have read the tail.
                 _why = getattr(_ASM_DEMOTE_TL, "reason", None)
-                if _CKPT_DIR_FN is not None and _why in _ASM_RESTORE_AFTER_DEMOTE:
+                if _CKPT_DIR_FN is not None and (_why in _ASM_RESTORE_AFTER_DEMOTE
+                                                 or (_why in _ASM_RESTORE_AFTER_DEMOTE_TAIL and entry.get("docPre") is not None
+                                                     and _tail_eligible(leaf_path) and tail_rule_on())):
                     # every restore over a document, this one and the boot's, first asks whether the tail CHAINS onto it
                     # (_tail_chains_onto_the_document); a rewind into the pre-cut interior, a /clear fork, a system spur
                     # anchored before the cut or an orphan parent refuses to the whole parse, as before (rounds one and two)
@@ -8755,7 +8959,8 @@ def _assemble(leaf_path, candidate_files, links, rompuuid, postal_index, sdk_hum
                     # share, a refused document, a postal author waiting) carries no flag and restores without the bound, as
                     # every entry did before: held to the share there, an open turn's entry would parse whole at every descent
                     served = _asm_restore(key, leaf_path, candidate_files, links, rompuuid, postal_index, sdk_human,
-                                          reseated=_why == "reseat" or bool(entry.get("reseat") or entry.get("reseated")))
+                                          reseated=_why == "reseat" or bool(entry.get("reseat") or entry.get("reseated"))
+                                          or _restore_bounded(leaf_path))
                     if served is not None:
                         _asm_stat("restore"); _asm_stat("restore:afterDemote")
                         _mode("restore")
@@ -8766,12 +8971,18 @@ def _assemble(leaf_path, candidate_files, links, rompuuid, postal_index, sdk_hum
                     # the same tail refuses the next document too). Either way the entry stays whole and folds, as before the re-seat
                     keep_whole = _why == "reseat" or asm_document_stands(leaf_path)
             elif _CKPT_DIR_FN is not None:
-                served = _asm_restore(key, leaf_path, candidate_files, links, rompuuid, postal_index, sdk_human)
+                with _ASM_LOCK:
+                    due = _ASM_RESEAT_DUE.pop(key, None)  # the writer released this key's whole entry (asm_checkpoint_write)
+                served = _asm_restore(key, leaf_path, candidate_files, links, rompuuid, postal_index, sdk_human,
+                                      reseated=bool(due) or _restore_bounded(leaf_path))
                 if served is not None:
                     _asm_stat("restore")
+                    if due:
+                        _asm_stat("g:reseat"); _asm_stat("restore:afterDemote")   # the re-seat's own counts, as at the next parse
                     _mode("restore")
                     return served
-                keep_whole = asm_document_stands(leaf_path)   # a boot's refusal that left the document standing: as above
+                keep_whole = bool(due) or asm_document_stands(leaf_path)   # a boot's refusal that left the document standing, or a
+                #                                                             released re-seat the restore refused: as above
             # A full parse names its road (T398): an entry the gates DEMOTED (the g:<reason> beside it: the leaf's record
             # entry replaced by a from-zero read, a lineage file moved), a leaf with NO document file, a document that
             # stood but was REFUSED at the restore (its fallback reason counted beside), or no checkpoint directory at all.
