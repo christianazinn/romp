@@ -220,7 +220,11 @@ class AnIdleLeafReleasesItsRecordsOnceItsDocumentStands(R2Base):
             hot = em._JSONL_CACHE[self.path][4]
             hot_n = len(hot.hot) if T._tail(hot) else len(hot)
             tree = jd._parse_slot(SID, jd._pending_cut(SID), self.path, km._display_sdk_human(SID))
-            self.assertIsNotNone(tree, "the store holds a tree again (the feed's cache-only read never meets an empty slot)")
+            self.assertIsNone(tree, "the store's tree built from the whole entry was dropped")
+            s0 = dict(em._ASM_STATS)
+            km._parse(self.path, SID, NOW)                # the next ask restores from the document just written
+            self.assertEqual(em._ASM_STATS.get("restore", 0) - s0.get("restore", 0), 1)
+            self.assertEqual(em._ASM_STATS.get("full", 0), s0.get("full", 0), "never a whole parse")
         self.assertGreater(before, 0)
         self.assertLess(after, 0.3 * before, "decoded records held: %d bytes after the document, %d before (the window holds "
                                              "%d of %d records)" % (after, before, hot_n, len(self.recs)))

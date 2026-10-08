@@ -13085,17 +13085,18 @@ def _stored_tree_under(path, sid, human):
 
 def _asm_reseat_after_write(leaf, sid, human):
     """After an assembly document was written for `leaf`: when the event model released the session's whole entry at the
-    write (a tail-only leaf, em.asm_reseat_due), the parse store's trees over the leaf go too, and the leaf is parsed again
-    at once, a restore from the document just written (2026-10-08). Those trees were built from the whole entry, so each held
-    every body of the transcript; an idle leaf's tree was served for the life of the process (the store keys on the file's
-    stat), keeping the released entry's records alive whatever the record cache counted. The re-parse fills the store
-    again, so the feed's cache-only read (_parse_cached) never meets an empty slot."""
+    write (a tail-only leaf, em.asm_reseat_due), the parse store's trees over the leaf go too (2026-10-08). Those trees were
+    built from the whole entry, so each held every body of the transcript; an idle leaf's tree was served for the life of the
+    process (the store keys on the file's stat), keeping the released entry's records alive whatever the record cache counted.
+    No parse here: the next one to ask (a build, a judge pass, the feed's warm fall-through) restores from the document just
+    written, where round one paid its re-seat. A restore costs 1.4 to 1.6 s for a 5.3 MB document (a 403 MB synthetic leaf),
+    seconds more for the largest live leaves, which the settle and the converge pass must not pay outside their budget (the
+    review of 2026-10-08, R3-2); the feed's cache-only read (_parse_cached) misses meanwhile, as at a boot."""
     try:
         if not em.asm_reseat_due(leaf, sid, human):
             return False
         jd.parse_cache_drop_leaf(str(leaf))
         _BG_TOPS_CACHE.pop(str(sid), None)                 # its pinned parse is the dropped tree (identity is its version)
-        _parse(leaf, sid, time.time())
         return True
     except Exception:
         sys.stderr.write("assembly re-seat: %s\n" % traceback.format_exc())
