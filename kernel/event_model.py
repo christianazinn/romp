@@ -7087,9 +7087,9 @@ _ASM_CKPT_CAP_SHARE = 16           # a TAIL-ONLY leaf's cap (2026-10-08): a docu
 #                                    the deploy's first hour, 162 in 11 hours on the build before), their assembly entries stayed
 #                                    WHOLE for the life of the process (every decoded record and body held, whatever the record
 #                                    cache counted) and every demotion re-read the whole leaf off disk. For such a leaf the
-#                                    alternative to a document is that whole entry and that read, so the document is the cheaper
-#                                    one up to a large fraction of the transcript; 1/16 keeps a boot's load well under the parse it
-#                                    replaces (decompressing and decoding a document is about a tenth of a whole parse per byte).
+#                                    alternative to a document is that whole entry and that read. 1/16 (6.25 percent) is about twice
+#                                    the largest ratio measured on the devbox's documents (26 leaves past 50 MB, 2026-10-08: 0.7 to
+#                                    3.3 percent of the leaf compressed, median 2.1), so every such leaf's document fits.
 
 
 def _asm_ckpt_cap_for(leaf_path, pre_bytes):
