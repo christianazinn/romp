@@ -349,6 +349,134 @@ class TheWindowStaysAtARestoredCut(R2Base):
             self.assertEqual(cold()[0] - c0, 0, "after the one widening read, nothing before the window")
 
 
+class OnlyAWholeParseAnswersWhatMovesAFrozenAtom(R2Base):
+    """Review of 2026-10-08 (R1-1, R1-2, p5): the restore road was picked from an append's FIRST demoting record, so a later
+    record only a whole parse can answer (a prompt stamped before the cut) was never read; the boot restore had the same hole;
+    a resurrected dangling target and a summary off any boundary restored too. Each shape now gives the tree a cold whole
+    parse gives (the restore refused or never taken). On 926f9199f each tree differs (turn 6 loses its late prompt; 164 turns
+    where the cold parse has 124)."""
+
+    def _ref(self):
+        with T.knobs(0, 4, roots=[str(self.proj)]):
+            self._reset()
+            saved = em._CKPT_DIR_FN; em._CKPT_DIR_FN = None
+            try:
+                return T._strip_tree(self.parse())
+            finally:
+                em._CKPT_DIR_FN = saved
+
+    def _stale(self, parent, k):
+        """A prompt stamped inside turn 5 (long before the cut) and its reply, chained at the tail."""
+        u = {"type": "user", "uuid": "old%d" % k, "parentUuid": parent, "timestamp": iso(NOW - 86400 + 5 * 60 + 30),
+             "promptSource": "typed", "cwd": "/w/notes-api", "message": {"role": "user", "content": "a late-stamped prompt %d" % k}}
+        a = {"type": "assistant", "uuid": "olda%d" % k, "parentUuid": u["uuid"], "timestamp": iso(self.t + 30), "cwd": "/w/notes-api",
+             "message": {"role": "assistant", "content": [{"type": "text", "text": "late reply ok " * 10}], "stop_reason": "end_turn"}}
+        return [u, a]
+
+    def _write(self, recs):
+        with open(self.path, "a") as f:
+            f.write("".join(json.dumps(r) + "\n" for r in recs))
+
+    def _tree(self, mutate, boot=False):
+        with T.knobs(WINDOW, 4, roots=[str(self.proj)]):
+            self.restored()
+            mutate()
+            if boot:
+                self._reset()                             # a restart over the grown tail: the boot's restore road
+            tree = self.parse()
+            em.hydrate(tree, SID)
+            got = T._strip_tree(tree)
+        return got
+
+    def test_a_compaction_then_a_stale_stamp_in_one_append(self):
+        def mutate():
+            recs = tail_turn(self.k, self.parent, self.t, boundary=True)
+            self._write(recs + self._stale(recs[-1]["uuid"], 1))
+        self.assertEqual(self._tree(mutate), self._ref())
+
+    def test_a_duplicate_then_a_stale_stamp_in_one_append(self):
+        def mutate():
+            recs = self.append()
+            self.parse()
+            self._write([recs[-1]] + self._stale(recs[-1]["uuid"], 2))
+        self.assertEqual(self._tree(mutate), self._ref())
+
+    def test_a_boot_restore_over_a_stale_stamp(self):
+        self.assertEqual(self._tree(lambda: self._write(self._stale(self.parent, 6)), boot=True), self._ref())
+
+    def test_a_summary_off_any_boundary(self):
+        def mutate():
+            self._write([{"type": "user", "uuid": "lone_s", "parentUuid": self.parent, "timestamp": iso(self.t),
+                          "isCompactSummary": True, "message": {"role": "user", "content": "summary so far: a lone summary"}}])
+            self.parent, self.t = "lone_s", self.t + 2
+            self.append()
+        self.assertEqual(self._tree(mutate), self._ref())
+
+
+class ADanglingTargetResurrectedInTheTail(OnlyAWholeParseAnswersWhatMovesAFrozenAtom):
+    """A pre-cut compaction whose stitch target was never written (the parse repairs it through preservedSegment); the target
+    then lands in the tail. A cold parse rebinds the stitch (124 turns); the restore froze it (164)."""
+
+    def setUp(self):
+        super().setUp()
+        for r in self.recs:
+            if r.get("uuid") == "b40":
+                real = r["logicalParentUuid"]
+                r["logicalParentUuid"] = "ghost40"
+                r["compactMetadata"]["preservedSegment"] = {"tailUuid": real, "anchorUuid": real, "headUuid": real}
+        Path(self.path).write_text("".join(json.dumps(x) + "\n" for x in self.recs))
+
+    def _resurrect(self):
+        self._write([{"type": "user", "uuid": "ghost40", "parentUuid": self.parent, "timestamp": iso(self.t), "promptSource": "typed",
+                      "message": {"role": "user", "content": "a record whose uuid a pre-cut stitch named"}}])
+        self.parent, self.t = "ghost40", self.t + 30
+        self.append()
+
+    def test_at_a_demotion(self):
+        self.assertEqual(self._tree(self._resurrect), self._ref())
+
+    def test_at_a_boot(self):
+        self.assertEqual(self._tree(self._resurrect, boot=True), self._ref())
+
+
+SID2 = "aaaaaaaa-4444-4222-8333-666666666666"
+
+
+class TheConvergePassReachesALeafLargerThanItsBudget(R2Base):
+    """Review of 2026-10-08 (R2-1): the converge pass took a leaf's write against the cycle's byte budget with an estimate of
+    its size / 64, and broke out of its loop at the first refusal. A leaf whose estimate passes the cap (any leaf past 512 MiB
+    under the 8 MiB default: the devbox's largest idle leaves) was never written, and every whole entry after it waited forever.
+    Scaled here: the cap one byte under the first leaf's estimate. Now the first candidate of a cycle may take it alone, a
+    refused leaf is owed and skipped, and both leaves get their documents and are released within three passes. On 926f9199f
+    neither is written."""
+
+    def test_the_large_leaf_and_the_one_behind_it_both_converge(self):
+        small = str(self.proj / (SID2 + ".jsonl"))
+        recs2 = transcript(NOW - 86400, turns=100, compact_every=40)
+        Path(small).write_text("".join(json.dumps(r) + "\n" for r in recs2))   # another session: its own leaf
+        old = time.time() - 600
+        for p in (self.path, small):
+            os.utime(p, (old, old))                       # quiescent: the converge pass's leaves
+        est = max(4096, os.path.getsize(self.path) // 64)
+        self.assertLessEqual(max(4096, os.path.getsize(small) // 64), est - 1, "the small leaf fits the cap alone")
+        with T.knobs(WINDOW, 4, roots=[str(self.proj)]):
+            km._parse(self.path, SID, NOW)                # the large leaf first: first in the pass's order
+            km._parse(small, SID2, NOW)
+            self.assertEqual(len(em.asm_whole_entries()), 2)
+            for name, val in (("CKPT_CONVERGE_MS", 5000.0), ("CKPT_CONVERGE_BYTES", est - 1), ("ASM_CONVERGE", True)):
+                saved = getattr(km, name); setattr(km, name, val); self.addCleanup(setattr, km, name, saved)
+            for t in (km._ASM_CONVERGE_DONE, km._ASM_CONVERGE_BLIP, km._ASM_CONVERGE_NOENTRY, getattr(km, "_ASM_CONVERGE_OWED", {})):
+                t.clear()
+            written = 0
+            for _ in range(3):
+                km._begin_checkpoint_cycle()
+                written += km._converge_assembly(time.time(), time.monotonic())
+            self.assertTrue(em._asm_ckpt_file(self.path).exists(), "the leaf larger than the budget got its document")
+            self.assertTrue(em._asm_ckpt_file(small).exists(), "the leaf behind it was not held")
+            self.assertEqual(written, 2)
+            self.assertEqual(em.asm_whole_entries(), [], "both whole entries released")
+
+
 class TheHydrationMemoKeepsWhatAtomsRead(unittest.TestCase):
     """The hydration memo held every hydrated record whole: a tool result's output twice (its message block and
     toolUseResult) and its metadata, beside the message the atom shares. It keeps the fields the atom's kind reads; an atom of
