@@ -349,5 +349,39 @@ class TheWindowStaysAtARestoredCut(R2Base):
             self.assertEqual(cold()[0] - c0, 0, "after the one widening read, nothing before the window")
 
 
+class TheHydrationMemoKeepsWhatAtomsRead(unittest.TestCase):
+    """The hydration memo held every hydrated record whole: a tool result's output twice (its message block and
+    toolUseResult) and its metadata, beside the message the atom shares. It keeps the fields the atom's kind reads; an atom of
+    the same uuid that needs a dropped field reads the record again (on 62e03751a the helpers do not exist)."""
+
+    REC = {"type": "user", "uuid": "u-tr", "parentUuid": "a-tr", "timestamp": "2026-10-07T00:00:00.000Z", "cwd": "/w/notes-api",
+           "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_1", "content": "out " * 50}]},
+           "toolUseResult": {"stdout": "out " * 50, "stderr": ""}}
+
+    def setUp(self):
+        with em._ASM_CKPT_LOCK:
+            em._HYDRATED.pop("u-tr", None)
+
+    tearDown = setUp
+
+    def test_a_tool_result_without_tur_keeps_no_second_copy(self):
+        keep = em._hydrated_keep(self.REC, {"k": "u"})
+        self.assertNotIn("toolUseResult", keep)
+        self.assertNotIn("cwd", keep)
+        self.assertIs(keep["message"], self.REC["message"])
+        with em._ASM_CKPT_LOCK:
+            em._HYDRATED["u-tr"] = (keep, 100)
+            self.assertIsNotNone(em._hydrated_hit("u-tr", {"uuid": "u-tr", "lazy": {"k": "u"}}))
+            self.assertIsNone(em._hydrated_hit("u-tr", {"uuid": "u-tr", "lazy": {"k": "u", "tur": True}}),
+                              "an atom that needs the dropped toolUseResult reads the record again")
+
+    def test_with_tur_the_atom_gets_it(self):
+        keep = em._hydrated_keep(self.REC, {"k": "u", "tur": True})
+        a = {"uuid": "u-tr", "lazy": {"k": "u", "tur": True}}
+        em._hydrate_one(a, keep)
+        self.assertEqual(a["toolUseResult"], self.REC["toolUseResult"])
+        self.assertEqual(a["message"], em._norm_message(self.REC["message"]))
+
+
 if __name__ == "__main__":
     unittest.main()

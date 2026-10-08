@@ -8713,6 +8713,40 @@ def _asm_restore_from_doc(key, leaf_path, candidate_files, links, rompuuid, post
     return _asm_serve(entry)
 
 
+def _hydrated_keep(rec, lz):
+    """What the hydration memo keeps of a record read for the lazy atom whose marker is `lz` (2026-10-08): the fields
+    _hydrate_one reads for that atom's kind, never the whole record. A tool result's record carries its output twice (the
+    message's tool_result block and toolUseResult), and the atom keeps toolUseResult only when its marker says so (`tur`), so
+    the memo held a second copy of every output no atom referenced, beside every record's metadata; the message's blocks are
+    shared with the hydrated atom. A field dropped for this atom's kind is marked, so an atom of the same uuid that needs it
+    (_hydrated_hit) reads the record again rather than being served a body without it."""
+    keep = {"uuid": rec.get("uuid"), "message": rec.get("message")}
+    if "toolUseResult" in rec:
+        if lz.get("tur"):
+            keep["toolUseResult"] = rec["toolUseResult"]
+        else:
+            keep["_noTur"] = True
+    if "attachment" in rec:
+        if lz.get("k") == "b":
+            keep["attachment"] = rec["attachment"]
+        else:
+            keep["_noAtt"] = True
+    return keep
+
+
+def _hydrated_hit(u, a):
+    """The hydration memo's entry for uuid `u` when it serves atom `a` (under _ASM_CKPT_LOCK): None when absent, or when it
+    was kept for an atom that needed less than `a` does (_hydrated_keep's markers)."""
+    hit = _HYDRATED.get(u) if u else None
+    if hit is None:
+        return None
+    lz = a.get("lazy") or {}
+    rec = hit[0]
+    if (lz.get("tur") and rec.get("_noTur")) or (lz.get("k") == "b" and rec.get("_noAtt")):
+        return None
+    return hit
+
+
 def _hydrate_one(a, rec):
     """Fill a lazy atom's body fields from its record, the way the emit built them. An atom another thread finished
     meanwhile (its marker gone) is left as it is (review find C)."""
@@ -8799,7 +8833,7 @@ def hydrate(atoms, rompuuid=None, by=None):
     for a in lazy:
         u = a.get("uuid")
         with _ASM_CKPT_LOCK:
-            hit = _HYDRATED.get(u) if u else None
+            hit = _hydrated_hit(u, a)
             if hit is not None:
                 _HYDRATED.pop(u, None); _HYDRATED[u] = hit      # a served body is a used one: to the LRU tail
         if hit is not None:
@@ -8810,7 +8844,7 @@ def hydrate(atoms, rompuuid=None, by=None):
         msg = a.get("message")
         if not hasattr(msg, "source_path"):                 # another thread finished this atom between the memo miss above and
             with _ASM_CKPT_LOCK:                            #  here (2026-09-20): its body is a plain dict with no source, and the
-                hit = _HYDRATED.get(u) if u else None       #  per-session map below could name a newer document and refuse an atom
+                hit = _hydrated_hit(u, a)                   #  per-session map below could name a newer document and refuse an atom
             if hit is not None:                             #  whose body is in place, the whole call with it. Its bookkeeping (the
                 _hydrate_one(a, hit[0])                     #  popped marker) may still be in flight: finish it from the memo as the
             filled += 1                                     #  hit branch does, or count it filled when the entry is gone already.
@@ -8850,7 +8884,7 @@ def hydrate(atoms, rompuuid=None, by=None):
                     filled += 1; continue                 # another thread hydrated it between the filter and here (the feed's
                 u = a.get("uuid")                         #  build and the judges both ask): its body is in place
                 with _ASM_CKPT_LOCK:
-                    hit = _HYDRATED.get(u) if u else None
+                    hit = _hydrated_hit(u, a)
                 if hit is not None:
                     _hydrate_one(a, hit[0]); filled += 1
                     continue
@@ -8872,7 +8906,7 @@ def hydrate(atoms, rompuuid=None, by=None):
                     hk = "%s:%s" % (_read_stage() or "none", by)
                     hbs[hk] = hbs.get(hk, 0) + ln
                     if a.get("uuid"):
-                        _HYDRATED[a["uuid"]] = (rec, ln); _HYDRATED_BYTES[0] += ln
+                        _HYDRATED[a["uuid"]] = (_hydrated_keep(rec, lz), ln); _HYDRATED_BYTES[0] += ln
                         while _HYDRATED_BYTES[0] > _HYDRATED_CAP and _HYDRATED:
                             _old = _HYDRATED.pop(next(iter(_HYDRATED)))    # the least recently used body goes first
                             _HYDRATED_BYTES[0] -= _old[1]
