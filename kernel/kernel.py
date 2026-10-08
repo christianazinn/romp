@@ -37565,6 +37565,53 @@ def _park_behind_queue(sid, op):
     return True
 
 
+# SENDS DRAIN MID-TURN PAST A PARKED SETTING (the user 2026-10-08, who ruled that parked messages always drain mid-turn,
+# after sessions went hours without receiving anything): the queue drained only once a session was QUIET, and while
+# anything was parked every new send parked behind it, so a busy session (almost never quiet) stopped hearing its peers
+# at the first parked /effort or /env. On a backend that forwards its own sends (_forwards_sends: it takes a send
+# mid-turn and hands it to the model at the next tool boundary), a parked op of one of these kinds changes only a
+# session SETTING (a reconnect at most), never the conversation, so a send parked behind it is passed over: the send
+# drains mid-turn (_drain_sends_midturn) and the setting stays parked until the session is quiet, where the drain
+# applies it as before. Every other kind keeps strict order, because it changes the conversation the send would land
+# in: a /compact or /clear (the send belongs after it), a typed slash command (it must fire as its own top-level
+# prompt), a move (the CLI rejects a move while a send is in flight), and any kind this list does not name.
+_SEND_PASSABLE_KINDS = frozenset(("model", "effort", "fast", "env", "auth"))
+
+
+def _send_may_pass(op, model_live):
+    """Can a parked SEND drain past this parked op (see _SEND_PASSABLE_KINDS)? A model pick is passable only on a
+    backend that switches models live (_model_switches_live, read by the caller OUTSIDE the queue lock and handed in
+    as `model_live`): on one that does not (Codex), the pick lands at the NEXT turn start while a send steers the
+    LIVE turn, so a send passing the parked pick would reach the old model first, the inversion that pick parks to
+    prevent (codex_backend.model_switches_live); there it stays a barrier, as it was."""
+    k = op[0] if op else None
+    if k not in _SEND_PASSABLE_KINDS:
+        return False
+    return model_live or k != "model"
+
+
+def _park_behind_blocking_queue(sid, op, model_live):
+    """_park_behind_queue for a plain send to a backend that forwards sends: park only behind a queue the send may
+    NOT pass. False (the caller hands over now) when nothing is parked, or when every parked op is a setting the send
+    may pass (_send_may_pass) and none is in flight: the setting keeps its slot and applies once the session is
+    quiet. True when parked: behind an earlier parked SEND (press order among sends: that one drains first, on the
+    next pusher cycle, and this one lines up behind it rather than overtaking it), behind a barrier kind, or behind
+    an op the drain is handing to the backend this instant (_inflight_ops: a reconnect in progress). None when the
+    park was refused because the session is ending, as _park_behind_queue answers. Same lock discipline: the check
+    and the park are one step under _pending_ops_lock, and `model_live` was read before taking it."""
+    sid = str(sid)
+    with _pending_ops_lock:
+        ops = _pending_ops.get(sid)
+        if not ops:
+            return False
+        if sid not in _inflight_ops and all(_send_may_pass(o, model_live) for o in ops):
+            return False
+        if not _park_op_locked(sid, op):
+            return None
+    _mark_views_dirty()
+    return True
+
+
 def _park_op(sid, op):
     """Park one mid-compaction drive op in the sid's FIFO queue and push at once (the queued bubble
     appears immediately, never waiting out the backstop poll). A repeat model/effort pick REPLACES the
@@ -38677,7 +38724,10 @@ def _send_or_park(be, sid, text, echo=None, qid=None, user=False, paths=None, fr
     forwards_sends backend would hand it straight over, so this arm has to sit ahead of that check); or
     (c) the backend can't forward its own sends AND a turn is open (the tmux backend's regime, until
     2026-09-11: hold while working, and _apply_pending_ops MERGES the held run into one message at turn
-    end). Otherwise hand
+    end). Arm (b) has one exception (the user 2026-10-08, who ruled that parked messages always drain mid-turn): on a
+    forwards_sends backend a plain send passes a queue that holds only parked SETTINGS (_SEND_PASSABLE_KINDS: model
+    where it switches live, effort, fast, env, auth) with none in flight and no move running
+    (_park_behind_blocking_queue); the settings stay parked until the session is quiet. Otherwise hand
     it over NOW — a forwards_sends backend (SDK) takes a send even mid-turn and forwards it at the next tool
     boundary (the user 2026-07-17, who wanted messages in as soon as possible, without an interrupt), hands
     a drained pile of queued sends to the CLI one message each, in order, the next held until the CLI has
@@ -38737,11 +38787,16 @@ def _send_or_park(be, sid, text, echo=None, qid=None, user=False, paths=None, fr
         op = op + (None,) * (5 - len(op)) + (list(paths),)   # the sixth slot: the attachments the trailing line named (_op_paths, T373 fold)
     if from_user and not cmd:
         op = op + (None,) * (6 - len(op)) + (True,)          # the seventh slot: the person's own words (_op_from_user), kept across the park
-    if _compacting_now(sid) or _pending_ops.get(sid) or _limit_hold(sid):
+    # a plain send to a backend that forwards sends may pass parked SETTINGS (_SEND_PASSABLE_KINDS, the user 2026-10-08):
+    # the queue alone no longer parks it, unless a move is in flight (which holds everything); the locked check
+    # below decides against the queue as it stands
+    passes = not cmd and _forwards_sends(be) and str(sid) not in _moving
+    if _compacting_now(sid) or (_pending_ops.get(sid) and not passes) or _limit_hold(sid):
         return True if _park_op(sid, op) else None       # None: the park was refused, the session is ending (2026-09-21)
     if _working_now(sid) and (cmd or not _forwards_sends(be)):
         return True if _park_op(sid, op) else None
-    parked = _park_behind_queue(sid, op)
+    parked = (_park_behind_blocking_queue(sid, op, _model_switches_live(be)) if passes
+              else _park_behind_queue(sid, op))
     if parked:
         return True
     if parked is None:
@@ -39410,9 +39465,65 @@ def _deliver_send_batch(be, sid, run):
             _hand_back_refused_send(be, sid, op)
 
 
+def _drain_sends_midturn(sid):
+    """The drain's arm for a session whose turn is OPEN (the user 2026-10-08, who ruled that parked messages always
+    drain mid-turn): on a backend that forwards its own sends (_forwards_sends: SDK, Codex), hand it the parked SENDS
+    it can take now instead of holding them for a quiet moment that a busy session almost never has. The backend
+    forwards each at its next tool boundary, one message each, in order (_deliver_send_batch), exactly as it does a
+    send that arrived with no queue ahead of it.
+
+    WHICH sends: walking from the head, every send up to the first op a send may not pass (_send_may_pass). A parked
+    SETTING (model where it switches live, effort, fast, env, auth) is passed over and stays where it is, to apply
+    once the session is quiet; a barrier (compact, clear, a typed slash command, a move, any unknown kind) ends the
+    walk, and the sends behind it wait for it as they always did. Sends keep their press order among themselves.
+
+    WHEN: the caller has already passed every hold the quiet drain honours ahead of the working gate (a move in
+    flight, a drain hold, an account limit, a compaction); this arm adds one more: nothing in flight (_inflight_ops).
+    The backend's busy() stays True across the handover (its send enqueues under the session lock), so the working
+    gate keeps the ops left behind for the quiet pass, and nothing here opens a turn of its own: no prompt hold is
+    armed. A non-forwarding backend gets nothing here (its regime is hold-then-merge at turn end).
+
+    Same lock discipline as the quiet walk: the head read and the pops run under _pending_ops_lock, the backend call
+    with it released; the run is popped before delivery (a ✕ after the pop is the same honest 'too late' as for a
+    quiet batch), and a refused send is handed back by the delivery itself. Unlike the quiet walk, a raise here
+    drops nothing still queued: it is logged and the rest waits for the next cycle. True when something drained."""
+    sid = str(sid)
+    try:
+        be = Sessions.backend_for(sid)
+        if be is None or be is _UNOWNED or not _forwards_sends(be):
+            return False
+        model_live = _model_switches_live(be)        # a backend capability, read before the lock (never under it)
+        with _pending_ops_lock:
+            ops = _pending_ops.get(sid) or []
+            if not ops or sid in _inflight_ops:
+                return False
+            take = []
+            for j, o in enumerate(ops):
+                if o[0] == "send":
+                    take.append(j)
+                elif not _send_may_pass(o, model_live):
+                    break                             # a barrier: the sends behind it wait for it
+            if not take:
+                return False
+            run = [ops[j] for j in take]
+            for j in reversed(take):
+                ops.pop(j)                            # an emptied list stays: the next cycle's walk drops it with its holds
+    except Exception:
+        sys.stderr.write("pending ops apply (mid-turn): %s\n" % traceback.format_exc())
+        return False
+    try:
+        _deliver_send_batch(be, sid, run)
+    except Exception:
+        sys.stderr.write("pending ops apply (mid-turn): %s\n" % traceback.format_exc())
+    _save_pending_ops()                               # the queue shrank: the disk mirror follows
+    _mark_views_dirty()                               # and the chips retire on this cycle's push
+    return True
+
+
 def _apply_pending_ops(now=None):
     """Pusher cycle: FIFO-deliver parked ops once the session is QUIET (neither compacting nor an open
-    turn) — in exactly the order they were parked, which is exactly the order the chat rendered their
+    turn) — except parked SENDS on a backend that forwards its own sends, which drain mid-turn past any parked
+    setting (_drain_sends_midturn, the user 2026-10-08) — in exactly the order they were parked, which is exactly the order the chat rendered their
     queued bubbles (the user 2026-07-02: what you see is what runs). SEQUENTIAL by construction (the user
     2026-07-02, compact-mid-turn): settings ops (model/effort) apply instantly and delivery continues,
     but a SEND or /COMPACT ends the pass — its turn/compaction must finish before the next op fires, so
@@ -39560,7 +39671,9 @@ def _apply_pending_ops(now=None):
                 _held_working.pop(sid, None)          # the compacting gate's hold, not the working gate's
                 continue
             if _working_now(sid):
-                _mark_held_working(sid, now)          # the belt records the hold; the jobs thread reads the transcript (_held_working_pass)
+                _drain_sends_midturn(sid)             # a forwarding backend takes parked SENDS mid-turn (the user 2026-10-08)
+                if _pending_ops.get(sid):
+                    _mark_held_working(sid, now)      # the belt records the hold; the jobs thread reads the transcript (_held_working_pass)
                 continue
             _held_working.pop(sid, None)              # the hold ended: the next one says again
             changed = False                               # a real mutation below → save the mirror + wake the pusher
