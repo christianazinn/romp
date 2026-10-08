@@ -2194,8 +2194,10 @@ def _widen_entry_to(path, off):
         i = _first_within(recs.offs, 0, recs.ncold, recs.guard_off, max(0, recs.guard_off - int(off)))
         if i >= recs.ncold or i <= 0:
             return 0                                      # the window reaches the pin already (or the pin is the file's start)
+        gap = []
         try:
-            gap = recs._read_cold(i, recs.ncold, _caller_outside_module())
+            for batch in recs._cold_batches(i, recs.ncold, _caller_outside_module()):   # runs of about _COLD_CHUNK_BYTES,
+                gap.extend(batch)                         #  never the whole span in one buffer
         except OSError:
             return 0                                      # a refused read drops the entry itself (TailRecordsRead): nothing to widen
         new = _TailRecords(path, recs.offs, i, gap + list(recs.hot), recs.guard_off, recs.guard, recs.crcs, recs.ident)
@@ -6306,6 +6308,9 @@ def evict_document(leaf_path):
             if e is not None:
                 popped.append(e)
                 files.update(e.get("cands") or ())
+        real = os.path.realpath(leaf)
+        for k in [k for k in _ASM_RESEAT_DUE if k[0] == real]:
+            _ASM_RESEAT_DUE.pop(k, None)                 # a released entry's pending re-seat goes with the document's entries
     for e in popped:
         _asm_release(e)                              # OUTSIDE _ASM_LOCK: release takes _MAT_LOCK, never nested with it
     dropped = 0
