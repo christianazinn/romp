@@ -1488,6 +1488,17 @@ def checkpoint_cycle_take(n):
         return True
 
 
+def checkpoint_cycle_take_floor(n):
+    """The converge pass's floor of one write a cycle (2026-10-08): `n` bytes charged even past the budget, so a leaf whose
+    estimate alone exceeds the cap still writes, once, as the pass's first candidate of a cycle (the caller's rule). False when
+    the cycle has no budget at all (the pass off)."""
+    with _CKPT_LOCK:
+        if _CKPT_CYCLE["cap"] <= 0:
+            return False
+        _CKPT_CYCLE["spent"] += int(n)
+        return True
+
+
 def checkpoint_drop_writes_on():
     """Whether the quiescence drop writes documents this cycle (a cap above zero)."""
     with _CKPT_LOCK:
@@ -6389,45 +6400,35 @@ def _asm_gates(entry, leaf_path, candidate_files, links):
     if old_leaf is None:
         return _asm_demote("empty-graph")
     parent_d, new_leaf = {}, old_leaf
-    for r in delta:
+    for i, r in enumerate(delta):
         t, u = r.get("type"), r.get("uuid")
         if u:
-            if u in ad.by_uuid or u in ad.dangling or u in ((ad.seed or {}).get("verdicts") or {}):
-                return _asm_demote("uuid-known")   # a re-write rebinds last-write-wins index state; a resurrected dangling target
-                #                                    rebinds repaired stitches; a RESTORED entry's adapter holds only the tail's
-                #                                    records, its pre-cut uuids live in the seed (round seven: a reuse of a pre-cut
-                #                                    uuid folded and served u1 a1 u2 a2 where a cold parse clears them)
+            if u in ad.dangling:
+                return _asm_demote("dangling")     # a resurrected dangling target rebinds repaired stitches: a stitch the document
+                #                                    froze before the cut, so only the whole parse answers it (2026-10-08: it was
+                #                                    counted uuid-known, which a restored tail-only entry now restores)
+            if u in ad.by_uuid or u in ((ad.seed or {}).get("verdicts") or {}):
+                return _asm_demote(_asm_rest_whole(delta, i, ad, max_ppt) or "uuid-known")
+                #                                    a re-write rebinds last-write-wins index state; a RESTORED entry's adapter holds
+                #                                    only the tail's records, its pre-cut uuids live in the seed (round seven: a reuse
+                #                                    of a pre-cut uuid folded and served u1 a1 u2 a2 where a cold parse clears them)
             p = r.get("parentUuid") or r.get("logicalParentUuid")
             parent_d[u] = None if p == u else p
             new_leaf = u
         if t == "system" and r.get("subtype") == "compact_boundary":
-            return _asm_demote("boundary")   # sets the pre-pass's compaction gate and can re-seat adoptions
+            return _asm_demote(_asm_rest_whole(delta, i, ad, max_ppt) or "boundary")   # sets the pre-pass's compaction gate and
+            #                                                                             can re-seat adoptions
         if r.get("isCompactSummary") is True:
-            return _asm_demote("summary")    # attaches to its boundary and arms the restore dedup in the
-            #                                  chronological pre-pass (the summary, not the boundary, 2026-09-19)
-        if t == "user" and r.get("promptId") and r["promptId"] in ad.prompt_ids:
-            # A repeated promptId is ROUTINE — every record of a turn wears its prompt's id, so
-            # tool results repeat it on nearly every append (measured: this gate, unshaped,
-            # demoted 1863 of 1869 bursts on a live 46MB replay). Only two shapes can
-            # re-classify OLD atoms: a command-wrapper-family record (it grows the twins map
-            # retroactively) and any record wearing an adoptable boundary's episode pid (it can
-            # re-seat the adopted card's splice without changing kept — invisible to the
-            # invariance check). Everything else folds: the carried twins map serves the DELTA
-            # record's own classification record-locally.
-            _wtxt = _text_of(_content(r.get("message"))) or ""
-            if r["promptId"] in ad.boundary_pids or \
-                    (CMD_WRAP_RE.match(_wtxt) and not is_skill_load_wrapper(_wtxt)):   # the harness's skill load
-                return _asm_demote("promptid")                                        #   re-classifies nothing (T333)
-        if t == "assistant":
-            for b in _content(r.get("message")) or []:
-                if isinstance(b, dict) and b.get("type") == "tool_use" and \
-                        b.get("name") == "Skill" and b.get("id") in ad.src_tool_links:
-                    return _asm_demote("skill-link")   # an already-ingested payload references it
-        if t in ("user", "assistant"):
-            ts = parse_z(r.get("timestamp"))
-            if ts is None or ts < max_ppt:
-                return _asm_demote("ts")   # the carry is valid only for a delta sorting at-or-
-                #                            after everything folded (the pre-pass sorts None first)
+            pb = r.get("parentUuid")
+            pr = next((x for x in delta[:i] if x.get("uuid") == pb), None) or ad.by_uuid.get(pb) or {}
+            if not (pr.get("type") == "system" and pr.get("subtype") == "compact_boundary"):
+                return _asm_demote("summary-orphan")   # not parented on a boundary: a cold parse attaches it to the last boundary's
+                #                                        card, which may sit before the cut (2026-10-08, review p5): the whole parse
+            return _asm_demote(_asm_rest_whole(delta, i, ad, max_ppt) or "summary")    # attaches to its boundary and arms the
+            #                                  restore dedup in the chronological pre-pass (the summary, not the boundary, 2026-09-19)
+        why = _asm_record_whole(r, ad, max_ppt)
+        if why is not None:
+            return _asm_demote(why)
     # Leaf descent: the new file-leaf must chain back to the old one THROUGH the delta — an
     # api_error spur re-parent, a rewind, and a /clear fork all fail here. parent_d.pop doubles
     # as the cycle guard; a delta with no uuid-bearing record passes trivially (leaf unmoved).
@@ -6438,6 +6439,50 @@ def _asm_gates(entry, leaf_path, candidate_files, links):
         cur = parent_d.pop(cur)
         hops += 1
     return delta, leaf_recs
+
+
+def _asm_record_whole(r, ad, max_ppt):
+    """The demotion a delta record `r` forces to the WHOLE parse, by the gates' rules, or None: a resurrected dangling target
+    ("dangling"), a repeated prompt id of the kinds that re-classify old atoms ("promptid"), a Skill tool_use an ingested
+    payload already references ("skill-link"), a conversational stamp unparseable or before the carry's watermark ("ts").
+    The reasons a restore cannot answer either: each moves an atom the document holds fixed before the cut."""
+    t, u = r.get("type"), r.get("uuid")
+    if u and u in ad.dangling:
+        return "dangling"
+    if t == "user" and r.get("promptId") and r["promptId"] in ad.prompt_ids:
+        # A repeated promptId is ROUTINE — every record of a turn wears its prompt's id, so tool results repeat it on nearly
+        # every append (measured: this gate, unshaped, demoted 1863 of 1869 bursts on a live 46MB replay). Only two shapes can
+        # re-classify OLD atoms: a command-wrapper-family record (it grows the twins map retroactively) and any record wearing an
+        # adoptable boundary's episode pid (it can re-seat the adopted card's splice without changing kept — invisible to the
+        # invariance check). Everything else folds: the carried twins map serves the DELTA record's own classification
+        # record-locally.
+        _wtxt = _text_of(_content(r.get("message"))) or ""
+        if r["promptId"] in ad.boundary_pids or \
+                (CMD_WRAP_RE.match(_wtxt) and not is_skill_load_wrapper(_wtxt)):   # the harness's skill load
+            return "promptid"                                                     #   re-classifies nothing (T333)
+    if t == "assistant":
+        for b in _content(r.get("message")) or []:
+            if isinstance(b, dict) and b.get("type") == "tool_use" and \
+                    b.get("name") == "Skill" and b.get("id") in ad.src_tool_links:
+                return "skill-link"           # an already-ingested payload references it
+    if t in ("user", "assistant"):
+        ts = parse_z(r.get("timestamp"))
+        if ts is None or ts < max_ppt:
+            return "ts"                       # the carry is valid only for a delta sorting at-or-after everything folded (the
+            #                                   pre-pass sorts None first)
+    return None
+
+
+def _asm_rest_whole(delta, i, ad, max_ppt):
+    """The first whole-parse demotion (_asm_record_whole) among delta[i:], or None (2026-10-08, review R1-1). The gates stop at a
+    record's first demotion, and a restored tail-only entry now restores for some (_ASM_RESTORE_AFTER_DEMOTE_TAIL); an append
+    whose first hit was one of those carried a later record the restore cannot answer (a prompt stamped before the cut landed in
+    a tail turn, where a cold parse opens the old turn with it), so the rest of the append is read before the road is picked."""
+    for r in delta[i:]:
+        why = _asm_record_whole(r, ad, max_ppt)
+        if why is not None:
+            return why
+    return None
 
 
 def _asm_heal(entry, rompuuid, postal_index):
@@ -8548,6 +8593,9 @@ def _tail_chains_over(recs, ent, cut, doc, assume_childless):
     tip = rows[spine[-1]][0] if spine and spine[-1] < len(rows) else None
     tip_ok = tip if tip is not None and (doc.get("tipChildless") is True or assume_childless) else None
     known = pre_uuids | set(by_uuid)
+    dangling = set(((doc.get("gates") or {}).get("dangling")) or ())   # the pre-cut stitch targets no record carried (2026-10-08):
+    if any(u in dangling for u in by_uuid):               #  a tail record carrying one rebinds a repaired stitch before the cut,
+        return False                                      #  which the document holds fixed (review R1-2): the whole parse answers it
     if any(u in pre_uuids for u in by_uuid):
         return False                                      # a tail uuid reusing a pre-cut record's: a cycle across the spine, and the parse
     #                                                       would re-bind a frozen record (round seven). A uuid REPEATED within the tail is
@@ -8687,6 +8735,18 @@ def _asm_restore_from_doc(key, leaf_path, candidate_files, links, rompuuid, post
         ad.sdk_human = sdk_human
         st = _emit_state()
         st.update(_carry_decode(doc["carry"]))
+        mp = st.get("max_ppt")
+        if mp is not None:
+            for r_ in ad.by_uuid.values():                # the seeded adapter holds the tail's records alone
+                if r_.get("type") in ("user", "assistant"):
+                    ts_ = parse_z(r_.get("timestamp"))
+                    if ts_ is None or ts_ < mp:
+                        # a tail record stamped before the carry's watermark (2026-10-08, review R1-1): a cold parse sorts it into
+                        # the pre-cut turns (a prompt opens an old turn), where the document holds them fixed, so the restore
+                        # cannot give its tree; refused to the whole parse, at a boot as after a demotion. The fold's own gate (ts)
+                        # holds the same line for an append
+                        _asm_stat("restore:stampRefused")
+                        return None
         kept = ad.kept_uuids(ad.active_path())
         order = _chrono(ad, kept)
         ad._prepass(order, st)

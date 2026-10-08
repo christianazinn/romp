@@ -13222,6 +13222,7 @@ _ASM_CONVERGE_DONE = {}             # leaf -> the file's (mtime_ns, size) once i
 #                                     writer refused it for a property of its cut (T376): looked at once per file state, never per cycle
 _ASM_CONVERGE_BLIP = {}             # leaf -> the file state under which the writer's one blip retry was spent
 _ASM_CONVERGE_NOENTRY = {}          # leaf -> the file state under which "no entry" was counted (once, not per cycle)
+_ASM_CONVERGE_OWED = {}             # leaf -> True: the budget deferred its write (insertion order = oldest owed first); tried first next pass
 _ASM_STRUCTURAL = set(em._ASM_SKIP_STRUCTURAL) | {"written", "restored"}   # the writer's reasons that hold until the cut moves (noCut
 #                                                                              rides in the writer's own structural set, stage one b)
 
@@ -13250,16 +13251,30 @@ def _converge_assembly(now, t0):
     for leaf, sid, human in em.asm_whole_entries():        #  whole entries for one leaf, the judges' flag and the display's, and the
         if leaf and sid:                                   #  document must carry the one the display's next boot reads with)
             by_leaf.setdefault((str(leaf), sid), set()).add(human)
-    for (leaf, sid), flags in by_leaf.items():             # the parses the boot actually did (T382: the discover window's rows, 48
+    order = sorted(by_leaf.items(), key=lambda kv: (kv[0][0] not in _ASM_CONVERGE_OWED,   # leaves the budget deferred go first,
+                                                    list(_ASM_CONVERGE_OWED).index(kv[0][0]) #  oldest-owed first (2026-10-08)
+                                                    if kv[0][0] in _ASM_CONVERGE_OWED else 0))
+    tried = False                                          # a candidate reached the budget this pass: the floor is spent
+    for (leaf, sid), flags in order:                       # the parses the boot actually did (T382: the discover window's rows, 48
         if time.monotonic() - t0 > CKPT_CONVERGE_MS / 1000.0:   #  hours, left every older idle leaf out: 19 of the 25 boundary leaves
             break                                          #  without a document on the devbox); the cycle's wall: the rest wait
         try:
-            r = _converge_assembly_leaf(leaf, sid, t0, flags=flags)
+            r = _converge_assembly_leaf(leaf, sid, t0, flags=flags, floor=not tried)
         except Exception:                                  # one leaf's raise (a stat, a backend hook) leaves the rest their turn
             sys.stderr.write("assembly converge: %s\n" % traceback.format_exc()); continue
         if r is None:
-            break                                          # the budget: the rest wait for the next cycle
+            # the budget refused this leaf (2026-10-08): it is owed, and the pass goes on to the others, which may fit. A break here
+            # left every whole entry after a leaf too large for the cycle (an estimate over the cap: any leaf past 512 MiB under the
+            # 8 MiB default) waiting forever, and that leaf itself was never written, so the largest idle leaves, the ones holding
+            # the most, were never released. The owed leaf goes first next pass, where the floor lets it take a cycle alone
+            _ASM_CONVERGE_OWED[leaf] = True
+            tried = True
+            continue
+        if r:
+            tried = True
+        _ASM_CONVERGE_OWED.pop(leaf, None)
         n += 1 if r else 0
+    _release_oldest(_ASM_CONVERGE_OWED)
     return n
 
 
@@ -13271,7 +13286,7 @@ def _release_oldest(table, cap=4096):
 _ASM_CONVERGE_FLAG = {}             # leaf -> the file state under which a flag mismatch was counted (once, not per cycle)
 
 
-def _converge_assembly_leaf(key, sid, t0, flags=None):
+def _converge_assembly_leaf(key, sid, t0, flags=None, floor=False):
     """One leaf's assembly write for the pass (see _converge_assembly): True written, False not (done, refused, nothing to
     write from), None when the budget refused it (the caller defers the rest). `flags`, when the caller knows them, are the
     sdk_human flags the boot parsed the leaf under; the document is written under the DISPLAY parse's flag (the one the next
@@ -13304,9 +13319,9 @@ def _converge_assembly_leaf(key, sid, t0, flags=None):
         return False
     em.asm_converge_stat("candidates")
     est = max(4096, st[1] // 64)
-    if not em.checkpoint_cycle_take(est):
-        em.asm_converge_stat("deferred")
-        return None
+    if not em.checkpoint_cycle_take(est) and not (floor and em.checkpoint_cycle_take_floor(est)):
+        em.asm_converge_stat("deferred")               # `floor`: the pass's first candidate this cycle may take it alone, over the
+        return None                                    #  budget (2026-10-08: else a leaf whose estimate passes the cap never writes)
     reasons = []
     try:
         wrote = em.asm_checkpoint_write(key, sid, human, tree=_stored_tree_under(key, sid, human), reason_out=reasons, who="converge pass")
