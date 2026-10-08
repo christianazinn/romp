@@ -6425,8 +6425,10 @@ def _asm_gates(entry, leaf_path, candidate_files, links):
             pb = r.get("parentUuid")
             pr = next((x for x in delta[:i] if x.get("uuid") == pb), None) or ad.by_uuid.get(pb) or {}
             if not (pr.get("type") == "system" and pr.get("subtype") == "compact_boundary"):
-                return _asm_demote("summary-orphan")   # not parented on a boundary: a cold parse attaches it to the last boundary's
-                #                                        card, which may sit before the cut (2026-10-08, review p5): the whole parse
+                _asm_demote("summary")                 # not parented on a boundary: a cold parse attaches it to the last boundary's
+                _asm_stat("g:summary:orphan")          #  card, which may sit before the cut (2026-10-08, review p5): counted as the
+                _ASM_DEMOTE_TL.reason = "summary-orphan"   #  summary it is, routed to the whole parse (the reason the road reads)
+                return None
             return _asm_demote(_asm_rest_whole(delta, i, ad, max_ppt) or "summary")    # attaches to its boundary and arms the
             #                                  restore dedup in the chronological pre-pass (the summary, not the boundary, 2026-09-19)
         why = _asm_record_whole(r, ad, max_ppt)
