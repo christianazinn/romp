@@ -904,6 +904,9 @@ def record_cache_stats() -> dict:
                            "skeletonBytes": sum(int(e[4].skel_bytes) for e in tails if e[4].skel is not None),
                            "skeletons": sum(min(len(e[4].skel), e[4].ncold) for e in tails if e[4].skel is not None),
                            "fileBytes": sum(int(e[1]) for e in tails), "tailBytes": _TAIL_BYTES, "tailRecords": _TAIL_RECORDS}
+    out["tailOnly"]["pins"] = len(tail_pin_stats())        # leaves whose window a restored assembly entry's cut holds (_tail_pin)
+    with _ASM_LOCK:
+        out["tailOnly"]["reseatDue"] = len(_ASM_RESEAT_DUE)   # whole entries released at a document write, not yet restored
     out["coldReads"] = cold_read_stats()
     with _JSONL_CACHE_LOCK:
         table = _RECORD_CACHE_STATS.get("wholeReads")
