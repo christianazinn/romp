@@ -94,17 +94,23 @@ class EchoMirrorBounded(unittest.TestCase):
         self.assertEqual(len(sb.read_reg(Path(self.d), SID)["echoes"]), 100,
                          "a send that may still be in flight is never dropped for size")
 
-    def test_age_bounds(self):
-        old_pending = _echo("echo:old-pending", int(self.now - sb.ECHO_MIRROR_PENDING_MAX_AGE_S - 60), "old send")
-        young_pending = _echo("echo:young-pending", int(self.now - 120), "young send")
-        old_dropped = _echo("echo:old-dropped", int(self.now - sb.ECHO_MIRROR_DROPPED_MAX_AGE_S - 60), "old loss",
-                            dropped=True)
-        young_dropped = _echo("echo:young-dropped", int(self.now - sb.ECHO_MIRROR_PENDING_MAX_AGE_S - 60), "loss",
-                              dropped=True)
-        self._stash([old_pending, young_pending, old_dropped, young_dropped])
+    def test_a_small_mirror_keeps_old_echoes_and_a_large_one_sheds_its_oldest(self):
+        """No age bound: an old stale or never-delivered echo still rides a small mirror (the restart contract). Over the
+        budget, the oldest go first."""
+        old = [_echo("echo:old-stale", 5, "three day old words", stale=True, dropped=True),
+               _echo("echo:old-pending", 2000, "an old send")]
+        self._stash(old)
+        self.be._persist_echoes(SID)
+        self.assertEqual(sorted(e.get("uuid") for e in sb.read_reg(Path(self.d), SID)["echoes"]),
+                         ["echo:old-pending", "echo:old-stale"])
+        big = "y" * 8192
+        old_big = [_echo("echo:big-%03d" % i, int(self.now) - 7200 - i, big) for i in range(60)]    # about 490 KB, 2 h old
+        self._stash(old_big)
         self.be._persist_echoes(SID)
         kept = [e.get("uuid") for e in sb.read_reg(Path(self.d), SID)["echoes"]]
-        self.assertEqual(sorted(kept), ["echo:young-dropped", "echo:young-pending"])
+        self.assertLess(self._reg_bytes(), sb.ECHO_MIRROR_MAX_BYTES + 16 * 1024)
+        self.assertIn("echo:big-000", kept, "the newest of the old sends stay")
+        self.assertNotIn("echo:big-059", kept, "the oldest go first")
 
     def test_the_selector_keeps_order_and_never_drops_a_fresh_send(self):
         now = 1_800_000_000.0

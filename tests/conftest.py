@@ -118,9 +118,6 @@ os.environ["GIT_AUTHOR_EMAIL"] = os.environ["GIT_COMMITTER_EMAIL"] = "tests@exam
 
 os.environ["XDG_STATE_HOME"] = tempfile.mkdtemp(prefix="romp-tests-state-")   # inside the root; the hook records it
 os.environ.pop("ROMP_STATE_DIR", None)  # a live kernel exports this to its sessions; it outranks the XDG floor
-# the registry-lock guard's hit file (see ROMP_REG_LOCK_GUARD below): one per run, in the controller's state root, which xdist
-# workers inherit; _fail_on_reg_lock_guard_hits reads it at the run's end
-os.environ.setdefault("ROMP_REG_LOCK_GUARD_LOG", os.path.join(os.environ["XDG_STATE_HOME"], "reg-lock-guard-hits.tsv"))
 # the postal bus port likewise (2026-09-11): a machine whose bus runs on a named port hands ROMP_POSTAL_PORT to every
 # session's shell, and a test run from one would carry the machine's name into every lab and in-process kernel; the
 # bus refuses its fixed port under a test unless the port is the run's own, which the marker beside a port says
@@ -141,6 +138,9 @@ os.environ.setdefault("ROMP_REG_LOCK_GUARD", "raise")   # 2026-10-09: a session 
 #                                        registry lock raises, so a hook or handler that writes the registry on the loop fails its test
 #                                        (sdk_backend._RegLock; the writers still owed are named in REG_LOCK_LOOP_WRITERS_OWED). "record"
 #                                        collects instead of raising. tests/__init__.py carries the same line for the unittest runner
+# ...and its hit file: one per run, in the controller's state root, which xdist workers inherit; _fail_on_reg_lock_guard_hits
+# reads it at the run's end, so a raise a handler swallowed still fails the run
+os.environ.setdefault("ROMP_REG_LOCK_GUARD_LOG", os.path.join(os.environ["XDG_STATE_HOME"], "reg-lock-guard-hits.tsv"))
 # No test spawns a per-session HOST by omission (2026-09-11, T348): hosts are on by default now, so a backend built over
 # a state dir with no `session-hosts` file starts a real bin/romp-session-host for any session it connects. The root the
 # runner floors carries the toggle set to off from the start, re-asserted per test below (a test that deletes or rewrites

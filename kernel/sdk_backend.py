@@ -11015,45 +11015,36 @@ LIVE_TAIL_CAP = 100
 # rewrites the whole file under the one registry lock, and the echo list was most of the largest files: 1.04 MB of a
 # 1.1 MB registry, 100 echoes of about 10 KB each, every one still pending at up to 11.8 hours old (sends whose landing
 # was never noticed, not sends in flight). What a restart needs from the mirror (_reseed_echoes, _mark_dropped_echoes):
-# the sends still in flight, so they stay visible or are flagged never delivered, and the never-delivered records the
-# chat shows with restore and dismiss. So the mirror keeps pending echoes up to ECHO_MIRROR_PENDING_MAX_AGE_S old,
-# dropped ones up to ECHO_MIRROR_DROPPED_MAX_AGE_S, only the newest ECHO_MIRROR_LANDED_KEEP landed ones (their records
-# are in the transcript), and within ECHO_MIRROR_MAX_BYTES drops the oldest first, never a pending echo younger than
-# ECHO_MIRROR_PENDING_FLOOR_S. The in-memory live tail is untouched: only what is written for the next kernel shrinks.
-ECHO_MIRROR_PENDING_MAX_AGE_S = 6 * 3600
+# the sends still in flight, so they stay visible or are flagged never delivered, and the never-delivered, stale and
+# refused records the chat shows with restore and dismiss, however old (a stale echo rides the mirror by design). So
+# the mirror keeps only the newest ECHO_MIRROR_LANDED_KEEP landed echoes (their records are in the transcript), and
+# when the rest pass ECHO_MIRROR_MAX_BYTES drops the oldest first, landed before any other, and never a pending echo
+# younger than ECHO_MIRROR_PENDING_FLOOR_S. No age bound: a small mirror keeps everything it kept before. The
+# in-memory live tail is untouched: only what is written for the next kernel shrinks.
 ECHO_MIRROR_PENDING_FLOOR_S = 3600
-ECHO_MIRROR_DROPPED_MAX_AGE_S = 24 * 3600
 ECHO_MIRROR_LANDED_KEEP = 5
 ECHO_MIRROR_MAX_BYTES = 256 * 1024
 
 
 def echo_mirror_select(entries: list, now: float) -> list:
     """The echo mirror entries worth persisting (see ECHO_MIRROR_*), in their original order."""
-    def age(e):
+    def t_of(i):
         try:
-            return now - float(e.get("t") or 0)
+            return float(entries[i].get("t") or 0)
         except (TypeError, ValueError):
             return 0.0
     landed = [i for i, e in enumerate(entries) if e.get("landed")]
-    keep_landed = set(sorted(landed, key=lambda i: -float(entries[i].get("t") or 0))[:ECHO_MIRROR_LANDED_KEEP])
-    keep = []
-    for i, e in enumerate(entries):
-        if e.get("landed"):
-            ok = i in keep_landed
-        elif e.get("dropped"):
-            ok = age(e) <= ECHO_MIRROR_DROPPED_MAX_AGE_S
-        else:
-            ok = age(e) <= ECHO_MIRROR_PENDING_MAX_AGE_S
-        if ok:
-            keep.append(i)
+    keep_landed = set(sorted(landed, key=lambda i: -t_of(i))[:ECHO_MIRROR_LANDED_KEEP])
+    keep = [i for i, e in enumerate(entries) if not e.get("landed") or i in keep_landed]
     size = {i: len(json.dumps(entries[i])) for i in keep}
     total = sum(size.values())
     if total > ECHO_MIRROR_MAX_BYTES:
-        for i in sorted(keep, key=lambda i: float(entries[i].get("t") or 0)):     # oldest first
+        order = sorted(keep, key=lambda i: (0 if entries[i].get("landed") else 1, t_of(i)))   # landed first, oldest first
+        for i in order:
             if total <= ECHO_MIRROR_MAX_BYTES:
                 break
             e = entries[i]
-            if not e.get("landed") and not e.get("dropped") and age(e) < ECHO_MIRROR_PENDING_FLOOR_S:
+            if not e.get("landed") and not e.get("dropped") and now - t_of(i) < ECHO_MIRROR_PENDING_FLOOR_S:
                 continue                                    # a send that may still be in flight: always kept
             keep.remove(i)
             total -= size[i]
