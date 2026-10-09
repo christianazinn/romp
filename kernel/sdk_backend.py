@@ -5864,6 +5864,10 @@ class SdkSession:
         # scan raised: logged once, the hold escapes on the next turn frame), "t", "off", "fsid" (the
         # transcript mark the landing scan starts at, _transcript_mark), plus the scan's own cursor keys}.
         self._untaken = None
+        # The CLI's prompt queue as its transcript's queue-operation records tell it (_queue_ledger_fold), from this
+        # client's first feed on: the take check reads a fed text's removal from it by queue ORDER, since the removal of
+        # a text romp fed carries no text (2026-10-09). None until a feed creates it; dropped with the client.
+        self._qledger = None
         # A RESTORED /compact must light the compacting bracket too (the user 2026-07-22). send() sets
         # _compacting when it enqueues a compact command, but a persisted queue lands here INSTEAD of
         # going through send() — any /compact still queued when the kernel died arrives this way. Without
@@ -6639,6 +6643,11 @@ class SdkSession:
                                              cursor=u)
         except Exception:
             seen = None
+        if seen is False:
+            v = self._ledger_take(u)                 # the removal by queue order (_ledger_take), read before any re-head
+            if v is not None:
+                u["take"] = v
+                seen = v in ("record", "absorbed")
         take = u.get("take")
         if seen is False and isinstance(take, tuple) and len(take) == 2 and take[0] == "removed":
             # the CLI removed the text unread before it exited (a hook dropped it; _untaken_taken's third answer, which no
@@ -7811,6 +7820,11 @@ class SdkSession:
                 off, fsid = self.backend._transcript_mark(self.sid)
                 if self._untaken is not None:
                     self._untaken["off"], self._untaken["fsid"] = off, fsid
+                led = getattr(self, "_qledger", None)
+                if isinstance(off, int) and fsid is not None and (led is None or led.get("fsid") != str(fsid)):
+                    # the queue ledger starts at this client's first feed (or a new transcript file): everything this
+                    # text's removal can be told apart from is enqueued at or after this mark (_queue_ledger_fold)
+                    self._qledger = {"fsid": str(fsid), "scan_off": off, "entries": [], "n": 0}
                 self._persist_queue()               # the fed turn leaves the persisted queue (it lands in the transcript)
                 if fresh:
                     self.since = int(time.time())    # a new turn starts now (mid-turn forwards keep the turn's clock)
@@ -7872,6 +7886,7 @@ class SdkSession:
             # long enough to finish the drained turn, and when it did the next build finds the record and
             # prunes the flag (_mark_dropped_echoes is self-correcting).
             u, self._untaken = self._untaken, None
+            self._qledger = None                     # the queue it read died with the client; the next feed starts a new one
             if u is not None and u.get("settled"):
                 with self._lock:
                     self._inflight_texts.append(u.get("item", u["text"]))
@@ -8897,6 +8912,19 @@ class SdkSession:
             return getattr(msg, "subtype", None) == "init"
         return type(msg).__name__.lstrip("_") == "UserMessage"
 
+    def _ledger_take(self, u):
+        """The hold `u`'s take as the session's queue ledger reads it (_queue_ledger_fold, _queue_ledger_verdict):
+        "absorbed", "record", ("removed", reason), or None (no verdict yet, no ledger, or a read that failed: the hold
+        then waits on its other events, the landing scan's fault line covering an unreadable transcript)."""
+        led = getattr(self, "_qledger", None)
+        if not isinstance(led, dict) or not isinstance(u.get("off"), int):
+            return None
+        try:
+            _queue_ledger_fold(self.backend.state_dir, self.sid, led)
+            return _queue_ledger_verdict(led, u)
+        except Exception:
+            return None
+
     def _untaken_taken(self, msg, AssistantMessage, ResultMessage, SystemMessage) -> bool:
         """Has the CLI TAKEN the last fed text (self._untaken), so the next queued text may be fed
         without the two fusing into one message? `msg` is the frame just streamed. Three exact events,
@@ -8916,9 +8944,12 @@ class SdkSession:
             the next text can follow it into the same turn instead of waiting for the turn to end. The
             CLI's queue-operation remove of the text with reason absorbed_mid_turn is the same take
             (2026-10-09: on one CLI version it was the ONLY record some mid-turn takes left, and a hold
-            waiting for the attachment parked a long-running session's queue for over an hour); a remove
-            for any other reason (dropped_by_hook) releases the hold as well, since the text is no longer
-            in the CLI's queue, and is reported as removed unread, never as delivered.
+            waiting for the attachment parked a long-running session's queue for over an hour). A text
+            romp feeds is a content-block list, whose removal the CLI writes WITHOUT its text, so the
+            removal is read by queue order from the session's ledger (_queue_ledger_fold, _ledger_take),
+            and by text only for an item whose removal names it. A remove for any other reason
+            (dropped_by_hook) releases the hold as well, since the text is no longer in the CLI's queue,
+            and is reported as removed unread, never as delivered.
         Only turn frames count (_turn_frame: the init, assistant messages, the CLI's own user records,
         results); a task, hook, rate-limit or progress frame proves nothing about the queue. The scan is
         bounded: it resumes at the last complete line it read and skips a file that has not grown.
@@ -8942,6 +8973,12 @@ class SdkSession:
                               problem=True, key=("feed-hold-scan", self.sid))
             return isinstance(msg, ResultMessage)
         if seen is True:
+            return True
+        # The text's REMOVAL by queue order (the removal of a text romp fed carries no text, so the scan above can only
+        # match a string-valued item's): the session's queue ledger names the take, absorbed or removed unread.
+        v = self._ledger_take(u)
+        if v is not None:
+            u["take"] = v
             return True
         # The CLI's queue-operation REMOVE of the text for a reason other than absorbed_mid_turn (dropped_by_hook
         # first among them; _text_landed leaves the verdict in u["take"]): the text is off the CLI's queue, so the
@@ -11117,13 +11154,19 @@ def _queue_removal(rec: dict):
     reason = rec.get("reason")
     if not isinstance(reason, str) or not reason:
         return None
-    c = rec.get("content")
+    out = _queue_text_keys(rec.get("content"))
+    return (reason, out) if out else None
+
+
+def _queue_text_keys(c) -> set:
+    """The match keys of a queue-operation record's `content` (a string, or a content-block list), keyed as
+    _landed_texts keys a landing; empty when the record carries no text."""
     if isinstance(c, str):
         blocks = [c]
     elif isinstance(c, list):
         blocks = [str(b.get("text") or "") for b in c if isinstance(b, dict) and b.get("type") == "text"]
     else:
-        return None
+        return set()
     out: set = set()
     joined = echo_text_key(" ".join(blocks))
     if joined:
@@ -11136,7 +11179,120 @@ def _queue_removal(rec: dict):
         ck = command_text_key(k)
         if ck:
             out.add(ck)
-    return (reason, out) if out else None
+    return out
+
+
+QUEUE_LEDGER_CAP = 512      # entries a session's queue ledger keeps (resolved ones included, for the verdict read)
+
+
+def _queue_ledger_fold(state_dir, sid: str, led: dict) -> None:
+    """Fold the sid's transcript QUEUE-OPERATION records, from where `led` last stopped to EOF, onto `led`, the session's
+    ledger of the CLI's prompt queue (SdkSession._qledger), so the feed hold can tell WHICH queued item a removal took.
+
+    Why a ledger and not a text match (measured 2026-10-09, counts only): the CLI writes `content` on a queue record only
+    when the queued value is a string. A text romp feeds is a content-block list, and the CLI's enqueue of it still
+    carries the text, but its REMOVE carries none: since 2026-10-08 the session transcripts on one machine held 12,918
+    peer-mail and 4,091 tagged enqueues with content and not one peer-mail or tagged remove with content, beside 7,233
+    content-less absorbed removes; the CLI's own notices (string values) keep their content on both. So a fed text's
+    removal is identified by queue ORDER: the CLI writes one remove per item, in queue order, each batch's removes in one
+    synchronous run.
+
+    Rules, per record in file order (`led["entries"]`, each {n, pos, keys, notice, res}; `res` None while pending):
+      * enqueue: a new pending entry at its byte offset `pos`, keyed by its content (None when it has none); `notice`
+        marks a CLI harness notice (a task notification, a system reminder: event_model.SYSTEM_WRAPPER_RE), whose own
+        removal always carries its text;
+      * remove WITH content: resolves the oldest pending entry with a common key, with the record's reason ("remove"
+        when it has none); a remove naming no tracked entry is an item queued before the ledger began, ignored;
+      * remove WITHOUT content: resolves the oldest pending entry that is not a notice (a notice's removal would have
+        carried its text), else nothing; a reason-less one resolves it as "remove";
+      * dequeue (the CLI's drain into a new turn, no reason, no content): resolves the oldest pending entry, "dequeue";
+      * popAll: resolves every pending entry, "popAll".
+    The ledger starts at the first feed of a client (SdkSession creates it with the feed's transcript mark), so the text
+    fed before the current one is IN it: a late content-less removal of that earlier text resolves the earlier entry,
+    never the current one. Items the CLI queued before the ledger began are not in it; a content-less removal of such an
+    item would resolve the oldest tracked entry (documented residual: a CLI the previous kernel fed, kept by its host).
+    A new transcript file (a /clear, a fork) restarts the ledger at that file's start. The read resumes after the last
+    complete line, skips a line still being written, and keeps QUEUE_LEDGER_CAP entries. Raises when the transcript
+    cannot be read; the caller turns that into no verdict."""
+    reg = read_reg(state_dir, sid) or {}
+    cur = str(reg.get("lastSid") or sid)
+    path = transcript_path(reg.get("cwd") or "", cur)
+    size = os.path.getsize(path)
+    if led.get("fsid") != cur:
+        led.clear()
+        led.update(fsid=cur, scan_off=0, entries=[], n=0)
+    pos = led.get("scan_off")
+    if not isinstance(pos, int) or isinstance(pos, bool) or not 0 <= pos <= size:
+        pos = 0
+    entries = led.setdefault("entries", [])
+    if pos < size:
+        with open(path, "rb") as f:
+            f.seek(pos)
+            for raw in f:
+                if not raw.endswith(b"\n"):
+                    break                          # a line still being written: read it whole next time
+                at = pos
+                pos += len(raw)
+                if b'"queue-operation"' not in raw:
+                    continue
+                try:
+                    rec = json.loads(raw.decode(errors="replace"))
+                except ValueError:
+                    continue
+                if not isinstance(rec, dict) or rec.get("type") != "queue-operation":
+                    continue
+                op = rec.get("operation")
+                pending = [e for e in entries if e["res"] is None]
+                if op == "enqueue":
+                    c = rec.get("content")
+                    led["n"] = int(led.get("n") or 0) + 1
+                    entries.append({"n": led["n"], "pos": at, "keys": _queue_text_keys(c) or None,
+                                    "notice": isinstance(c, str) and bool(_em.SYSTEM_WRAPPER_RE.match(c)), "res": None})
+                elif op == "remove":
+                    reason = rec.get("reason") if isinstance(rec.get("reason"), str) and rec.get("reason") else "remove"
+                    keys = _queue_text_keys(rec.get("content"))
+                    if keys:
+                        hit = next((e for e in pending if e["keys"] and e["keys"] & keys), None)
+                    else:
+                        hit = next((e for e in pending if not e["notice"]), None)
+                    if hit is not None:
+                        hit["res"] = reason
+                elif op == "dequeue":
+                    if pending:
+                        pending[0]["res"] = "dequeue"
+                elif op == "popAll":
+                    for e in pending:
+                        e["res"] = "popAll"
+                if len(entries) > QUEUE_LEDGER_CAP:
+                    del entries[:-QUEUE_LEDGER_CAP]
+    led["scan_off"] = pos
+
+
+def _queue_ledger_verdict(led: dict, u: dict):
+    """The feed hold `u`'s take as the queue ledger reads it (_queue_ledger_fold): its entry is the first enqueue at or
+    after the feed's transcript mark (u["off"], on u["fsid"]) carrying its text, remembered on `u` as `led_n`; once that
+    entry is resolved, "absorbed" (reason absorbed_mid_turn: taken into the running turn), "record" (a dequeue: drained
+    into a new turn, whose own record lands it), or ("removed", reason) for any other reason; None while it is pending,
+    when no such enqueue has been read, or when it was resolved by a reason-less remove or a popAll (no verdict about
+    delivery: the hold keeps waiting for its other events)."""
+    entries = led.get("entries") or []
+    n = u.get("led_n")
+    if n is None:
+        if led.get("fsid") != u.get("fsid") or not isinstance(u.get("off"), int):
+            return None
+        want = set(echo_keys(u.get("text") or ""))
+        hit = next((e for e in entries if e["pos"] >= u["off"] and e["keys"] and e["keys"] & want), None)
+        if hit is None:
+            return None
+        n = u["led_n"] = hit["n"]
+    e = next((e for e in entries if e["n"] == n), None)
+    if e is None or e["res"] is None or e["res"] in ("remove", "popAll"):
+        return None
+    if e["res"] == QUEUE_REMOVE_ABSORBED:
+        return "absorbed"
+    if e["res"] == "dequeue":
+        return "record"
+    return ("removed", e["res"])
 
 
 def _record_epoch(ts) -> int | None:

@@ -9,7 +9,12 @@ version some mid-turn takes left only the CLI's queue bookkeeping record, a queu
 absorbed_mid_turn, and no attachment, so the hold never saw the take: busy sessions whose turns never end kept every
 later text queued for over an hour.
 
-The fix reads the remove too (sdk_backend._queue_removal, through _text_take):
+The CLI writes a queue record's text only for a string-valued item: the enqueue of a text romp feeds carries the text,
+its remove carries none. So the fix reads the removal by queue ORDER from a per-session ledger of the CLI's queue
+records (sdk_backend._queue_ledger_fold: content-less removes resolve the oldest pending item that is not a CLI notice,
+whose own removals keep their text), and by text where the removal names it (_queue_removal, through _text_take):
+  * the previous text's late removal resolves the previous text, never the one now held, and a CLI notice queued ahead
+    of the fed text does not take its content-less removal;
   * an absorbed_mid_turn removal naming the fed text is a take: the hold releases, the next text feeds into the same
     turn, the echoes it speaks for land by id (no record carries their text for the by-text retire), and it is
     counted (feed_take_counts);
@@ -106,8 +111,10 @@ class TakeOnTheCLIsQueueRemoval(unittest.TestCase):
         return self.be.feed_take_counts()
 
     def test_an_absorbed_removal_with_no_attachment_releases_the_hold_and_the_next_text_feeds(self):
-        """The incident: the CLI took the fed text into its running turn and wrote only the remove. The hold
-        releases on the next turn frame and the text behind it follows into the SAME turn."""
+        """The incident: the CLI took the fed text into its running turn and wrote only its queue bookkeeping, the
+        enqueue (carrying the text) and an absorbed_mid_turn remove carrying NONE (the CLI writes a remove's text only
+        for a string-valued item, and a fed text is a content-block list). The hold releases on the next turn frame and
+        the text behind it follows into the SAME turn."""
         s, c = self.s, self._first_turn()
         q1 = self._send("please also rerun the lint step", user=True)
         self._wait(lambda: len(c.writes) == 2, "the first mid-turn send forwarded")
@@ -118,7 +125,7 @@ class TakeOnTheCLIsQueueRemoval(unittest.TestCase):
         self._assistant(c)                                   # a turn frame with only the enqueue on disk: no take
         self._settle()
         self.assertEqual(len(c.writes), 2, "an enqueue is not a take")
-        self._append(_remove_op("please also rerun the lint step"))
+        self._append(_remove_op(None))                       # absorbed_mid_turn, no content: the live shape
         self._assistant(c)
         self._wait(lambda: len(c.writes) == 3, "the next text fed after the absorbed removal")
         self.assertEqual(c.writes[2], ("and then summarise what changed", "turn-1"), "into the same running turn")
@@ -130,13 +137,26 @@ class TakeOnTheCLIsQueueRemoval(unittest.TestCase):
         self.assertIsNone(self._echo(q1), "the landed echo retires with no record of its text (prune_live's _landed exit)")
         self.assertIsNotNone(self._echo(q2))
 
+    def test_a_removal_that_names_the_text_releases_it_too(self):
+        """A string-valued item's removal carries its text: matched by text, with no enqueue needed."""
+        s, c = self.s, self._first_turn()
+        s.enqueue("first note")
+        self._wait(lambda: len(c.writes) == 2, "the first note forwarded")
+        s.enqueue("second note")
+        self._append(_remove_op("first note"))
+        self._assistant(c)
+        self._wait(lambda: len(c.writes) == 3, "released by the removal naming it")
+        self.assertEqual(self._counts().get("absorbed_removal"), 1)
+
     def test_joined_mail_and_tagged_sends_match_their_removal(self):
-        """Mail and tagged sends queued back to back go in as one joined text; the CLI's removal names that joined
-        text, so it releases the hold, every part's echo lands, and every mail id is reported read."""
+        """Mail and tagged sends queued back to back go in as one joined text; the enqueue carries the joined text and
+        the CLI's content-less absorbed removal resolves it by queue order, so the hold releases, every part's echo
+        lands, and every mail id is reported read."""
         s, c = self.s, self._first_turn()
         reports = self._reports()
         s.enqueue("hold this")
         self._wait(lambda: len(c.writes) == 2, "the holding send forwarded")
+        self._append(_enqueue_op("hold this"))
         b1, b2 = _banner(_mid(1)), _banner(_mid(2), body="the cache is warm")
         t1, t2 = _tagged("build 7 finished green on TESTHOST"), _tagged("deploy queued", label="ci")
         s.enqueue_postal(b1, [_mid(1)])
@@ -144,13 +164,17 @@ class TakeOnTheCLIsQueueRemoval(unittest.TestCase):
         s.enqueue_postal(b2, [_mid(2)])
         qb = self._send(t2)
         s.enqueue("the person's own words")                 # not joinable: waits behind the joined text
-        self._append(_splice("hold this"))
+        self._append(_splice("hold this"))                  # the holding send taken by its attachment, the old shape
+        self._append(_remove_op(None))                      # ...and its own content-less removal right behind it
         self._assistant(c)
         joined = SEP.join([b1, t1, b2, t2])
         self._wait(lambda: len(c.writes) == 3, "the joined text fed")
         self.assertEqual(c.writes[2][0], joined)
         self._append(_enqueue_op(joined))
-        self._append(_remove_op(joined))
+        self._assistant(c)
+        self._settle()
+        self.assertEqual(len(c.writes), 3, "the holding send's removal resolved the holding send, not the joined text")
+        self._append(_remove_op(None))
         self._assistant(c)
         self._wait(lambda: len(c.writes) == 4, "the text behind the joined one fed after its absorbed removal")
         self.assertEqual(c.writes[3], ("the person's own words", "turn-1"))
@@ -159,6 +183,46 @@ class TakeOnTheCLIsQueueRemoval(unittest.TestCase):
         for q in (qa, qb):
             self.assertTrue((self._echo(q) or {}).get("_landed"), "each tagged part's echo landed by id")
         self.assertEqual(self._counts().get("absorbed_removal"), 1, "one removal take: the holding send's attachment take is not one")
+
+    def test_the_previous_texts_late_removal_does_not_release_the_current_one(self):
+        """The previous text was taken by its attachment and the hold moved on; its content-less removal is written
+        only AFTER the next text's enqueue. Queue order gives that removal to the previous text, so the current one
+        stays held until its own removal."""
+        s, c = self.s, self._first_turn()
+        s.enqueue("note A")
+        self._wait(lambda: len(c.writes) == 2, "A forwarded")
+        self._append(_enqueue_op("note A"))
+        s.enqueue("note B")
+        s.enqueue("note C")
+        self._append(_splice("note A"))
+        self._assistant(c)
+        self._wait(lambda: len(c.writes) == 3, "B fed on A's attachment")
+        self._append(_enqueue_op("note B"))
+        self._append(_remove_op(None))                       # A's removal, late
+        self._assistant(c)
+        self._settle()
+        self.assertEqual(len(c.writes), 3, "A's late removal is A's: C is not fed to fuse with B")
+        self._append(_remove_op(None))                       # B's own
+        self._assistant(c)
+        self._wait(lambda: len(c.writes) == 4, "C fed on B's removal")
+        self.assertEqual(c.writes[3], ("note C", "turn-1"))
+
+    def test_a_pending_notice_ahead_does_not_take_the_content_less_removal(self):
+        """A CLI notice queued ahead of the fed text keeps its own text on its removal; a content-less removal is the
+        fed text's, and the notice's later removal (with its text) changes nothing."""
+        s, c = self.s, self._first_turn()
+        self._append(_enqueue_op(_q.NOTIF))
+        s.enqueue("note A")
+        self._wait(lambda: len(c.writes) == 2, "A forwarded")
+        self._append(_enqueue_op("note A"))
+        s.enqueue("note B")
+        self._append(_remove_op(None))
+        self._assistant(c)
+        self._wait(lambda: len(c.writes) == 3, "B fed: the content-less removal was A's, not the notice's")
+        self._append(_remove_op(_q.NOTIF, reason="delivered_to_agent"))
+        self._assistant(c)
+        self._settle()
+        self.assertEqual(len(c.writes), 3)
 
     def test_a_dropped_by_hook_removal_releases_the_hold_but_is_reported_never_delivered(self):
         """A hook dropped the fed text: it left the CLI's queue (so the next text may feed) but the turn never read
@@ -172,7 +236,7 @@ class TakeOnTheCLIsQueueRemoval(unittest.TestCase):
         q = self._send("a note the hook will drop", user=True)
         self._wait(lambda: len(c.writes) == 2 and s.pending() == ["a note the hook will drop"], "the note waits")
         self._append(_enqueue_op(b))
-        self._append(_remove_op(b, reason="dropped_by_hook"))
+        self._append(_remove_op(None, reason="dropped_by_hook"))
         self._assistant(c)
         self._wait(lambda: len(c.writes) == 3, "the note fed once the dropped mail left the CLI's queue")
         self._settle()
@@ -188,7 +252,7 @@ class TakeOnTheCLIsQueueRemoval(unittest.TestCase):
 
         # the note the person sent is dropped too: its echo is flagged never delivered, and never re-fed
         self._append(_enqueue_op("a note the hook will drop"))
-        self._append(_remove_op("a note the hook will drop", reason="dropped_by_hook"))
+        self._append(_remove_op(None, reason="dropped_by_hook"))
         self._assistant(c)
         self._wait(lambda: (self._echo(q) or {}).get("dropped"), "the dropped note's echo flagged")
         e = self._echo(q)
@@ -202,56 +266,66 @@ class TakeOnTheCLIsQueueRemoval(unittest.TestCase):
         self.assertIsNotNone(self._echo(q), "a dropped echo stays visible until the person dismisses it")
 
     def test_a_reasonless_or_foreign_removal_releases_nothing(self):
-        """A remove with no reason (an older CLI's discard), one with no text, and one naming another text say nothing
-        about the fed text: the hold stays until its own take."""
+        """A remove with no reason (an older CLI's discard: no verdict about delivery), and removals naming other texts,
+        say nothing about the fed text: the hold stays until its own take, here its attachment."""
         s, c = self.s, self._first_turn()
         s.enqueue("first note")
         self._wait(lambda: len(c.writes) == 2, "the first note forwarded")
         s.enqueue("second note")
-        self._append(_remove_op("first note", reason=None))
-        self._append(_remove_op(None))
         self._append(_remove_op("some other text"))
         self._append(_remove_op("some other text", reason="dropped_by_hook"))
+        self._append(_remove_op(None))                       # content-less, before the note's enqueue: not the note's
         self._assistant(c)
         self._settle()
         self.assertEqual(len(c.writes), 2, "none of these is the first note's take")
-        self.assertEqual(self._counts(), {})
-        self._append(_remove_op("first note"))
+        self._append(_enqueue_op("first note"))
+        self._append(_remove_op(None, reason=None))          # reason-less: resolves the entry with no verdict
         self._assistant(c)
-        self._wait(lambda: len(c.writes) == 3, "its own absorbed removal is")
+        self._settle()
+        self.assertEqual(len(c.writes), 2, "a reason-less removal is no take")
+        self.assertEqual(self._counts(), {})
+        self._append(_splice("first note"))
+        self._assistant(c)
+        self._wait(lambda: len(c.writes) == 3, "its attachment still is")
 
     def test_the_queued_command_attachment_still_releases_the_hold_and_counts_no_removal(self):
         s, c = self.s, self._first_turn()
         q = self._send("check the release notes", user=True)
         self._wait(lambda: len(c.writes) == 2, "forwarded")
+        self._append(_enqueue_op("check the release notes"))
         s.enqueue("then tag the release")
         self._append(_splice("check the release notes"))
         self._assistant(c)
         self._wait(lambda: len(c.writes) == 3, "the attachment is the take, as before")
         self.assertEqual(self._counts(), {}, "no removal take counted")
         self.assertFalse((self._echo(q) or {}).get("_landed"), "its echo retires by text on the record, as before")
-        # the removal the CLI writes after the attachment changes nothing for the text now held
-        self._append(_remove_op("check the release notes"))
-        self._assistant(c)
-        self._settle()
-        self.assertEqual(len(c.writes), 3)
-        self.assertEqual(self._counts(), {})
+
+    def test_the_cli_exiting_after_an_absorbed_removal_does_not_re_head_the_text(self):
+        """The CLI took the text with only its removal and exited before any turn frame acted on it: the exit release
+        reads the ledger and leaves it alone, where a text with no trace at all is re-headed."""
+        s, c = self.s, self._first_turn()
+        s.enqueue("a note the turn read")
+        self._wait(lambda: len(c.writes) == 2, "forwarded")
+        self._append(_enqueue_op("a note the turn read"))
+        self._append(_remove_op(None))
+        s._release_hold_at_exit()
+        self.assertIsNone(s._untaken)
+        self.assertEqual(s.pending(), [], "not re-headed: the turn read it")
+        self.assertTrue(any("after taking the last fed text" in l for l in self.lines))
 
     def test_the_cli_exiting_after_a_dropped_removal_does_not_re_head_the_text(self):
         """The CLI removed the text unread and exited before any turn frame acted on it: the exit release reads the
-        removal and takes the same road (flagged, not re-fed), where a text with no record at all is re-headed."""
+        removal and takes the same road (flagged, not re-fed)."""
         s, c = self.s, self._first_turn()
         q = self._send("a note the hook will drop", user=True)
         self._wait(lambda: len(c.writes) == 2, "forwarded")
         self._append(_enqueue_op("a note the hook will drop"))
-        self._append(_remove_op("a note the hook will drop", reason="dropped_by_hook"))
-        u = s._untaken
+        self._append(_remove_op(None, reason="dropped_by_hook"))
         s._release_hold_at_exit()
         self.assertIsNone(s._untaken)
         self.assertEqual(s.pending(), [], "not re-headed")
         self.assertTrue((self._echo(q) or {}).get("dropped"), "flagged never delivered")
         self.assertEqual(self._counts().get("removed:dropped_by_hook"), 1)
-        self.assertIsNotNone(u)
 
 
 class TheLandingScanReadsRemovals(unittest.TestCase):
@@ -287,6 +361,24 @@ class TheLandingScanReadsRemovals(unittest.TestCase):
         future = int(time.time()) + 3600
         self.assertIs(self.be._text_take(SID, "alpha", future, 0, FSID), False,
                       "a removal stamped before the send is an older copy's, like any record")
+
+    def test_the_ledger_resolves_removals_by_queue_order(self):
+        self._write([{"type": "user", "uuid": "11111111-2222-3333-4444-000000000001", "message": {"content": "x"}}])
+        led = {"fsid": FSID, "scan_off": 0, "entries": [], "n": 0}
+        self._write([_enqueue_op(_q.NOTIF), _enqueue_op("alpha"), _enqueue_op("beta"), _enqueue_op("gamma"),
+                     _remove_op(None), _remove_op(_q.NOTIF), _remove_op(None, reason="dropped_by_hook"),
+                     {"type": "queue-operation", "operation": "dequeue", "timestamp": _q._iso(time.time())}])
+        sb._queue_ledger_fold(self.state, SID, led)
+        res = [(sorted(e["keys"])[0][:6] if e["keys"] else None, e["res"]) for e in led["entries"]]
+        self.assertEqual([r[1] for r in res], ["absorbed_mid_turn", "absorbed_mid_turn", "dropped_by_hook", "dequeue"],
+                         "content-less removes skip the pending notice; the notice's own removal names it; dequeue takes the oldest")
+        self.assertEqual(sb._queue_ledger_verdict(led, {"text": "alpha", "off": 0, "fsid": FSID}), "absorbed")
+        self.assertEqual(sb._queue_ledger_verdict(led, {"text": "beta", "off": 0, "fsid": FSID}), ("removed", "dropped_by_hook"))
+        self.assertEqual(sb._queue_ledger_verdict(led, {"text": "gamma", "off": 0, "fsid": FSID}), "record")
+        self.assertIsNone(sb._queue_ledger_verdict(led, {"text": "delta", "off": 0, "fsid": FSID}), "never enqueued")
+        before = led["scan_off"]
+        sb._queue_ledger_fold(self.state, SID, led)
+        self.assertEqual(led["scan_off"], before, "resumes where it stopped")
 
     def test_a_content_block_list_removal_matches_too(self):
         rec = _remove_op(None)
