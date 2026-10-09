@@ -7844,6 +7844,12 @@ def asm_checkpoint_write(leaf_path, rompuuid, sdk_human=False, tree=None, reason
             if turn_seqs[_i]:
                 _m = min(turn_seqs[_i]) if _m is None else min(_m, min(turn_seqs[_i]))
             suf_min[_i] = _m
+        pre_max, _m = [0] * (len(turns) + 1), 0           # pre_max[ti]: the last record seq over turns[:ti]'s atoms
+        for _i, _sqs in enumerate(turn_seqs):
+            pre_max[_i] = _m
+            if _sqs:
+                _m = max(_m, max(_sqs))
+        pre_max[len(turns)] = _m
         blocked = set()                                   # why candidates fell: the named skip when none survives
         qseqs = {q["seq"] for q in ad.qatts}              # the absorbed attachments' seqs: a turn's bytes begin at the attachments the
         #                                                   CLI spliced before its prompt, so a cut at the prompt's record leaves them
@@ -7869,6 +7875,12 @@ def asm_checkpoint_write(leaf_path, rompuuid, sdk_human=False, tree=None, reason
                 #                                           parent the parse re-points from the /compact stdout to the summary): the
                 #                                           restore's proof walks raw parents, so this cut could never be proven; the
                 #                                           turn before it is the cut (stage one b, correction 1)
+            if pre_max[ti] >= cand:
+                continue                                  # an atom of a pre-cut turn comes from a record at or past the cut (a reply
+                #                                           stamped between the last pre-cut stamp and the cut's first record, a record
+                #                                           parented on the settled tip): the restore would give it a turn of its own
+                #                                           (_restore_first_atom_refusal refuses it), so the turn holding it goes past
+                #                                           the cut (2026-10-09, third review, must-fix 1 and 2)
             if _reused_across(cand):
                 blocked.add("reuse"); continue            # a tail record reuses a uuid the pre-cut bytes carry (a row's, an absorbed
                 #                                           attachment's, a shadowed copy's): the restore cannot rebuild what the parse
@@ -8792,6 +8804,32 @@ def _restore_tail_refusal(ad, max_ppt, pre_gates, pre_boundary=None):
     return None
 
 
+def _restore_first_atom_refusal(last_pre, atoms):
+    """Why a restore over a turns section must refuse the tail atoms `atoms`, or None (2026-10-09, third review, must-fix 1
+    and 2). The restore segments the tail alone and appends its turns after the frozen pre-cut turns; the cold parse segments
+    everything in one sorted walk (segment_turns). The two agree exactly when the tail's first atom in that sort order
+    (t, _seq) opens a fresh turn there: it sorts at or after every pre-cut atom (the last pre-cut turn's maxT, the largest
+    pre-cut stamp, since turns are contiguous runs of the sorted atoms), and it is a compaction boundary (always a fresh
+    turn) or an opener after a last pre-cut turn that ended. After that first atom both walks carry the same state, so the
+    rest of the tail segments alike. `ended` is the turn's flag, which implies the walk's own (a turn the flag calls ended
+    always leaves the walk ended; the converse can fail on a command absorbed mid-turn), so the check can over-refuse there
+    and never under-refuse. `last_pre` None (an atoms-only document, segmented whole with its tail) or no tail atom: None.
+      - order: the first atom sorts before a pre-cut atom (a stamp the carry's watermark does not count, an idle span's);
+      - opener: it opens no fresh turn: a reply or tool_result stamped in the gap between the watermark and the cut's first
+        record, a record parented on the settled pre-cut tip, a prompt after an open pre-cut turn."""
+    if last_pre is None or not atoms:
+        return None
+    first = min(atoms, key=lambda a: (a.get("t") or 0, a.get("_seq", 0)))
+    mt = last_pre.get("maxT")
+    if mt is not None and (first.get("t") or 0) < mt:
+        return "order"
+    if first.get("type") == "system" and first.get("subtype") == "compact_boundary":
+        return None
+    if _is_opener(first) and last_pre.get("ended"):
+        return None
+    return "opener"
+
+
 def _asm_restore_from_doc(key, leaf_path, candidate_files, links, rompuuid, postal_index, sdk_human, reseated, doc, pin):
     """_asm_restore_inner past the document's load: the restored entry served, or None (see there). `pin` is the window pin
     the entry takes ownership of (_tail_pin), or None."""
@@ -8863,6 +8901,18 @@ def _asm_restore_from_doc(key, leaf_path, candidate_files, links, rompuuid, post
         ad._prepass(order, st)
         atoms = list(ad._emit_fold(order, st, rompuuid, postal_index))
         atoms += ad._absorbed(ad.qatts, kept, st, rompuuid, postal_index)
+        why_ = _restore_first_atom_refusal(pre_turns[-1] if pre_turns else None, atoms)
+        if why_ is not None:
+            # the tail's first atom would not open a fresh turn after the frozen last pre-cut turn (2026-10-09, third review,
+            # must-fix 1 and 2): a reply stamped between the watermark and the cut's first record, a record parented on the
+            # settled pre-cut tip. The cold parse files it into that turn; refused like a content refusal (the rewrite's cut
+            # guard then puts the record's turn past the new cut)
+            _asm_stat("restore:%sRefused" % why_)
+            _ASM_DEMOTE_TL.restore_refused = why_
+            with _ASM_CKPT_LOCK:
+                _ASM_CHAIN_REFUSED_PATHS[os.path.realpath(str(leaf_path))] = (
+                    "content", int((((doc.get("files") or {}).get(Path(leaf_path).stem) or {}).get("cut") or [0])[0]))
+            return None
         entry = {"ad": ad, "st": st, "atoms": atoms, "kept": kept, "landed": landed | ad.landed_text_uuids(),
                  "cands": tuple(str(f) for f in candidate_files), "links": dict(links or {}),
                  "recs": dict(ad._src_keys), "n_qatts": len(ad.qatts), "prefix": prefix, "preTurns": pre_turns, "index": index,

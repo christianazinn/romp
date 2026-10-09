@@ -81,6 +81,49 @@ class _Base(R._Roads):
         os.utime(p, (st.st_atime, st.st_mtime))
 
 
+class AGapStampedRecord(_Base):
+    """Defect 1: a reply stamped one second after the watermark, before the cut's first record."""
+
+    def test_after_a_compaction_in_the_same_append(self):
+        wm = _ts(self._rec("a157"))
+        def mutate():
+            b = self._boundary(1, self.t)
+            self._write(b + [self._reply("gap1", b[-1]["uuid"], wm + 1)])
+        d, got = self._go(mutate)
+        self.assertEqual(got, self._ref(), d)
+
+    def test_at_a_boot(self):
+        wm = _ts(self._rec("a157"))
+        d, got = self._go(lambda: self._write([self._reply("gap2", self.parent, wm + 1)]), boot=True)
+        self.assertEqual(got, self._ref(), d)
+
+    def test_control_a_prompt_in_the_gap_still_restores(self):
+        """A prompt in the gap opens its own turn in the cold parse too: the restore answers it (no refusal)."""
+        wm = _ts(self._rec("a157"))
+        def mutate():
+            self._write([{"type": "user", "uuid": "gapu", "parentUuid": self.parent, "timestamp": iso(wm + 1), "promptSource": "typed",
+                          "cwd": "/w/notes-api", "message": {"role": "user", "content": "a prompt in the gap"}}])
+        d, got = self._go(mutate, boot=True)
+        self.assertEqual((d.get("restore"), d.get("full", 0)), (1, 0), d)
+        self.assertEqual(got, self._ref(), d)
+
+
+class ARecordOnTheSettledPreCutTip(_Base):
+    """Defect 2: a record that opens no turn, parented on a157 (the pre-cut tip), stamped current."""
+
+    def test_a_reply_after_an_append(self):
+        d, got = self._go(lambda: self._write([self._reply("tip1", "a157", self.t)]))
+        self.assertEqual(got, self._ref(), d)
+
+    def test_a_reply_at_a_boot(self):
+        d, got = self._go(lambda: self._write([self._reply("tip2", "a157", self.t)]), boot=True)
+        self.assertEqual(got, self._ref(), d)
+
+    def test_a_tool_result_at_a_boot(self):
+        d, got = self._go(lambda: self._write([self._tool_result("tip3", "a157", self.t)]), boot=True)
+        self.assertEqual(got, self._ref(), d)
+
+
 class TheCutSearchIsLinear(R.R2Base):
     """Should-fix: a kept prompt in the last turn stamped near the start steps the writer's cut back one turn per candidate;
     each candidate re-scanned every kept record and every record (d088e830b: 2.1 s at 1,000 turns, 69.8 s at 4,000 in the
