@@ -42,6 +42,7 @@ sb = load_source("romp_sdk_backend", os.path.join(BIN, "romp_sdk_backend.py"))
 ht = sb._ht()
 
 SID = "5e1f0a77-2222-4333-8444-0000000000c1"     # private synthetic sid (never a real session)
+LOOP_PREFIX = getattr(sb, "SESSION_LOOP_THREAD_PREFIX", "sdk:")   # the session loop threads' name prefix (SdkSession.start)
 HELLO = {"t": "hello", "host": {"pid": 4242, "start": "h1"}, "cli": {"pid": 4343, "start": "c1"}, "journal": {"next": 0}}
 
 
@@ -185,7 +186,7 @@ class HooksNotBehindRegLock(unittest.TestCase):
 
         def run():
             out["answer"] = asyncio.run(make_coro())
-        th = threading.Thread(target=run, name=sb.SESSION_LOOP_THREAD_PREFIX + "web-hooks", daemon=True)
+        th = threading.Thread(target=run, name=LOOP_PREFIX + "web-hooks", daemon=True)
         self.be._reg_lock.acquire()
         try:
             th.start()
@@ -269,7 +270,7 @@ class QueueMirrorOnTheLoop(HooksNotBehindRegLock):
     queue before it is fed, as before), queued when the lock is busy, landing the queue as it stands then."""
 
     def _on_loop(self, fn):
-        th = threading.Thread(target=fn, name=sb.SESSION_LOOP_THREAD_PREFIX + "web-queue", daemon=True)
+        th = threading.Thread(target=fn, name=LOOP_PREFIX + "web-queue", daemon=True)
         th.start()
         th.join(3.0)
         return not th.is_alive()
@@ -346,7 +347,7 @@ class SessionLoopRegLockGuard(unittest.TestCase):
         return out
 
     def test_a_registry_write_on_a_session_loop_raises(self):
-        out = self._on_thread(sb.SESSION_LOOP_THREAD_PREFIX + "web", lambda: self.be._update_reg(SID, hostAck={"offset": 1}))
+        out = self._on_thread(LOOP_PREFIX + "web", lambda: self.be._update_reg(SID, hostAck={"offset": 1}))
         self.assertIsInstance(out.get("error"), sb.RegLockOnSessionLoop)
         self.assertNotIn("hostAck", sb.read_reg(Path(self.d), SID) or {})
         self.assertTrue(Path(self.hits).read_text().strip(), "the hit is on file too, so a swallowed raise still fails the run")
@@ -356,7 +357,7 @@ class SessionLoopRegLockGuard(unittest.TestCase):
         try (the queue mirror's) never waits, so it is allowed on a loop."""
         self.assertIn("_persist_cost_state", sb.REG_LOCK_LOOP_WRITERS_OWED)
         self.assertNotIn("_ledger_tool_apply", sb.REG_LOCK_LOOP_WRITERS_OWED)
-        out = self._on_thread(sb.SESSION_LOOP_THREAD_PREFIX + "web", lambda: self.be._update_reg_try(SID, lastStopAt=3))
+        out = self._on_thread(LOOP_PREFIX + "web", lambda: self.be._update_reg_try(SID, lastStopAt=3))
         self.assertTrue(out.get("ok"), out)
         self.assertEqual((sb.read_reg(Path(self.d), SID) or {}).get("lastStopAt"), 3)
 
@@ -366,7 +367,7 @@ class SessionLoopRegLockGuard(unittest.TestCase):
         self.assertEqual((sb.read_reg(Path(self.d), SID) or {}).get("hostAck"), {"offset": 1})
 
     def test_queued_work_from_a_session_loop_does_not_raise(self):
-        out = self._on_thread(sb.SESSION_LOOP_THREAD_PREFIX + "web",
+        out = self._on_thread(LOOP_PREFIX + "web",
                               lambda: self.be._reg_job(None, lambda: self.be._update_reg(SID, lastStopAt=5)))
         self.assertTrue(out.get("ok"), out)
         _drain_writer(self.be)
