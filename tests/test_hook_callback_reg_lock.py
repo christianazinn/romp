@@ -689,6 +689,30 @@ class QueuedJobsTakeValues(HooksNotBehindRegLock):
         # the newer k1 running ahead of k2
         self.assertIn(order, (["k2", "k1-new"], ["k1-old", "k2", "k1-new"]), order)
 
+    def test_a_model_pick_written_while_a_refresh_is_queued_is_not_undone(self):
+        """Review 2 (should-fix): the context refresh's queued write carried modelPending from queue time and landed an
+        old False over a newer pick's True. The mirror is read when the write runs."""
+        class FakeClient:
+            async def get_context_usage(self):
+                return {"percentage": 10, "totalTokens": 1000, "model": ""}
+        self.s.client = FakeClient()
+        self.s._model_pending = ""
+
+        def pick():                                            # what set_model does: the field, then its own write
+            self.s._model_pending = "opus"
+            reg = sb.read_reg(Path(self.d), SID)
+            reg["modelPending"] = True
+            sb.write_reg(Path(self.d), SID, reg)              # landed while the refresh's write waited
+        self._hold_lock_while(lambda: asyncio.run(self.s._do_refresh_context()), pick)
+        self.assertIs(self._reg().get("modelPending"), True, "the queued refresh undid a newer model pick")
+
+    def test_resolving_a_model_switch_does_not_wait_on_the_lock(self):
+        self.s._model_pending = "opus"
+        out = {}
+        self._hold_lock_while(lambda: out.setdefault("cleared", self.s._resolve_model_pending("Opus 4.8")), lambda: None)
+        self.assertTrue(out["cleared"])
+        self.assertIs(self._reg().get("modelPending"), False)
+
     # the inherited hook tests run once, in HooksNotBehindRegLock
     test_post_tool_use_ledger_hook = test_post_tool_use_failure_ledger_hook = test_stop_hook = None
     test_schedule_tool_hook = test_facts_tool_hook = test_worktree_tool_hook_transcript_path = None

@@ -7178,16 +7178,18 @@ class SdkSession:
             upd["liveModel"] = self.model
         if getattr(self, "_model_id", ""):
             upd["liveModelId"] = self._model_id
-        upd["modelPending"] = bool(self._model_pending)
+        # modelPending is NOT captured here: it mirrors self._model_pending, which set_model and its resolve also write
+        # synchronously, so a value captured now could land after a newer pick's write. The queued write reads it when it
+        # runs, under the registry lock (review 2: an old "no switch pending" overwrote a fresh model pick).
         if self._ctx is not None:
             upd["liveCtx"] = self._ctx
             upd["liveCtxOver"] = self._ctx_over
         if self._ctx_tokens is not None:
             upd["liveCtxTokens"] = self._ctx_tokens
-        if upd:
+        if True:                          # modelPending is always written, as before (the refresh is its mirror)
             def write(upd=upd):           # through _reg_job: off this loop thread (2026-10-09); a newer refresh still
                 try:                      # queued replaces this one, so the latest values are the ones written
-                    self.backend._update_reg(self.sid, **upd)
+                    self.backend._update_reg_with(self.sid, lambda: {**upd, "modelPending": bool(self._model_pending)})
                 except Exception as e:
                     self.backend._log("context refresh (%s): registry write failed: %s" % (self.name, e))
             self.backend._reg_job(("liveCtx", self.sid), write)
@@ -8380,10 +8382,14 @@ class SdkSession:
         if not self._model_pending or not _model_reflects_alias(pm, self._model_pending):
             return False
         self._model_pending = ""
-        try:
-            self.backend._update_reg(self.sid, modelPending=False)
-        except Exception as e:
-            self.backend._log("model-pending clear (%s): registry write failed: %s" % (self.name, e))
+
+        def write():
+            # the mirror's value when the write runs (a pick made since then wrote True and must not be undone)
+            try:
+                self.backend._update_reg_with(self.sid, lambda: {"modelPending": bool(self._model_pending)})
+            except Exception as e:
+                self.backend._log("model-pending clear (%s): registry write failed: %s" % (self.name, e))
+        self.backend._reg_job(("modelPending", self.sid), write)   # off the session loop (review 2: it was not)
         return True
 
     def _ctx_pct(self):
@@ -9474,11 +9480,16 @@ class SdkSession:
                     # the first; _complete_rewind_wait is idempotent, first one wins) — it exists for
                     # the turn shapes where Stop never fires (an interrupt that dies straight to the
                     # ResultMessage).
-                    try:
-                        self.backend._complete_rewind_wait(self)
-                    except Exception as e:
-                        self.backend._log("rewind (%s): delete-while-busy completion failed at the "
-                                          "settle: %s" % (self.name, e))
+                    # through _reg_job: on the loop it is queued (its registry writes and transcript read must not stall
+                    # the loop, review 2); it is idempotent and re-checks the flag itself, the Stop hook's queued call
+                    # included, so whichever runs first wins
+                    def complete():
+                        try:
+                            self.backend._complete_rewind_wait(self)
+                        except Exception as e:
+                            self.backend._log("rewind (%s): delete-while-busy completion failed at the "
+                                              "settle: %s" % (self.name, e))
+                    self.backend._reg_job(None, complete)
                 elif self._rewind_to and self._rewind_armed:
                     # the rewind turn settled — the flag is CONSUMED (the leaf moved past the recorded one, so
                     # rewind_disposition would drop it on the next connect anyway; this just tidies the reg now).
