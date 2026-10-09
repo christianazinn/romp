@@ -11675,6 +11675,8 @@ _REG_LOCK_HELPERS = frozenset(("_check", "acquire", "__enter__", "_update_reg", 
 REG_LOCK_LOOP_WRITERS_OWED = frozenset((
     "_on_message",                # per-message registry writes inside the receive loop (lastSid, and others)
     "_persist_cost_state",        # every result: the spend watermark
+    "_write_host_ack_forced",     # the detach's last ack, synchronous on purpose (review 1, must-fix): written before the
+    #                               reconnect reads the registry; the in-memory carry now also covers that read
     "_persist_echoes",            # echo marks written from the loop
     "_learn_model", "_emit_ask", "_clear_ask",
     "_file_host_log_rows",
@@ -11682,6 +11684,19 @@ REG_LOCK_LOOP_WRITERS_OWED = frozenset((
     "_persist_login_evidence", "_fresh_cli_stamp", "_fresh_cli_decision", "_amain", "_host_stand_down",
     "_host_ended", "_record_launch_error", "_heal_cut_session", "_ensure",
 ))
+
+
+def _host_ack_backwards(old, new) -> bool:
+    """Whether writing hostAck `new` over `old` would move the acknowledged offset back for the same host identity."""
+    if not isinstance(old, dict) or not isinstance(new, dict):
+        return False
+    host = str(new.get("host") or "")
+    if not host or host != str(old.get("host") or ""):
+        return False
+    try:
+        return int(new.get("offset", -1)) < int(old.get("offset", -1))
+    except (TypeError, ValueError):
+        return False
 
 
 class RegLockOnSessionLoop(RuntimeError):
@@ -11813,6 +11828,11 @@ class SdkBackend:
         self._reg_jobs_lock = threading.Lock()
         self._reg_jobs_seq = 0
         self._reg_writer = None
+        # sid -> (host identity "pid:start", offset): the newest offset this kernel CONSUMED from a session's host, kept in
+        # memory from every hand-over (2026-10-09, review 1 of the hostAck move). The registry's hostAck can trail it (a
+        # queued write, a write dropped once the CLI exited), so a reconnect in this kernel replays from the larger of the
+        # two for the same host (_host_ack_resume_offset) and never re-delivers records this kernel already took.
+        self._host_ack_carry: dict = {}
         self._pending_ask: dict[str, bool] = {}   # sid -> has an ask awaiting answer
         self._live: dict[str, dict] = {}          # sid -> {key -> atom}: the in-memory LIVE TAIL (ahead of disk)
         self._live_rev: dict[str, int] = {}       # sid -> count of changes to its live tail (add/edit/drop/flag):
@@ -12280,11 +12300,8 @@ class SdkBackend:
             return None
         if state == "attach":
             sess._host_is_attach = True
-            reg = read_reg(self.state_dir, sess.sid) or {}
-            ack = reg.get("hostAck") if isinstance(reg.get("hostAck"), dict) else {}
             holder = lease.get("holder") or {}
-            same_host = str(ack.get("host") or "") == "%s:%s" % (holder.get("pid"), holder.get("start"))
-            offset = int(ack.get("offset", -1)) if same_host else -1
+            offset = self._host_ack_resume_offset(sess, self._holder_ident(lease))
             t = self._new_host_transport(sess, ht.host_sock(self.state_dir, sess.sid), offset)
             sess._host = t
             self._log("host (%s): attaching to the live host (pid %s), replay from %d" % (sess.name, holder.get("pid"), offset + 1))
@@ -12620,7 +12637,7 @@ class SdkBackend:
             ident = "%s:%s" % (ident.get("pid"), ident.get("start"))
         except Exception:
             ident = None
-        offset = int(ack.get("offset", -1)) if (ack and ident and str(ack.get("host") or "") == ident) else -1
+        offset = self._host_ack_resume_offset(sess, ident, reg) if ident else -1
         has_tail = any(True for _ in ht.sh.read_journal_dir(hdir, offset + 1)) if any(hdir.glob("journal-*.jsonl")) else False
         if not died:
             if has_tail:
@@ -12657,6 +12674,7 @@ class SdkBackend:
             self._log("host (%s): replayed the orphan journal from offset %d" % (sess.name, offset + 1))
         remove_lease(self.state_dir, sess.sid)
         shutil.rmtree(str(hdir), ignore_errors=True)
+        self._host_ack_carry.pop(sess.sid, None)
         self._update_reg_dropping(sess.sid, drop=("hostAck", "hostLogPos"))
 
     async def _replay_drain(self, sess, client, msg_classes):
@@ -12673,22 +12691,65 @@ class SdkBackend:
         through _update_reg and the one registry lock every session shares, a busy lock stopped the loop: sessions lost
         every prompt, tool and stop hook to the CLI's 540 s deadline (subagent hooks to its 180 s one) for up to 90
         minutes, and a stack read of the live kernel found 18 of its 34 session threads parked on this call (2026-10-09).
-        So the write goes through _reg_job: queued for the registry writer when called on a session loop, made at once
-        anywhere else. The per-record write reads the session's transport under the lock, so a session that has left its
-        host writes nothing stale. `force` (the detach path's last ack) captures its values NOW, while the transport is
-        still the session's, under the same queue key, so it replaces any per-record write still queued for the session."""
+        So the per-record write goes through _reg_job: queued for the registry writer when called on a session loop, made
+        at once anywhere else. It reads the session's transport under the lock, so a session that has left its host writes
+        nothing stale.
+
+        Every call first notes the offset in memory (_host_ack_carry), so a reconnect in this kernel resumes past what it
+        consumed whatever the registry says. `force` (the detach path's last ack) writes SYNCHRONOUSLY before it returns
+        (_write_host_ack_forced): queued, it lost the race to the reconnect's registry read, the host replayed records
+        the kernel had consumed, and the queued writes landed out of order, moving hostAck backwards (review 1 of this
+        move, reproduced twice). Every hostAck write is also monotonic per host identity (_reg_merge_locked)."""
         t = sess._host
-        if t is None or getattr(t, "hello", None) is None or getattr(t, "exit_info", None) is not None:
-            return                # no host, no hello yet, or a host that reported its exit (its ack is history)
+        if t is None or getattr(t, "hello", None) is None:
+            return                # no host, or no hello yet: no identity to key an offset on
+        self._note_host_ack_carry(sess, t)    # even past the host's exit: records handed over at the exit were consumed
+        if getattr(t, "exit_info", None) is not None:
+            return                # a host that reported its exit: its registry ack is history (the carry keeps the offset)
         now = time.time()
         if not force and now - sess._host_ack_t < 1.0:
             return
         sess._host_ack_t = now
         if force:
-            fields = self._host_ack_fields(t)
-            self._reg_job(("hostAck", sess.sid), lambda: self._reg_write_logged(sess, "hostAck", lambda: fields))
+            self._write_host_ack_forced(sess, t)
             return
         self._reg_job(("hostAck", sess.sid), lambda: self._write_host_ack_now(sess))
+
+    @staticmethod
+    def _host_ident(t) -> str:
+        h = ((getattr(t, "hello", None) or {}).get("host") or {})
+        return "%s:%s" % (h.get("pid"), h.get("start"))
+
+    def _note_host_ack_carry(self, sess, t) -> None:
+        """Remember the newest offset consumed from `t`'s host (see _host_ack_carry); never moves back for one host."""
+        try:
+            ident, off = self._host_ident(t), int(t.ack_offset)
+        except (TypeError, ValueError, AttributeError):
+            return
+        prev = self._host_ack_carry.get(sess.sid)
+        if prev is not None and prev[0] == ident and prev[1] >= off:
+            return
+        self._host_ack_carry[sess.sid] = (ident, off)
+
+    def _host_ack_resume_offset(self, sess, ident: str, reg=None) -> int:
+        """The offset a connect to the host `ident` resumes from: the larger of the registry's hostAck and the in-memory
+        carry, each counted only when it names that host (-1, the whole journal, when neither does). The registry alone
+        trails what this kernel consumed whenever its write is still queued or was dropped at the CLI's exit."""
+        if reg is None:
+            reg = read_reg(self.state_dir, sess.sid) or {}
+        ack = reg.get("hostAck") if isinstance(reg.get("hostAck"), dict) else {}
+        offset = -1
+        if ack and str(ack.get("host") or "") == ident:
+            try:
+                offset = int(ack.get("offset", -1))
+            except (TypeError, ValueError):
+                offset = -1
+        carry = self._host_ack_carry.get(sess.sid)
+        if carry is not None and carry[0] == ident and carry[1] > offset:
+            self._log("host (%s): resuming from offset %d, past the registry's %d (this kernel consumed it; the registry "
+                      "write had not landed)" % (getattr(sess, "name", "?"), carry[1] + 1, offset + 1))
+            offset = carry[1]
+        return offset
 
     @staticmethod
     def _host_ack_fields(t) -> dict:
@@ -12697,11 +12758,17 @@ class SdkBackend:
         return {"hostAck": {"host": "%s:%s" % (h.get("pid"), h.get("start")),
                             "cli": "%s:%s" % (c.get("pid"), c.get("start")), "offset": int(t.ack_offset)}}
 
-    def _reg_write_logged(self, sess, what: str, make_fields) -> None:
+    def _write_host_ack_forced(self, sess, t) -> None:
+        """The detach's last ack, written before this returns, on whatever thread calls it (the session's loop, as it
+        leaves its host): a queued per-record ack for the session is dropped first, since this one carries the newer
+        offset. Named in REG_LOCK_LOOP_WRITERS_OWED: it takes the lock on the loop on purpose."""
+        fields = self._host_ack_fields(t)
+        with self._reg_jobs_lock:
+            self._reg_jobs.pop(("hostAck", sess.sid), None)
         try:
-            self._update_reg_with(sess.sid, make_fields)
+            self._update_reg_with(sess.sid, lambda: fields)
         except Exception as e:
-            self._log("host (%s): %s write failed: %s" % (getattr(sess, "name", "?"), what, e))
+            self._log("host (%s): hostAck write failed: %s" % (getattr(sess, "name", "?"), e))
 
     def _reg_job(self, key, fn) -> None:
         """Run registry work `fn` now, unless the caller is a session's loop thread (on_session_loop): there it is queued
@@ -12766,6 +12833,7 @@ class SdkBackend:
             self._host_recently_ended[sess.sid] = "%s:%s" % (h.get("pid"), h.get("start"))
         if ex.get("cause") in ("end", "end-forced", "eof-grace"):
             shutil.rmtree(str(_ht().host_dir(self.state_dir, sess.sid)), ignore_errors=True)
+            self._host_ack_carry.pop(sess.sid, None)
             self._update_reg_dropping(sess.sid, drop=("hostAck", "hostLogPos"))
 
     def _on_host_hello(self, sess, hello: dict) -> None:
@@ -18878,6 +18946,12 @@ class SdkBackend:
                                  "gutting the reg\n" % (sid[:8], "/".join(sorted(fields))))
                 return
             reg = {"sid": sid}
+        if "hostAck" in fields and _host_ack_backwards(reg.get("hostAck"), fields.get("hostAck")):
+            # hostAck is monotonic per host identity (2026-10-09, review 1 of the hostAck move): a write that waited behind
+            # a newer one (two writers, a queued write and the detach's forced one) is dropped, never landed over it
+            fields = {k: v for k, v in fields.items() if k != "hostAck"}
+            if not fields:
+                return
         reg.update(fields)
         write_reg(self.state_dir, sid, reg)
 

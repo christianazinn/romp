@@ -311,6 +311,108 @@ class QueueMirrorOnTheLoop(HooksNotBehindRegLock):
     test_background_task_mirror_never_writes_back_a_cleared_set = None
 
 
+def _rec(off):
+    return {"t": "out", "offset": off, "data": {"type": "assistant", "message": {"content": []}}}
+
+
+class HostAckNeverBackwards(unittest.TestCase):
+    """Review 1 of the hostAck move (must-fix, reproduced twice): the detach's forced ack was QUEUED, so a reconnect at
+    once read the registry's stale offset (consumed through 9, the registry still 5), the host replayed 6 to 9, and the
+    queued writes landed 9 then 6. Now the forced ack is written before the detach moves on, the old transport's last
+    offset is carried in memory into the next connect, and every hostAck write is monotonic per host identity."""
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.d, ignore_errors=True)
+        Path(self.d, "session-hosts").write_text("off")
+        self.logs = []
+        self.be = sb.SdkBackend(self.d, "/bin/true", lambda *a, **k: None, log=self.logs.append)
+        sb.write_reg(Path(self.d), SID, {"sid": SID, "name": "web", "alive": True,
+                                         "hostAck": {"host": "4242:h1", "cli": "4343:c1", "offset": 5}})
+        # a live host lease (synthetic pids; proc_start is stubbed so both read as running)
+        sb.write_lease(Path(self.d), {"sid": SID, "pid": 4343, "start": "c1", "t": time.time(),
+                                      "holder": {"kind": "host", "pid": 4242, "start": "h1"}})
+        self._starts = {4242: "h1", 4343: "c1"}
+        self._orig_start = sb.proc_start
+        sb.proc_start = lambda p, run=None: self._starts.get(p)
+        self.addCleanup(setattr, sb, "proc_start", self._orig_start)
+        self.s = types.SimpleNamespace(sid=SID, name="web", _host=None, _host_ack_t=0.0, _host_end_grace=None,
+                                       _on_cli_stderr=lambda line: None, _host_is_attach=False, _host_reexec_wait="",
+                                       _host_reexec_closed=False, _host_reexec_from=None,
+                                       _seed_for_dead_cli=lambda cli: None)
+        self.t1 = self.be._new_host_transport(self.s, "/nonexistent.sock", 5)
+        self.t1.hello = dict(HELLO)
+        self.t1.replay_end = 0
+        self.s._host = self.t1
+        # every hostAck value the registry holds after each write, in order
+        self.acks = []
+        orig = self.be._update_reg_with
+
+        def spy(sid, make_fields):
+            orig(sid, make_fields)
+            a = (sb.read_reg(Path(self.d), SID) or {}).get("hostAck")
+            if isinstance(a, dict):
+                self.acks.append(a.get("offset"))
+        self.be._update_reg_with = spy
+
+    def _reg_ack(self):
+        return (sb.read_reg(Path(self.d), SID) or {}).get("hostAck") or {}
+
+    def test_consumed_through_9_detach_reconnect_at_once_replays_nothing_and_never_moves_back(self):
+        out = {}
+
+        def loop():
+            async def main():
+                for off in range(6, 10):              # consumed through 9 while another thread holds the lock
+                    self.s._host_ack_t = 0.0          # past the one-second throttle: every record marks a write
+                    self.t1._take(_rec(off))
+                self.be._write_host_ack(self.s, force=True)   # the connect loop's finally: the last ack
+                self.s._host = None
+                t2 = await self.be._host_transport_for(self.s, None, None)   # the reconnect, at once
+                out["replay_from"] = t2.ack_offset + 1
+                t2.hello = dict(HELLO)
+                t2.replay_end = 10
+                for off in range(t2.ack_offset + 1, 10):   # what the host replays from that offset
+                    self.s._host_ack_t = 0.0
+                    t2._take(_rec(off))
+                out["t2"] = t2
+            asyncio.run(main())
+        th = threading.Thread(target=loop, name=LOOP_PREFIX + "web-mustfix", daemon=True)
+        self.be._reg_lock.acquire()                   # the writer is held: another session's long registry write
+        try:
+            th.start()
+            th.join(1.5)
+        finally:
+            self.be._reg_lock.release()
+        th.join(10.0)
+        self.assertFalse(th.is_alive())
+        _drain_writer(self.be)
+        self.assertEqual(out.get("replay_from"), 10, "the reconnect replayed records 6 to 9 the kernel already consumed")
+        self.assertEqual(self.acks, sorted(self.acks), "hostAck moved backwards: %r" % (self.acks,))
+        self.assertEqual(self._reg_ack().get("offset"), 9)
+
+    def test_the_in_memory_carry_alone_resumes_past_a_stale_registry(self):
+        """Even when the registry never got the final offset (a write that failed or had not landed), a reconnect in the
+        same kernel resumes from what the old transport consumed."""
+        for off in range(6, 10):
+            self.s._host_ack_t = 0.0
+            self.t1._take(_rec(off))
+        self.be._write_host_ack(self.s, force=True)
+        self.s._host = None
+        reg = sb.read_reg(Path(self.d), SID)
+        reg["hostAck"] = {"host": "4242:h1", "cli": "4343:c1", "offset": 5}      # the registry trails, as under the race
+        sb.write_reg(Path(self.d), SID, reg)
+        t2 = asyncio.run(self.be._host_transport_for(self.s, None, None))
+        self.assertEqual(t2.ack_offset, 9, "the reconnect took the registry's stale 5 over the carried 9")
+
+    def test_a_lower_offset_for_the_same_host_is_dropped_and_another_host_lands(self):
+        self.be._update_reg(SID, hostAck={"host": "4242:h1", "cli": "4343:c1", "offset": 9})
+        self.be._update_reg(SID, hostAck={"host": "4242:h1", "cli": "4343:c1", "offset": 6}, lastStopAt=7)
+        self.assertEqual(self._reg_ack().get("offset"), 9, "a lower offset for the same host must not land")
+        self.assertEqual((sb.read_reg(Path(self.d), SID) or {}).get("lastStopAt"), 7, "the other fields still land")
+        self.be._update_reg(SID, hostAck={"host": "5151:h2", "cli": "5252:c2", "offset": 3})
+        self.assertEqual(self._reg_ack(), {"host": "5151:h2", "cli": "5252:c2", "offset": 3}, "a new host starts over")
+
 class SessionLoopRegLockGuard(unittest.TestCase):
     """The test-time rule: a session loop thread that takes the registry lock raises (ROMP_REG_LOCK_GUARD=raise, which
     tests/conftest.py sets for the suite), so a hook or handler that writes the registry on the loop fails its test."""
