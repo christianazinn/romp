@@ -11587,6 +11587,11 @@ class SdkBackend:
         #                                             CLI's verdict (see _seed_write_pending); under _defaults_lock
         self._reg_lock = threading.Lock()         # serializes _update_reg read-modify-writes (queue mirror
         #                                           writes come from kernel AND loop threads)
+        # hostAck writes OFF the session loops (2026-10-09): sid -> session whose ack is due, drained by one writer
+        # thread per backend (_host_ack_writer); see _write_host_ack for why the loop thread must never wait on _reg_lock
+        self._host_ack_due: dict = {}
+        self._host_ack_lock = threading.Lock()
+        self._host_ack_thread = None
         self._pending_ask: dict[str, bool] = {}   # sid -> has an ask awaiting answer
         self._live: dict[str, dict] = {}          # sid -> {key -> atom}: the in-memory LIVE TAIL (ahead of disk)
         self._live_rev: dict[str, int] = {}       # sid -> count of changes to its live tail (add/edit/drop/flag):
@@ -12440,7 +12445,17 @@ class SdkBackend:
     def _write_host_ack(self, sess, force: bool = False) -> None:
         """hostAck in the registry (the kernel is its only writer): the offset the kernel has consumed, at most
         once a second, and always on detach. Acknowledged means received by this process, not persisted:
-        derived state is rebuilt from the transcript and the journal anyway."""
+        derived state is rebuilt from the transcript and the journal anyway.
+
+        The per-record call (the transport's on_ack) NEVER writes on the calling thread (2026-10-09). It runs on the
+        session's own loop thread, inside the record hand-over the SDK's reader pulls, and that loop is the only place
+        the session's hook callbacks are answered. _update_reg takes _reg_lock, one lock for EVERY session's registry
+        read-modify-write, so a loop waiting there answered no hook at all for as long as other threads kept the lock
+        busy: sessions lost every prompt, tool and stop hook to the CLI's 540 s deadline (subagent hooks to its 180 s
+        one) for up to 90 minutes, and a stack read of the live kernel found 18 of its 34 session threads parked on this
+        call. So the call only marks the session due and returns; one writer thread per backend (_host_ack_writer) does
+        the write, reading the session's transport under the lock, so a session that has left its host writes nothing.
+        `force` (the detach path's last ack, as the session leaves its loop) still writes before it returns."""
         t = sess._host
         if t is None or getattr(t, "hello", None) is None or getattr(t, "exit_info", None) is not None:
             return                # no host, no hello yet, or a host that reported its exit (its ack is history)
@@ -12448,11 +12463,46 @@ class SdkBackend:
         if not force and now - sess._host_ack_t < 1.0:
             return
         sess._host_ack_t = now
-        h = t.hello.get("host") or {}
-        c = t.hello.get("cli") or {}
+        if force:
+            self._write_host_ack_now(sess)
+            return
+        with self._host_ack_lock:
+            self._host_ack_due[sess.sid] = sess
+            if self._host_ack_thread is None:
+                self._host_ack_thread = threading.Thread(target=self._host_ack_writer, name="romp-host-ack",
+                                                         daemon=True)
+                self._host_ack_thread.start()
+
+    def _host_ack_writer(self) -> None:
+        """The hostAck writer: drains the due sessions, one registry write each, and exits when nothing is due (the next
+        due mark starts a fresh one), so an idle backend holds no thread. Marks that arrive while a write waits on
+        _reg_lock coalesce into one entry per session, so a busy lock costs at most one queued write per session."""
+        while True:
+            with self._host_ack_lock:
+                if not self._host_ack_due:
+                    self._host_ack_thread = None
+                    return
+                due, self._host_ack_due = self._host_ack_due, {}
+            for sess in due.values():
+                try:
+                    self._write_host_ack_now(sess)
+                except Exception as e:                # one session's failure never strands the others' acks
+                    self._log("host (%s): hostAck write failed: %s" % (getattr(sess, "name", "?"), e))
+
+    def _write_host_ack_now(self, sess) -> None:
+        """The hostAck registry write itself, from the session's CURRENT transport, read UNDER _reg_lock (see
+        _write_host_ack): a write that waited on the lock while the session left its host (the detach's forced ack, then
+        `_host = None`) finds no transport and writes nothing, instead of landing an older offset over the forced one."""
+        def fields():
+            t = sess._host
+            if t is None or getattr(t, "hello", None) is None or getattr(t, "exit_info", None) is not None:
+                return None
+            h = t.hello.get("host") or {}
+            c = t.hello.get("cli") or {}
+            return {"hostAck": {"host": "%s:%s" % (h.get("pid"), h.get("start")),
+                                "cli": "%s:%s" % (c.get("pid"), c.get("start")), "offset": int(t.ack_offset)}}
         try:
-            self._update_reg(sess.sid, hostAck={"host": "%s:%s" % (h.get("pid"), h.get("start")),
-                                                 "cli": "%s:%s" % (c.get("pid"), c.get("start")), "offset": int(t.ack_offset)})
+            self._update_reg_with(sess.sid, fields)
         except Exception as e:
             self._log("host (%s): hostAck write failed: %s" % (sess.name, e))
 
@@ -18545,7 +18595,15 @@ class SdkBackend:
         return True
 
     def _update_reg(self, sid: str, **fields):
+        self._update_reg_with(sid, lambda: fields)
+
+    def _update_reg_with(self, sid: str, make_fields):
+        """_update_reg with the fields computed UNDER _reg_lock: `make_fields()` returns the fields to merge, or None to
+        write nothing. For a writer whose value can go stale while it waits on the lock (the deferred hostAck)."""
         with self._reg_lock:                       # kernel + loop threads both write (queue mirror);
+            fields = make_fields()
+            if fields is None:
+                return
             reg = read_reg(self.state_dir, sid)    # unserialized RMWs would drop fields
             if reg is None:
                 if not _reg_absent_for_write(_reg_path(self.state_dir, sid)):
