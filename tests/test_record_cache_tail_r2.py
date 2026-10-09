@@ -582,31 +582,51 @@ class ARefusedStampHeals(_Roads):
     """Second review (3): a restore refused for a stamp left the document as it was, so an idle leaf paid the refusal and a
     whole parse at every boot. Now the whole parse after the refusal rewrites the document (write:afterRefusal), and the next
     boot restores from it: no refusal, no whole parse, the cold parse's tree. On c8219856f the next boot refuses again.
-    (The writer keeps stamps in order across its cut, so a record stamped early but written last puts the new cut before it:
-    the tail past that cut is long, the entry is not released in this process, and an idle leaf's restored entry holds that
-    tail until later turns let the cut move past the record.)"""
+    (The writer keeps stamps in order across its cut, so a record stamped early but written last puts the new cut before it.)
+    Third review (2026-10-09): a stamp far back steps that cut so far that the tail is over the churn bound's share, and the
+    restored entry then demoted at its first fold and parsed whole: two whole-parse equivalents a boot. That rewrite now
+    declines (refusalTail) and the leaf is marked at its stat, so a later boot pays one whole parse and no write; a stamp
+    near the cut (here inside turn 150, ten turns back) still heals."""
 
-    def test_the_next_boot_restores(self):
+    def _stale_at(self, parent, k, t):
+        u = {"type": "user", "uuid": "old%d" % k, "parentUuid": parent, "timestamp": iso(t), "promptSource": "typed",
+             "cwd": "/w/notes-api", "message": {"role": "user", "content": "a late-stamped prompt %d" % k}}
+        a = {"type": "assistant", "uuid": "olda%d" % k, "parentUuid": u["uuid"], "timestamp": iso(self.t + 30), "cwd": "/w/notes-api",
+             "message": {"role": "assistant", "content": [{"type": "text", "text": "late reply ok " * 10}], "stop_reason": "end_turn"}}
+        return [u, a]
+
+    def _boots(self, recs):
         with T.knobs(WINDOW, 4, roots=[str(self.proj)]):
             tree = self.parse()
             self.assertTrue(em.asm_checkpoint_write(self.path, SID, tree=tree))
             del tree
-            self._write(self._stale(self.parent, 9))
+            self._write(recs)
             old = time.time() - 600
             os.utime(self.path, (old, old))               # idle: nothing appends after this
             self._reset()
             s0 = dict(em._ASM_STATS)
             km._parse(self.path, SID, NOW)                # boot one
             d1 = {k: v - s0.get(k, 0) for k, v in em._ASM_STATS.items() if v != s0.get(k, 0)}
-            self.assertEqual(d1.get("restore:stampRefused"), 1, d1)
-            self.assertEqual(d1.get("write:afterRefusal"), 1, d1)
             self._reset()
-            s0 = dict(em._ASM_STATS)
+            s0, w0 = dict(em._ASM_STATS), em._ASM_CKPT_STATS.get("written", 0)
             tree = self.parse()                           # boot two
             d2 = {k: v - s0.get(k, 0) for k, v in em._ASM_STATS.items() if v != s0.get(k, 0)}
-            self.assertEqual((d2.get("restore"), d2.get("full", 0), d2.get("restore:stampRefused")), (1, 0, None), d2)
+            d2["_written"] = em._ASM_CKPT_STATS.get("written", 0) - w0
             em.hydrate(tree, SID)
             got = T._strip_tree(tree)
+        return d1, d2, got
+
+    def test_the_next_boot_restores(self):
+        d1, d2, got = self._boots(self._stale_at(self.parent, 9, NOW - 86400 + 150 * 60 + 30))
+        self.assertEqual(d1.get("restore:stampRefused"), 1, d1)
+        self.assertEqual(d1.get("write:afterRefusal"), 1, d1)
+        self.assertEqual((d2.get("restore"), d2.get("full", 0), d2.get("restore:stampRefused")), (1, 0, None), d2)
+        self.assertEqual(got, self._ref())
+
+    def test_a_stamp_far_back_marks_the_leaf(self):
+        d1, d2, got = self._boots(self._stale(self.parent, 9))
+        self.assertEqual((d1.get("restore:stampRefused"), d1.get("write:afterRefusalSkipped")), (1, 1), d1)
+        self.assertEqual((d2.get("restore:refusedStanding"), d2.get("full", 0), d2["_written"]), (1, 1, 0), d2)
         self.assertEqual(got, self._ref())
 
 

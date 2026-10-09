@@ -208,6 +208,45 @@ class ATypedSlashCommandAtTheCut(_Base):
         self.assertEqual(got, self._ref())
 
 
+class AContentRefusalWithTheSameCut(_Base):
+    """Should-fix: a content refusal whose rewrite publishes the same cut (an orphan compaction summary in the last two
+    turns, while a pre-cut boundary stands: the writer's cut cannot move past the last two turns). On d088e830b each boot
+    paid two whole parses and two writes and kept the entry whole; now the rewrite declines (sameCut), the leaf is marked
+    at its stat, and a later boot pays one whole parse and no write."""
+
+    def _boots(self, recs):
+        with T.knobs(WINDOW, 4, roots=[str(self.proj)]):
+            tree = self.parse()
+            self.assertTrue(em.asm_checkpoint_write(self.path, SID, tree=tree))
+            del tree
+            self._write(recs)
+            old = time.time() - 600
+            os.utime(self.path, (old, old))               # idle from here
+            per_boot = []
+            for boot in range(3):
+                self._reset()
+                ds = [self._counted(self.parse)[1] for _ in range(3)]
+                per_boot.append((sum(d.get("full", 0) for d in ds), sum(d.get("_written", 0) for d in ds)))
+            tree = self.parse()
+            em.hydrate(tree, SID)
+            got = T._strip_tree(tree)
+        return per_boot, got
+
+    def test_one_whole_parse_per_boot_no_rewrite(self):
+        per_boot, got = self._boots([self._orphan("orph1", self.parent, self.t), self._reply("orrep", "orph1", self.t + 20)])
+        self.assertLessEqual(per_boot[0][0], 2, per_boot)
+        self.assertEqual(per_boot[1:], [(1, 0), (1, 0)], per_boot)
+        self.assertEqual(got, self._ref())
+
+    def test_a_prompt_without_a_stamp_restores(self):
+        """Its repaired stamp (the previous parseable one, alike in both parses) is read: no refusal, no whole parse."""
+        u = {"type": "user", "uuid": "nostamp", "parentUuid": self.parent, "promptSource": "typed", "cwd": "/w/notes-api",
+             "message": {"role": "user", "content": "a prompt without a stamp"}}
+        per_boot, got = self._boots([u, self._reply("nsrep", "nostamp", self.t + 20)])
+        self.assertEqual(per_boot, [(0, 0)] * 3, per_boot)
+        self.assertEqual(got, self._ref())
+
+
 class TheCutSearchIsLinear(R.R2Base):
     """Should-fix: a kept prompt in the last turn stamped near the start steps the writer's cut back one turn per candidate;
     each candidate re-scanned every kept record and every record (d088e830b: 2.1 s at 1,000 turns, 69.8 s at 4,000 in the

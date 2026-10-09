@@ -7682,7 +7682,8 @@ def _pre_tree_identity(atoms, rompuuid):
     return h.hexdigest()
 
 
-_ASM_SKIP_STRUCTURAL = ("unsplittable", "reconstruction", "unencodable", "oversize", "noCut", "reuse", "closure", "young")   # true of a cut until it moves
+_ASM_SKIP_STRUCTURAL = ("unsplittable", "reconstruction", "unencodable", "oversize", "noCut", "reuse", "closure", "young",
+                        "sameCut", "refusalTail")   # true of a cut until it moves
 _ASM_FIRST_DOC_MIN = _env_or("ROMP_CKPT_FIRST_DOC_KB", _CKPT_FOLD_CAP // 8, 1024)   # the young-session floor (the 1695 read, low 1): no FIRST
 #                                       document until the pre-cut part holds this many bytes (an eighth of the fold cap: 1 MB by default, moving with
 #                                       ROMP_CKPT_FOLD_CAP_KB; ROMP_CKPT_FIRST_DOC_KB sets it outright, 0 turns the floor off, as the test suite does
@@ -7705,14 +7706,18 @@ def _tree_key(tree):
     return (id(tree), len(turns), turns[-1].get("id") if turns else None)
 
 
-def asm_checkpoint_write(leaf_path, rompuuid, sdk_human=False, tree=None, reason_out=None, who="settle"):
+def asm_checkpoint_write(leaf_path, rompuuid, sdk_human=False, tree=None, reason_out=None, who="settle", refused_cut=None):
     """Write the leaf's assembly checkpoint from its WHOLE assembly entry. False when there is nothing to write: no
     entry, an entry restored from a document (its cut stands until a compaction moves it), no compaction boundary in
     the tree (the whole file would be the tail), a cut that would not split the chronological order the fold's gate
     needs (garbled stamps), or a document past the cap; each counted under asmCheckpoint.skipped, and appended to
     `reason_out` when a list is given (the converge pass reads its refusal there; T376 review). `who` names the caller
     in the blip line (the settle, the converge pass), said once per leaf and reason. An entry it wrote from is marked for
-    re-seat: the next parse restores the entry from this document (2026-09-24)."""
+    re-seat: the next parse restores the entry from this document (2026-09-24). `refused_cut`: the leaf cut offset of the
+    document a restore just refused for its tail's content (parse_session's refusal road); the write declines when its cut
+    would be that same cut (sameCut: the same tail, the same refusal at every boot) or would leave the tail past it over the
+    churn bound's share (refusalTail: the restore would read a near-whole tail and demote at its first fold), so the road
+    marks the leaf at its stat instead (2026-10-09, third review)."""
     cp = _asm_ckpt_file(leaf_path)
     if cp is None:
         return False
@@ -7980,6 +7985,14 @@ def asm_checkpoint_write(leaf_path, rompuuid, sdk_human=False, tree=None, reason
             files[fsid] = f
         # the pre-cut records: identity, verdict, type, order, time, file, landed
         type_code = {"user": "u", "assistant": "a", "system": "s", "attachment": "t"}
+        if refused_cut is not None:
+            _lf = files.get(Path(leaf_path).stem) or {}
+            _new_cut = int((_lf.get("cut") or [0])[0])
+            if _new_cut == int(refused_cut):
+                return skip("sameCut")                    # the refused document's own cut: rewriting it changes nothing the restore reads
+            if (int(_lf.get("size") or 0) - _new_cut) * _ASM_TAIL_SHARE >= max(1, int(cut_off_total)):
+                return skip("refusalTail")                # the cut stepped back so far (a stale stamp near the start) that the tail is
+                #                                           over the share: a document no restore would hold, so none is written
         if standing is None and not cp.exists() and cut_off_total < _ASM_FIRST_DOC_MIN:
             return skip("young")                          # the young-session floor: no first document under the floor's bytes; the memo
             #                                               re-arms as the cut moves with the settled turns, so the first write lands once
@@ -8787,8 +8800,8 @@ def _asm_restore_inner(key, leaf_path, candidate_files, links, rompuuid, postal_
 def _restore_tail_refusal(ad, max_ppt, pre_gates, pre_boundary=None):
     """Why a restore must refuse the tail the seeded adapter `ad` ingested, or None (2026-10-08). The checks a cold parse makes
     of the tail against the pre-cut part, which the document holds fixed:
-      - stamp: a prompt, reply or compaction stamped before the carry's watermark (`max_ppt`), or with no stamp: the cold parse
-        sorts it among the pre-cut turns (a prompt opens an old turn; a compaction's card moves);
+      - stamp: a prompt, reply or compaction stamped before the carry's watermark (`max_ppt`) (a record with no stamp is read
+        at its repaired stamp): the cold parse sorts it among the pre-cut turns (a prompt opens an old turn; a card moves);
       - summary: a compaction summary parented on no compaction boundary of the tail while the carry names a pre-cut boundary
         (`pre_boundary`): the cold parse attaches it to that boundary's card, which the document holds fixed (with no pre-cut
         compaction there is no such card, and the restore builds what the cold parse does);
@@ -8803,6 +8816,11 @@ def _restore_tail_refusal(ad, max_ppt, pre_gates, pre_boundary=None):
         t = r.get("type")
         if max_ppt is not None and (t in ("user", "assistant") or (t == "system" and r.get("subtype") == "compact_boundary")):
             ts = parse_z(r.get("timestamp"))
+            if ts is None:                                # no stamp: the stamp both parses repair it to (the last parseable stamp
+                ts = ad.ts_of.get(r.get("uuid"))          #  before it in file order; the seeded adapter starts from the document's
+                #                                           lastTs, the whole parse's value at the cut), so the record sorts alike in
+                #                                           both (2026-10-09, third review: a missing stamp refused at every boot,
+                #                                           and the rewrite could not move past it)
             if ts is None or ts < max_ppt:
                 return "stamp"
         if r.get("isCompactSummary") is True and pre_boundary is not None:
@@ -8920,7 +8938,10 @@ def _asm_restore_from_doc(key, leaf_path, candidate_files, links, rompuuid, post
             _ASM_DEMOTE_TL.restore_refused = why_
             with _ASM_CKPT_LOCK:
                 _ASM_CHAIN_REFUSED_PATHS[os.path.realpath(str(leaf_path))] = (
-                    "content", int((((doc.get("files") or {}).get(Path(leaf_path).stem) or {}).get("cut") or [0])[0]))
+                    "legacy" if legacy and why_ in ("promptId", "skill") else "content",
+                    int((((doc.get("files") or {}).get(Path(leaf_path).stem) or {}).get("cut") or [0])[0]))
+                #                                           legacy: refused from the superset, so the rewrite is wanted even at the
+                #                                           same cut (it writes preGates); content: the rewrite declines the same cut
             return None
         mp = st.get("max_ppt")
         kept = ad.kept_uuids(ad.active_path())
@@ -9276,9 +9297,13 @@ def _assemble(leaf_path, candidate_files, links, rompuuid, postal_index, sdk_hum
                         _asm_stat("g:reseat"); _asm_stat("restore:afterDemote")   # the re-seat's own counts, as at the next parse
                     _mode("restore")
                     return served
-                keep_whole = bool(due) or (asm_document_stands(leaf_path)   # a boot's refusal that left the document standing, or a
-                                           and not getattr(_ASM_DEMOTE_TL, "restore_refused", None))   # released re-seat the
-                #                                   restore refused: as above; a content refusal is healed by the rewrite (as above)
+                _content_ref = getattr(_ASM_DEMOTE_TL, "restore_refused", None)
+                keep_whole = (bool(due) and not _content_ref) or (asm_document_stands(leaf_path)   # a boot's refusal that left the
+                                                                  and not _content_ref)   # document standing, or a released re-seat
+                #                                   the restore refused: as above; a content refusal is healed by the rewrite (as above),
+                #                                   a released re-seat's included (2026-10-09, third review: `due` overrode it, so the
+                #                                   second ask of every boot parsed whole again and held the entry whole); a rewrite
+                #                                   that would repeat the refused cut declines and marks the leaf (parse_session)
             # A full parse names its road (T398): an entry the gates DEMOTED (the g:<reason> beside it: the leaf's record
             # entry replaced by a from-zero read, a lineage file moved), a leaf with NO document file, a document that
             # stood but was REFUSED at the restore (its fallback reason counted beside), or no checkpoint directory at all.
@@ -9418,7 +9443,8 @@ def parse_session(leaf_path, rompuuid=None, name=None, color="#888888", dir=None
     _why, _refused_off = _refused if _refused is not None else (None, None)
     if _why is not None and _CKPT_DIR_FN is not None:
         try:                                        # the chain proof refused the standing document and this whole parse produced a
-            if asm_checkpoint_write(leaf_path, rompuuid, sdk_human, tree=out, who="refusal"):   # sound tree: write its document now,
+            if asm_checkpoint_write(leaf_path, rompuuid, sdk_human, tree=out, who="refusal",   # sound tree: write its document now,
+                                    refused_cut=_refused_off if _why == "content" else None):
                 _asm_stat("write:afterRefusal")     #  carrying the childless bit, so the next restore takes it (T402 follow-up)
                 with _ASM_CKPT_LOCK:
                     _new_off = _ASM_LAST_WRITE_CUT.get(_rk)
