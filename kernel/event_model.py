@@ -7805,27 +7805,55 @@ def asm_checkpoint_write(leaf_path, rompuuid, sdk_human=False, tree=None, reason
         for _sq, _r in all_recs:
             first_at.setdefault(_r["uuid"], _sq); last_at[_r["uuid"]] = _sq
         spans = sorted((a, b) for a, b in ((first_at[u], last_at[u]) for u in first_at) if a < b)   # a reused uuid: (first, last)
-        def _reused_across(cand):
-            return any(a < cand <= b for a, b in spans)
-        def _parent_past(cand):
-            for _sq, _r in all_recs:
-                if _sq >= cand:
-                    break
-                u = _r["uuid"]
-                p = ad.parent_of.get(u) if ad.by_uuid.get(u) is _r else (_r.get("parentUuid") or None)   # the last-wins copy: as the
-                if p and ad.seq_of.get(p, 0) >= cand:                                                     #  parse resolves it; a shadowed
-                    return True                                                                           #  copy: its raw parent, last-wins
-            return False
+        # The guards below read facts precomputed once, so each candidate costs a bisect, not a pass over every record
+        # (2026-10-09, third review: a stale stamp in the last turn steps the cut back a turn per candidate, and each
+        # candidate rescanned the kept records, every record and every later turn: 69.8 s at 4,000 turns on the parse
+        # thread). Each fact answers exactly what its old per-candidate scan answered.
+        span_a = [a for a, _b in spans]
+        span_bmax, _m = [], 0                             # the largest `last` over the spans whose `first` sorts before
+        for _a, _b in spans:
+            _m = max(_m, _b); span_bmax.append(_m)
+        def _reused_across(cand):                         # a span with first < cand <= last
+            k = bisect.bisect_left(span_a, cand)
+            return k > 0 and span_bmax[k - 1] >= cand
+        rec_runmax, rec_pmax, _rm, _pm = [], [], 0, 0     # in all_recs order: the running max seq (the old scan broke at the first
+        for _sq, _r in all_recs:                          #  record at or past the candidate) and the running max of each record's
+            u = _r["uuid"]                                #  resolved parent's seq (its raw parent for a shadowed copy, last-wins)
+            p = ad.parent_of.get(u) if ad.by_uuid.get(u) is _r else (_r.get("parentUuid") or None)
+            _rm = max(_rm, _sq); _pm = max(_pm, ad.seq_of.get(p, 0) if p else 0)
+            rec_runmax.append(_rm); rec_pmax.append(_pm)
+        def _parent_past(cand):                           # a record before the candidate whose resolved parent is at or past it
+            k = bisect.bisect_left(rec_runmax, cand)      # the records the old scan read before its break
+            return k > 0 and rec_pmax[k - 1] >= cand
+        _ts_kind = [(ad.seq_of.get(u, 0), ad.ts_of.get(u, 0)) for u in entry["kept"] if u in ad.by_uuid
+                    and (ad.by_uuid[u].get("type") in ("user", "assistant") or ad.by_uuid[u].get("subtype") == "compact_boundary")]
+        _ts_kind.sort(key=lambda x: x[0])
+        ts_seqs = [x[0] for x in _ts_kind]
+        ts_premax, _m = [], None                          # ts_premax[i]: the latest stamp of the first i such kept records
+        for _x in _ts_kind:
+            _m = _x[1] if _m is None else max(_m, _x[1]); ts_premax.append(_m)
+        ts_sufmin, _m = [None] * len(_ts_kind), None      # ts_sufmin[i]: the earliest stamp from the i-th on
+        for _i in range(len(_ts_kind) - 1, -1, -1):
+            _m = _ts_kind[_i][1] if _m is None else min(_m, _ts_kind[_i][1]); ts_sufmin[_i] = _m
+        def _stamps_cross(cand):                          # a stamp out of order across the cut: the carry would not hold
+            i = bisect.bisect_left(ts_seqs, cand)
+            return 0 < i < len(ts_seqs) and ts_premax[i - 1] > ts_sufmin[i]
+        turn_seqs = [[_rec_seq(a) for a in t["atoms"] if a.get("uuid") in ad.seq_of] for t in turns]
+        suf_min, _m = [None] * (len(turns) + 1), None     # suf_min[ti]: the first record seq over turns[ti:]'s atoms
+        for _i in range(len(turns) - 1, -1, -1):
+            if turn_seqs[_i]:
+                _m = min(turn_seqs[_i]) if _m is None else min(_m, min(turn_seqs[_i]))
+            suf_min[_i] = _m
         blocked = set()                                   # why candidates fell: the named skip when none survives
         qseqs = {q["seq"] for q in ad.qatts}              # the absorbed attachments' seqs: a turn's bytes begin at the attachments the
         #                                                   CLI spliced before its prompt, so a cut at the prompt's record leaves them
         #                                                   pre-cut (absorbed through the carry) and a cut before them is the same turn
         #                                                   boundary; both are tried, the attachment-first one when the prompt's fails
         def _cands(ti):
-            seqs = [_rec_seq(a) for t in turns[ti:] for a in t["atoms"] if a.get("uuid") in ad.seq_of]
-            if not seqs:
+            if suf_min[ti] is None:
                 return []
-            out, c = [min(seqs)], min(seqs)
+            c = suf_min[ti]
+            out = [c]
             for _k in range(len(qseqs)):                  # bounded: at most every attachment
                 if (c - 1) not in qseqs:
                     break
@@ -7850,11 +7878,7 @@ def asm_checkpoint_write(leaf_path, rompuuid, sdk_human=False, tree=None, reason
                 #                                           cut, which the restore cannot rebuild (the pre-cut rows are frozen, their parent
                 #                                           bound to a record the tail holds). The pre-cut part is closed under parents,
                 #                                           or the cut steps back (stage one b; found by the moving-cut oracle)
-            pre_ts = [ad.ts_of.get(u, 0) for u in entry["kept"] if ad.seq_of.get(u, 0) < cand and u in ad.by_uuid
-                      and (ad.by_uuid[u].get("type") in ("user", "assistant") or ad.by_uuid[u].get("subtype") == "compact_boundary")]
-            tail_ts = [ad.ts_of.get(u, 0) for u in entry["kept"] if ad.seq_of.get(u, 0) >= cand and u in ad.by_uuid
-                       and (ad.by_uuid[u].get("type") in ("user", "assistant") or ad.by_uuid[u].get("subtype") == "compact_boundary")]
-            if pre_ts and tail_ts and max(pre_ts) > min(tail_ts):
+            if _stamps_cross(cand):
                 continue                                  # a stamp out of order across the cut: the carry would not hold
             cut_seq = cand
             break
