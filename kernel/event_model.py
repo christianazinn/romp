@@ -7850,15 +7850,34 @@ def asm_checkpoint_write(leaf_path, rompuuid, sdk_human=False, tree=None, reason
             if _sqs:
                 _m = max(_m, max(_sqs))
         pre_max[len(turns)] = _m
+        atom_uuids = {a.get("uuid") for t in turns for a in t["atoms"] if a.get("uuid")}
         blocked = set()                                   # why candidates fell: the named skip when none survives
         qseqs = {q["seq"] for q in ad.qatts}              # the absorbed attachments' seqs: a turn's bytes begin at the attachments the
         #                                                   CLI spliced before its prompt, so a cut at the prompt's record leaves them
         #                                                   pre-cut (absorbed through the carry) and a cut before them is the same turn
         #                                                   boundary; both are tried, the attachment-first one when the prompt's fails
+        def _twin_before(c):
+            """The seq of a typed slash command's raw twin just before the cut record at `c`, or None (2026-10-09, third review,
+            must-fix 4): the twin makes no atom, so the turn's first atom is its command wrapper, and a cut there left the twin
+            before the cut wearing the wrapper's prompt id, which every restore then refused (promptId): two whole parses at
+            every restart. The twin is the wrapper's turn: the cut takes it with its wrapper."""
+            w = ad.by_uuid.get(uuid_at.get(c))
+            if not (w and w.get("type") == "user" and w.get("promptId")):
+                return None
+            wtxt = _text_of(_content(w.get("message"))) or ""
+            if not (CMD_WRAP_RE.match(wtxt) and not is_skill_load_wrapper(wtxt)):
+                return None
+            tw = ad.by_uuid.get(uuid_at.get(c - 1))
+            if tw and tw.get("type") == "user" and tw.get("promptId") == w["promptId"] and tw.get("uuid") not in atom_uuids:
+                return c - 1
+            return None
         def _cands(ti):
             if suf_min[ti] is None:
                 return []
             c = suf_min[ti]
+            tw = _twin_before(c)
+            if tw is not None:
+                c = tw                                    # the twin-first cut alone: the wrapper-first one would refuse at every restore
             out = [c]
             for _k in range(len(qseqs)):                  # bounded: at most every attachment
                 if (c - 1) not in qseqs:

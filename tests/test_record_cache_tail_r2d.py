@@ -174,6 +174,40 @@ class AnOldDocumentWithoutPreGates(_Base):
         self.assertEqual(got[1], self._ref(), d)
 
 
+class ATypedSlashCommandAtTheCut(_Base):
+    """Defect 4: a typed slash command (raw twin, wrapper with the twin's prompt id, reply), then one more turn, settled by a
+    whole parse's write; every restart after it must restore, not parse whole twice."""
+
+    def _command_turns(self):
+        t = self.t
+        twin = {"type": "user", "uuid": "cmdtwin", "parentUuid": self.parent, "timestamp": iso(t), "promptSource": "typed",
+                "promptId": "pid-cmd", "cwd": "/w/notes-api", "message": {"role": "user", "content": "/review"}}
+        wrap = {"type": "user", "uuid": "cmdwrap", "parentUuid": "cmdtwin", "timestamp": iso(t + 1), "promptId": "pid-cmd",
+                "cwd": "/w/notes-api", "message": {"role": "user", "content": WRAP}}
+        rep = self._reply("cmdrep", "cmdwrap", t + 20)
+        self._write([twin, wrap, rep])
+        self.parent, self.t = "cmdrep", t + 60
+        self.append()
+
+    def test_restarts_restore(self):
+        with T.knobs(WINDOW, 4, roots=[str(self.proj)]):
+            self._command_turns()
+            self._reset()
+            tree = self.parse()                           # no document yet: the whole parse, then the settle's write
+            self.assertTrue(em.asm_checkpoint_write(self.path, SID, tree=tree), em.asm_checkpoint_stats())
+            del tree
+            for boot in range(2):
+                self._reset()
+                _, d0 = self._counted(self.parse)
+                _, d1 = self._counted(self.parse)
+                self.assertEqual((d0.get("full", 0), d0.get("restore"), d1.get("full", 0)), (0, 1, 0), (boot, d0, d1))
+            self._reset()
+            tree = self.parse()
+            em.hydrate(tree, SID)
+            got = T._strip_tree(tree)
+        self.assertEqual(got, self._ref())
+
+
 class TheCutSearchIsLinear(R.R2Base):
     """Should-fix: a kept prompt in the last turn stamped near the start steps the writer's cut back one turn per candidate;
     each candidate re-scanned every kept record and every record (d088e830b: 2.1 s at 1,000 turns, 69.8 s at 4,000 in the
