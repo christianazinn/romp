@@ -10932,6 +10932,42 @@ def _records_from_mark(state_dir, sid: str, off, fsid, literals, cursor=None):
     if isinstance(cursor, dict):
         cursor["scan_off"], cursor["scan_fsid"] = pos, cur
 
+def _text_take_scan(state_dir, sid: str, text: str, t=None, off=None, fsid=None, cursor=None):
+    """SdkBackend._text_landed's scan, saying WHICH event took `text` off the CLI's queue (the feed hold, _untaken_taken,
+    acts on each differently): "record" (a native user record or a queued_command attachment carries it), "absorbed" (a
+    queue-operation remove, reason absorbed_mid_turn, names it: taken into the running turn with no record of its own),
+    ("removed", reason) (a remove for another reason names it, dropped_by_hook first among them: off the queue, NOT read
+    by the turn), False (readable, none of these), None (unreadable; `cursor` gets `scan_error`). The first matching
+    record in file order wins, under the same mark, cursor and send-time floor as a landing. A module function over the
+    state dir, as _records_from_mark is, because the boot marker's tests bind _text_landed onto bare stubs."""
+    try:
+        # the plain key and, for a slash send, its words (echo_keys): the send's own record is the
+        # CLI's wrapper, which _landed_texts reads as "/name args" the way the kernel's prune does
+        want = set(echo_keys(text))
+        floor = int(t or 0)
+        for rec in _records_from_mark(state_dir, sid, off, fsid,
+                                      (b'"user"', b'"queued_command"', b'"queue-operation"'),
+                                      cursor=cursor if isinstance(cursor, dict) else None):
+            removal = _queue_removal(rec)
+            if removal is not None:
+                if not (want & removal[1]):
+                    continue
+                verdict = "absorbed" if removal[0] == QUEUE_REMOVE_ABSORBED else ("removed", removal[0])
+            elif want & _landed_texts(rec):
+                verdict = "record"
+            else:
+                continue
+            ts = _record_epoch(rec.get("timestamp"))
+            if floor and ts is not None and ts < floor:
+                continue                           # an earlier record wearing the same words
+            return verdict
+        return False
+    except Exception as e:
+        if isinstance(cursor, dict):       # the caller's one log line names the fault (_untaken_taken)
+            cursor["scan_error"] = "%s: %s" % (type(e).__name__, _mask_ids(e))
+        return None
+
+
 def _input_landed_after(state_dir, sid: str, t, off=None, fsid=None):
     """Did a GENUINE HUMAN input land in the sid's transcript STRICTLY AFTER the send stamped `t`? The
     boot marker's second question about a send whose text never landed (SdkBackend._mark_dropped_echoes): the
@@ -15685,7 +15721,7 @@ class SdkBackend:
         _text_take tells it apart for the feed hold, which must release on it without calling the text delivered. The
         verdict's kind rides back in `cursor` as `take` (the hold is the cursor: _untaken_taken reads it after this call,
         which stays its one entry, so a test double that stands in for this method still drives the hold)."""
-        took = self._text_take(sid, text, t, off, fsid, cursor)
+        took = _text_take_scan(self.state_dir, sid, text, t, off, fsid, cursor)
         if isinstance(cursor, dict):
             cursor["take"] = took or None              # "record", "absorbed", ("removed", reason), or None: no take yet
         if took is None:
@@ -15693,38 +15729,8 @@ class SdkBackend:
         return took in ("record", "absorbed")
 
     def _text_take(self, sid: str, text: str, t: int | None = None, off=None, fsid=None, cursor=None):
-        """_text_landed's scan, saying WHICH event took `text` off the CLI's queue (the feed hold, _untaken_taken, acts
-        on each differently): "record" (a native user record or a queued_command attachment carries it), "absorbed"
-        (a queue-operation remove, reason absorbed_mid_turn, names it: taken into the running turn with no record of
-        its own), ("removed", reason) (a remove for another reason names it, dropped_by_hook first among them: off the
-        queue, NOT read by the turn), False (readable, none of these), None (unreadable; `cursor` gets `scan_error`).
-        The first matching record in file order wins, under the same mark, cursor and send-time floor as a landing."""
-        try:
-            # the plain key and, for a slash send, its words (echo_keys): the send's own record is the
-            # CLI's wrapper, which _landed_texts reads as "/name args" the way the kernel's prune does
-            want = set(echo_keys(text))
-            floor = int(t or 0)
-            for rec in _records_from_mark(self.state_dir, sid, off, fsid,
-                                          (b'"user"', b'"queued_command"', b'"queue-operation"'),
-                                          cursor=cursor if isinstance(cursor, dict) else None):
-                removal = _queue_removal(rec)
-                if removal is not None:
-                    if not (want & removal[1]):
-                        continue
-                    verdict = "absorbed" if removal[0] == QUEUE_REMOVE_ABSORBED else ("removed", removal[0])
-                elif want & _landed_texts(rec):
-                    verdict = "record"
-                else:
-                    continue
-                ts = _record_epoch(rec.get("timestamp"))
-                if floor and ts is not None and ts < floor:
-                    continue                           # an earlier record wearing the same words
-                return verdict
-            return False
-        except Exception as e:
-            if isinstance(cursor, dict):       # the caller's one log line names the fault (_untaken_taken)
-                cursor["scan_error"] = "%s: %s" % (type(e).__name__, _mask_ids(e))
-            return None
+        """_text_landed's scan, saying WHICH event took `text` off the CLI's queue (_text_take_scan)."""
+        return _text_take_scan(self.state_dir, sid, text, t, off, fsid, cursor)
 
     def dismiss_echo(self, sid: str, uuid: str | None = None, t: int | None = None) -> str | None:
         """✕ on a never-delivered bubble: retire a DROPPED echo the user has acknowledged. Matched by the
