@@ -11103,8 +11103,11 @@ ECHO_MIRROR_LANDED_KEEP = 5
 ECHO_MIRROR_MAX_BYTES = 256 * 1024
 
 
-def echo_mirror_select(entries: list, now: float) -> list:
-    """The echo mirror entries worth persisting (see ECHO_MIRROR_*), in their original order."""
+def echo_mirror_select(entries: list, now: float, cut: list | None = None) -> list:
+    """The echo mirror entries worth persisting (see ECHO_MIRROR_*), in their original order. An echo flagged never
+    delivered (`dropped`, which every stale and refused one also carries) is ALWAYS kept, whatever the budget: it is
+    what a restart offers back for restore (review 2 of the mirror bound). `cut`, when given, receives (landed beyond
+    the keep, cut for size), for the caller's log line."""
     def t_of(i):
         try:
             return float(entries[i].get("t") or 0)
@@ -11115,17 +11118,22 @@ def echo_mirror_select(entries: list, now: float) -> list:
     keep = [i for i, e in enumerate(entries) if not e.get("landed") or i in keep_landed]
     size = {i: len(json.dumps(entries[i])) for i in keep}
     total = sum(size.values())
+    gone = set()
     if total > ECHO_MIRROR_MAX_BYTES:
         order = sorted(keep, key=lambda i: (0 if entries[i].get("landed") else 1, t_of(i)))   # landed first, oldest first
         for i in order:
             if total <= ECHO_MIRROR_MAX_BYTES:
                 break
             e = entries[i]
-            if not e.get("landed") and not e.get("dropped") and now - t_of(i) < ECHO_MIRROR_PENDING_FLOOR_S:
+            if e.get("dropped") and not e.get("landed"):
+                continue                                    # never delivered: the restart's restore offer, always kept
+            if not e.get("landed") and now - t_of(i) < ECHO_MIRROR_PENDING_FLOOR_S:
                 continue                                    # a send that may still be in flight: always kept
-            keep.remove(i)
+            gone.add(i)
             total -= size[i]
-    return [entries[i] for i in keep]
+    if cut is not None:
+        cut.append((len(landed) - len(keep_landed), len(gone)))
+    return [entries[i] for i in keep if i not in gone]
 
 # An IMAGE path (absolute or ~-rooted) with one of the extensions the CLI's composer paste hook
 # recognises. SOURCE OF TRUTH: the installed Claude Code bundle (2.1.261) carries exactly one image-path
@@ -16098,7 +16106,14 @@ class SdkBackend:
         # Persisted by IDENTITY (not inferred from the echoes: an old stuck /clear echo must not relight the
         # bracket), restored in __init__ only when _lease_survives.
         _s = getattr(self, "sessions", {}).get(sid)   # lockless dict.get (atomic under the GIL); a stand-in backend has none
-        kw = {"echoes": echo_mirror_select(snap, time.time())}   # bounded: what a restart needs (ECHO_MIRROR_*)
+        cut = []
+        kw = {"echoes": echo_mirror_select(snap, time.time(), cut)}   # bounded: what a restart needs (ECHO_MIRROR_*)
+        if cut and cut[0][1]:
+            # every cut for size is said, with its count (review 2): those sends are not offered back after a restart
+            self._log("echo mirror (%s): %d echo(es) over the %d byte budget not written (oldest first, never a "
+                      "never-delivered one or a send under %d s old); %d landed ones beyond the newest %d skipped as usual"
+                      % (sid[:8], cut[0][1], ECHO_MIRROR_MAX_BYTES, ECHO_MIRROR_PENDING_FLOOR_S, cut[0][0],
+                         ECHO_MIRROR_LANDED_KEEP))
         if _s is not None:
             # Only a LIVE session owns the take mirror. A boot re-persist runs BEFORE the SdkSession is restored
             # (sessions is empty then), so writing the mirror from the absent session would clobber the persisted

@@ -112,6 +112,27 @@ class EchoMirrorBounded(unittest.TestCase):
         self.assertIn("echo:big-000", kept, "the newest of the old sends stay")
         self.assertNotIn("echo:big-059", kept, "the oldest go first")
 
+    def test_never_delivered_echoes_are_kept_over_the_budget_and_every_cut_is_logged(self):
+        """Review 2 of the mirror bound: over the budget the cap cut echoes already flagged never delivered (any age),
+        so a restart could no longer offer them back, and said nothing. They are always kept now, and a cut is logged
+        with its count."""
+        logs = []
+        self.be._log_cb = logs.append
+        self.be._log = lambda msg, *a, **k: logs.append(msg)
+        big = "y" * 8192
+        lost = [_echo("echo:lost-%03d" % i, 100 + i, big, dropped=True) for i in range(20)]           # ancient, flagged
+        old = [_echo("echo:old-%03d" % i, int(self.now) - 7200 - i, big) for i in range(40)]          # 2 h, pending
+        self._stash(lost + old)
+        self.be._persist_echoes(SID)
+        kept = {e.get("uuid") for e in sb.read_reg(Path(self.d), SID)["echoes"]}
+        for a in lost:
+            self.assertIn(a["uuid"], kept, "a never-delivered echo was cut for size")
+        cut = [l for l in logs if "over the" in str(l) and "byte budget not written" in str(l)]
+        self.assertEqual(len(cut), 1, logs)
+        n_cut = 40 - len([u for u in kept if u.startswith("echo:old-")])
+        self.assertGreater(n_cut, 0)
+        self.assertIn(" %d echo(es)" % n_cut, cut[0])
+
     def test_the_selector_keeps_order_and_never_drops_a_fresh_send(self):
         now = 1_800_000_000.0
         entries = [{"t": now - 10, "text": "y" * 300_000}, {"t": now - 7200, "text": "z" * 300_000}]
