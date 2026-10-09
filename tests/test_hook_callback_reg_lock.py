@@ -414,6 +414,95 @@ class HostAckNeverBackwards(unittest.TestCase):
         self.be._update_reg(SID, hostAck={"host": "5151:h2", "cli": "5252:c2", "offset": 3})
         self.assertEqual(self._reg_ack(), {"host": "5151:h2", "cli": "5252:c2", "offset": 3}, "a new host starts over")
 
+    def test_acks_dropped_when_the_cli_dies_are_recovered_by_the_carry(self):
+        """Should-fix (c): acks still queued when the CLI dies write nothing (the transport reported its exit), so the
+        registry trails; the orphan road's replay then resumes from the carried offset, not the registry's."""
+        reg = sb.read_reg(Path(self.d), SID)
+        reg["hostAck"] = {"host": "4242:h1", "cli": "4343:c1", "offset": 2}
+        sb.write_reg(Path(self.d), SID, reg)
+        self.t1.ack_offset = 2
+
+        def loop():
+            for off in range(3, 40):                  # consumed through 39 while the lock is held
+                self.s._host_ack_t = 0.0
+                self.t1._take(_rec(off))
+            self.t1.exit_info = {"t": "exit", "cause": "died", "code": -9}
+            self.be._write_host_ack(self.s, force=True)   # what the finally would do; the exit makes it write nothing
+            self.s._host = None                       # the connect loop's finally, the CLI gone
+        th = threading.Thread(target=loop, name=LOOP_PREFIX + "web-died", daemon=True)
+        self.be._reg_lock.acquire()
+        try:
+            th.start()
+            th.join(3.0)
+        finally:
+            self.be._reg_lock.release()
+        th.join(10.0)
+        _drain_writer(self.be)
+        self.assertLess(self._reg_ack().get("offset", -1), 39, "the setup expects the queued acks to be dropped")
+        # the dead host's directory: its identity and a journal of records 0..39
+        hdir = ht.host_dir(Path(self.d), SID)
+        hdir.mkdir(parents=True, exist_ok=True)
+        (hdir / "identity.json").write_text('{"pid": 4242, "start": "h1"}')
+        with open(hdir / "journal-0.jsonl", "w") as fh:
+            for off in range(40):
+                fh.write('{"type": "assistant", "n": %d}\n' % off)
+        replayed = []
+
+        class FakeClient:                             # stands in for the SDK client the replay would open
+            def __init__(self, options=None, transport=None):
+                replayed.append(transport.ack_offset + 1)
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc):
+                return False
+        fake = types.ModuleType("claude_agent_sdk")
+        fake.ClaudeSDKClient = FakeClient
+        with unittest.mock.patch.dict(sys.modules, {"claude_agent_sdk": fake}), \
+                unittest.mock.patch.object(self.be, "_replay_drain", lambda *a, **k: asyncio.sleep(0)):
+            asyncio.run(self.be._host_orphan_recover(self.s, None, None, None, died=True))
+        self.assertEqual(replayed, [], "records the kernel had consumed were replayed from offset %r" % (replayed,))
+
+
+class RegFlushAtDrain(unittest.TestCase):
+    """Should-fix (c), the shutdown half: the registry writer is a daemon thread, so work the session loops queued dies
+    with the process unless the drain waits for it; _reg_flush gives it the rest of the drain's bound."""
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.d, ignore_errors=True)
+        Path(self.d, "session-hosts").write_text("off")
+        self.logs = []
+        self.be = sb.SdkBackend(self.d, "/bin/true", lambda *a, **k: None, log=self.logs.append)
+        sb.write_reg(Path(self.d), SID, {"sid": SID, "name": "web", "alive": True})
+
+    def _queue_on_loop(self, **fields):
+        th = threading.Thread(target=lambda: self.be._reg_job(None, lambda: self.be._update_reg(SID, **fields)),
+                              name=LOOP_PREFIX + "web-flush", daemon=True)
+        th.start()
+        th.join(10.0)
+
+    def test_the_drain_waits_for_queued_writes_within_its_bound(self):
+        self.be._reg_lock.acquire()
+        self._queue_on_loop(lastStopAt=11)
+        threading.Timer(0.3, self.be._reg_lock.release).start()     # the other writer finishes inside the bound
+        left = self.be._reg_flush(5.0)
+        self.assertEqual(left, 0)
+        self.assertEqual((sb.read_reg(Path(self.d), SID) or {}).get("lastStopAt"), 11, "the queued write landed")
+
+    def test_work_left_at_the_bound_is_named(self):
+        self.be._reg_lock.acquire()
+        try:
+            self._queue_on_loop(lastStopAt=12)
+            left = self.be._reg_flush(0.2)
+        finally:
+            self.be._reg_lock.release()
+        _drain_writer(self.be)
+        self.assertGreaterEqual(left, 1)
+        self.assertTrue(any("still pending at the shutdown bound" in str(l) for l in self.logs), self.logs)
+
+
 class RegWriterStart(unittest.TestCase):
     """Should-fix (a): the registry writer was stored in its slot before start(); a failed start raised into the caller
     (the record hand-over, a hook) and left the slot stuck for the kernel's life, silently."""

@@ -12841,6 +12841,26 @@ class SdkBackend:
             finally:
                 _REG_INLINE.on = was
 
+    def _reg_flush(self, timeout: float) -> int:
+        """Wait up to `timeout` for the registry writer to run what is queued (the shutdown drain); returns how many
+        items were still queued at the bound, logged when any were, since they are lost with the process."""
+        deadline = time.time() + max(0.0, timeout)
+        while True:
+            with self._reg_jobs_lock:
+                w = self._reg_writer
+            if w is None or not w.is_alive():
+                break
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                break
+            w.join(remaining)
+        with self._reg_jobs_lock:
+            left = len(self._reg_jobs) + (1 if (self._reg_writer is not None and self._reg_writer.is_alive()) else 0)
+        if left:
+            self._log_quiet("drain: %d queued registry write(s) still pending at the shutdown bound; they are lost with "
+                            "this process" % left)
+        return left
+
     def _log_quiet(self, msg: str) -> None:
         """_log that never raises (the registry writer must outlive a failing log callback)."""
         try:
@@ -13835,6 +13855,9 @@ class SdkBackend:
                 #   joining None raised here and the WHOLE drain died recordless (T143: 2 of 18
                 #   restarts lost their ledger rows to exactly this)
                 s.thread.join(max(0.05, deadline - time.time()))
+        # registry work the session loops queued (acks, hook writes) dies with this daemon writer at exit: give it the
+        # rest of the bound, with a short floor, after the sessions' own synchronous last acks (2026-10-09, review 1)
+        self._reg_flush(max(0.25, deadline - time.time()))
         unjoined = [s for s in sessions if s.thread is not None and s.thread.is_alive()]
         reaped = []
         reaped_sids = set()
