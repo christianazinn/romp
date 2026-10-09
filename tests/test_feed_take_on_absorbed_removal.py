@@ -149,7 +149,6 @@ class TakeOnTheCLIsQueueRemoval(unittest.TestCase):
         joined = SEP.join([b1, t1, b2, t2])
         self._wait(lambda: len(c.writes) == 3, "the joined text fed")
         self.assertEqual(c.writes[2][0], joined)
-        self.assertEqual(self._counts().get("absorbed_removal"), None, "the attachment take is not a removal take")
         self._append(_enqueue_op(joined))
         self._append(_remove_op(joined))
         self._assistant(c)
@@ -159,7 +158,7 @@ class TakeOnTheCLIsQueueRemoval(unittest.TestCase):
         self.assertEqual(reports, [(SID, [_mid(1), _mid(2)])], "every mail id, once")
         for q in (qa, qb):
             self.assertTrue((self._echo(q) or {}).get("_landed"), "each tagged part's echo landed by id")
-        self.assertEqual(self._counts().get("absorbed_removal"), 1)
+        self.assertEqual(self._counts().get("absorbed_removal"), 1, "one removal take: the holding send's attachment take is not one")
 
     def test_a_dropped_by_hook_removal_releases_the_hold_but_is_reported_never_delivered(self):
         """A hook dropped the fed text: it left the CLI's queue (so the next text may feed) but the turn never read
