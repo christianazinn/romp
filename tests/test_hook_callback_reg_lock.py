@@ -297,6 +297,9 @@ class QueueMirrorOnTheLoop(HooksNotBehindRegLock):
             with self.s._lock:
                 self.s._pending.append("second synthetic text")
                 self.s._pending_meta.append({})
+            # every real queue change persists itself, as this does: the writer may already have taken its snapshot
+            # (before it waits on the lock), so a change that never persisted would race it (2 of 4 runs at 4f116788e)
+            self.assertTrue(self._on_loop(self.s._persist_queue), "the queue mirror waited on the registry lock")
         finally:
             self.be._reg_lock.release()
         _drain_writer(self.be)
