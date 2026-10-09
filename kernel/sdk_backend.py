@@ -11011,6 +11011,54 @@ class SdkSession:
 
 LIVE_TAIL_CAP = 100
 
+# The ECHO MIRROR's bounds (reg['echoes'], SdkBackend._persist_echoes; 2026-10-09). Every registry write re-reads and
+# rewrites the whole file under the one registry lock, and the echo list was most of the largest files: 1.04 MB of a
+# 1.1 MB registry, 100 echoes of about 10 KB each, every one still pending at up to 11.8 hours old (sends whose landing
+# was never noticed, not sends in flight). What a restart needs from the mirror (_reseed_echoes, _mark_dropped_echoes):
+# the sends still in flight, so they stay visible or are flagged never delivered, and the never-delivered records the
+# chat shows with restore and dismiss. So the mirror keeps pending echoes up to ECHO_MIRROR_PENDING_MAX_AGE_S old,
+# dropped ones up to ECHO_MIRROR_DROPPED_MAX_AGE_S, only the newest ECHO_MIRROR_LANDED_KEEP landed ones (their records
+# are in the transcript), and within ECHO_MIRROR_MAX_BYTES drops the oldest first, never a pending echo younger than
+# ECHO_MIRROR_PENDING_FLOOR_S. The in-memory live tail is untouched: only what is written for the next kernel shrinks.
+ECHO_MIRROR_PENDING_MAX_AGE_S = 6 * 3600
+ECHO_MIRROR_PENDING_FLOOR_S = 3600
+ECHO_MIRROR_DROPPED_MAX_AGE_S = 24 * 3600
+ECHO_MIRROR_LANDED_KEEP = 5
+ECHO_MIRROR_MAX_BYTES = 256 * 1024
+
+
+def echo_mirror_select(entries: list, now: float) -> list:
+    """The echo mirror entries worth persisting (see ECHO_MIRROR_*), in their original order."""
+    def age(e):
+        try:
+            return now - float(e.get("t") or 0)
+        except (TypeError, ValueError):
+            return 0.0
+    landed = [i for i, e in enumerate(entries) if e.get("landed")]
+    keep_landed = set(sorted(landed, key=lambda i: -float(entries[i].get("t") or 0))[:ECHO_MIRROR_LANDED_KEEP])
+    keep = []
+    for i, e in enumerate(entries):
+        if e.get("landed"):
+            ok = i in keep_landed
+        elif e.get("dropped"):
+            ok = age(e) <= ECHO_MIRROR_DROPPED_MAX_AGE_S
+        else:
+            ok = age(e) <= ECHO_MIRROR_PENDING_MAX_AGE_S
+        if ok:
+            keep.append(i)
+    size = {i: len(json.dumps(entries[i])) for i in keep}
+    total = sum(size.values())
+    if total > ECHO_MIRROR_MAX_BYTES:
+        for i in sorted(keep, key=lambda i: float(entries[i].get("t") or 0)):     # oldest first
+            if total <= ECHO_MIRROR_MAX_BYTES:
+                break
+            e = entries[i]
+            if not e.get("landed") and not e.get("dropped") and age(e) < ECHO_MIRROR_PENDING_FLOOR_S:
+                continue                                    # a send that may still be in flight: always kept
+            keep.remove(i)
+            total -= size[i]
+    return [entries[i] for i in keep]
+
 # An IMAGE path (absolute or ~-rooted) with one of the extensions the CLI's composer paste hook
 # recognises. SOURCE OF TRUTH: the installed Claude Code bundle (2.1.261) carries exactly one image-path
 # test, `/\.(png|jpe?g|gif|webp)$/i`, and its callers are the terminal composer's bracketed-paste
@@ -15794,7 +15842,7 @@ class SdkBackend:
         # Persisted by IDENTITY (not inferred from the echoes: an old stuck /clear echo must not relight the
         # bracket), restored in __init__ only when _lease_survives.
         _s = getattr(self, "sessions", {}).get(sid)   # lockless dict.get (atomic under the GIL); a stand-in backend has none
-        kw = {"echoes": snap}
+        kw = {"echoes": echo_mirror_select(snap, time.time())}   # bounded: what a restart needs (ECHO_MIRROR_*)
         if _s is not None:
             # Only a LIVE session owns the take mirror. A boot re-persist runs BEFORE the SdkSession is restored
             # (sessions is empty then), so writing the mirror from the absent session would clobber the persisted
