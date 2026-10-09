@@ -11699,6 +11699,11 @@ def _host_ack_backwards(old, new) -> bool:
         return False
 
 
+# Set (per thread) while SdkBackend._reg_run_queue_inline runs queued registry work on a session loop because the writer
+# thread could not be started: a degraded path that takes the lock on the loop knowingly, so the guard lets it through.
+_REG_INLINE = threading.local()
+
+
 class RegLockOnSessionLoop(RuntimeError):
     """A session loop thread took the backend's registry lock (see SESSION_LOOP_THREAD_PREFIX); test suite only."""
 
@@ -11718,7 +11723,7 @@ class _RegLock:
     @staticmethod
     def _check():
         mode = os.environ.get(REG_LOCK_GUARD_ENV)
-        if not mode or not on_session_loop():
+        if not mode or not on_session_loop() or getattr(_REG_INLINE, "on", False):
             return
         f, chain, writer = sys._getframe(2), [], None
         while f is not None and len(chain) < 8:
@@ -11828,6 +11833,9 @@ class SdkBackend:
         self._reg_jobs_lock = threading.Lock()
         self._reg_jobs_seq = 0
         self._reg_writer = None
+        self._reg_writer_start_failed = False     # the writer's failed start is logged once per backend (_reg_job)
+        self._reg_inline_lock = threading.RLock() # one inline runner at a time when the writer cannot start; re-entrant,
+        #                                           since a queued item can queue more (the Stop hook's transcriptPath)
         # sid -> (host identity "pid:start", offset): the newest offset this kernel CONSUMED from a session's host, kept in
         # memory from every hand-over (2026-10-09, review 1 of the hostAck move). The registry's hostAck can trail it (a
         # queued write, a write dropped once the CLI exited), so a reconnect in this kernel replays from the larger of the
@@ -12693,7 +12701,8 @@ class SdkBackend:
         minutes, and a stack read of the live kernel found 18 of its 34 session threads parked on this call (2026-10-09).
         So the per-record write goes through _reg_job: queued for the registry writer when called on a session loop, made
         at once anywhere else. It reads the session's transport under the lock, so a session that has left its host writes
-        nothing stale.
+        nothing stale, and it never raises into the hand-over (a record whose offset already moved must still be handed
+        over).
 
         Every call first notes the offset in memory (_host_ack_carry), so a reconnect in this kernel resumes past what it
         consumed whatever the registry says. `force` (the detach path's last ack) writes SYNCHRONOUSLY before it returns
@@ -12713,7 +12722,10 @@ class SdkBackend:
         if force:
             self._write_host_ack_forced(sess, t)
             return
-        self._reg_job(("hostAck", sess.sid), lambda: self._write_host_ack_now(sess))
+        try:
+            self._reg_job(("hostAck", sess.sid), lambda: self._write_host_ack_now(sess))
+        except Exception as e:    # never into the hand-over: the carry still holds the offset for a reconnect
+            self._log("host (%s): queuing the hostAck write failed: %s" % (getattr(sess, "name", "?"), e))
 
     @staticmethod
     def _host_ident(t) -> str:
@@ -12776,7 +12788,12 @@ class SdkBackend:
         _reg_lock answers none of its session's hook callbacks (see SESSION_LOOP_THREAD_PREFIX). Queued work runs in the
         order it was queued, one item at a time, on one thread, so one session's writes keep their order and the writer
         is the only one making them. A `key` coalesces: queuing a key already waiting replaces its callable in place (the
-        mirrors and hostAck, whose latest value is the only one worth writing); key None never coalesces."""
+        mirrors and hostAck, whose latest value is the only one worth writing); key None never coalesces.
+
+        The writer is published only once it has started, and a slot holding a thread that is not alive is replaced
+        (2026-10-09, review 1: a slot stored before a failed start() stayed stuck for the kernel's life, silently, and the
+        failure raised into the record hand-over). When a writer cannot be started (the process's thread limit, memory),
+        that is logged once per backend and the queue is run here, synchronously: degraded, never lost."""
         if not on_session_loop():
             fn()
             return
@@ -12785,24 +12802,74 @@ class SdkBackend:
                 self._reg_jobs_seq += 1
                 key = ("job", self._reg_jobs_seq)
             self._reg_jobs[key] = fn
-            if self._reg_writer is None:
-                self._reg_writer = threading.Thread(target=self._reg_writer_run, name="romp-reg-writer", daemon=True)
-                self._reg_writer.start()
+            w = self._reg_writer
+            if w is not None and w.is_alive():
+                return
+            th = threading.Thread(target=self._reg_writer_run, name="romp-reg-writer", daemon=True)
+            try:
+                th.start()
+            except Exception as e:                # RuntimeError("can't start new thread"), or anything else start raises
+                self._reg_writer = None
+                failed = e
+            else:
+                self._reg_writer = th
+                return
+        if not getattr(self, "_reg_writer_start_failed", False):
+            self._reg_writer_start_failed = True
+            self._log("registry writer: could not start a thread (%s: %s); queued registry work runs on the calling "
+                      "session's loop until one starts" % (type(failed).__name__, failed))
+        self._reg_run_queue_inline()
+
+    def _reg_run_queue_inline(self) -> None:
+        """The fallback when the writer cannot start: run what is queued on this thread, oldest first, one runner at a
+        time, stopping as soon as a live writer exists again. These writes take _reg_lock on a session loop by design,
+        so the test suite's loop guard is told so (_REG_INLINE)."""
+        with self._reg_inline_lock:
+            was = getattr(_REG_INLINE, "on", False)
+            _REG_INLINE.on = True
+            try:
+                while True:
+                    with self._reg_jobs_lock:
+                        w = self._reg_writer
+                        if not self._reg_jobs or (w is not None and w.is_alive()):
+                            return
+                        key, fn = self._reg_jobs.popitem(last=False)
+                    try:
+                        fn()
+                    except Exception as e:
+                        self._log_quiet("registry writer: queued %s write failed: %s" % (key[0], e))
+            finally:
+                _REG_INLINE.on = was
+
+    def _log_quiet(self, msg: str) -> None:
+        """_log that never raises (the registry writer must outlive a failing log callback)."""
+        try:
+            self._log(msg)
+        except Exception:
+            pass
 
     def _reg_writer_run(self) -> None:
         """The registry writer: runs queued registry work oldest first and exits when none is left (the next queued item
         starts a fresh one), so an idle backend holds no thread. It never holds _reg_lock across an item: each item takes
-        the lock for its own writes, as the code it came from did, so a callback inside an item cannot deadlock on it."""
-        while True:
+        the lock for its own writes, as the code it came from did, so a callback inside an item cannot deadlock on it.
+        However it ends, it clears its own slot, so the next queued item starts a fresh writer."""
+        me = threading.current_thread()
+        try:
+            while True:
+                with self._reg_jobs_lock:
+                    if not self._reg_jobs:
+                        if self._reg_writer is me:
+                            self._reg_writer = None
+                        return
+                    key, fn = self._reg_jobs.popitem(last=False)
+                try:
+                    fn()
+                except Exception as e:                    # one item's failure never strands the rest
+                    self._log_quiet("registry writer: queued %s write failed: %s" % (key[0], e))
+        finally:
             with self._reg_jobs_lock:
-                if not self._reg_jobs:
+                if self._reg_writer is me:
                     self._reg_writer = None
-                    return
-                key, fn = self._reg_jobs.popitem(last=False)
-            try:
-                fn()
-            except Exception as e:                    # one item's failure never strands the rest
-                self._log("registry writer: queued %s write failed: %s" % (key[0], e))
 
     def _write_host_ack_now(self, sess) -> None:
         """The hostAck registry write itself, from the session's CURRENT transport, read UNDER _reg_lock (see

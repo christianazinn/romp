@@ -24,6 +24,7 @@ import threading
 import time
 import types
 import unittest
+import unittest.mock
 from pathlib import Path
 
 from romp_load import load_source
@@ -412,6 +413,77 @@ class HostAckNeverBackwards(unittest.TestCase):
         self.assertEqual((sb.read_reg(Path(self.d), SID) or {}).get("lastStopAt"), 7, "the other fields still land")
         self.be._update_reg(SID, hostAck={"host": "5151:h2", "cli": "5252:c2", "offset": 3})
         self.assertEqual(self._reg_ack(), {"host": "5151:h2", "cli": "5252:c2", "offset": 3}, "a new host starts over")
+
+class RegWriterStart(unittest.TestCase):
+    """Should-fix (a): the registry writer was stored in its slot before start(); a failed start raised into the caller
+    (the record hand-over, a hook) and left the slot stuck for the kernel's life, silently."""
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.d, ignore_errors=True)
+        Path(self.d, "session-hosts").write_text("off")
+        self.logs = []
+        self.be = sb.SdkBackend(self.d, "/bin/true", lambda *a, **k: None, log=self.logs.append)
+        sb.write_reg(Path(self.d), SID, {"sid": SID, "name": "web", "cwd": self.d, "host": "TESTHOST", "alive": True})
+        self.s = sb.SdkSession(self.be, sb.read_reg(Path(self.d), SID))
+
+    def _on_loop(self, fn):
+        out = {}
+
+        def run():
+            try:
+                out["value"] = fn()
+            except BaseException as e:
+                out["error"] = e
+        th = threading.Thread(target=run, name=LOOP_PREFIX + "web-start", daemon=True)
+        th.start()
+        th.join(10.0)
+        return out
+
+    def test_a_failing_start_still_answers_the_hook_and_writes(self):
+        real_start = threading.Thread.start
+
+        def failing_start(th):
+            if th.name == "romp-reg-writer":
+                raise RuntimeError("can't start new thread")
+            return real_start(th)
+        tr = self.be._new_host_transport(self.s, "/nonexistent.sock", -1)
+        tr.hello = dict(HELLO)
+        tr.replay_end = 0
+        self.s._host = tr
+        self.s._host_ack_t = 0.0
+        inp = {"hook_event_name": "Stop", "session_crons": [], "background_tasks": [], "transcript_path": "/x/t.jsonl"}
+
+        def body():
+            data = tr._take(_rec(7))                  # the record hand-over: must not raise
+            return data, asyncio.run(self.s._stop_hook(inp, None, None))
+        with unittest.mock.patch.object(threading.Thread, "start", failing_start):
+            out = self._on_loop(body)
+            out2 = self._on_loop(lambda: self.be._reg_job(None, lambda: self.be._update_reg(SID, lastTurnOpener="x")))
+        self.assertNotIn("error", out, out.get("error"))
+        self.assertNotIn("error", out2, out2.get("error"))
+        self.assertEqual(out["value"][1], {}, "the Stop hook is answered")
+        reg = sb.read_reg(Path(self.d), SID) or {}
+        self.assertEqual((reg.get("hostAck") or {}).get("offset"), 7, "the ack is written synchronously instead")
+        self.assertTrue(reg.get("lastStopAt"), "the Stop hook's write lands synchronously instead")
+        self.assertEqual(reg.get("lastTurnOpener"), "x")
+        self.assertEqual(sum(1 for l in self.logs if "could not start" in str(l)), 1, "logged once: %r" % (self.logs,))
+        self.assertIsNone(self.be._reg_writer, "no never-started thread is left in the slot")
+        # the start works again: the next queued item starts a writer, so nothing is stuck
+        self._on_loop(lambda: self.be._reg_job(None, lambda: self.be._update_reg(SID, lastTurnOpener="y")))
+        _drain_writer(self.be)
+        self.assertEqual((sb.read_reg(Path(self.d), SID) or {}).get("lastTurnOpener"), "y")
+
+    def test_a_dead_thread_in_the_slot_is_replaced(self):
+        self.be._reg_writer = threading.Thread(target=lambda: None, name="romp-reg-writer")   # never started
+        out = self._on_loop(lambda: self.be._reg_job(None, lambda: self.be._update_reg(SID, lastTurnOpener="z")))
+        self.assertNotIn("error", out, out.get("error"))
+        deadline = time.time() + 10.0
+        while time.time() < deadline and (sb.read_reg(Path(self.d), SID) or {}).get("lastTurnOpener") != "z":
+            time.sleep(0.02)
+        self.assertEqual((sb.read_reg(Path(self.d), SID) or {}).get("lastTurnOpener"), "z",
+                         "work queued behind a dead writer was never run")
+
 
 class SessionLoopRegLockGuard(unittest.TestCase):
     """The test-time rule: a session loop thread that takes the registry lock raises (ROMP_REG_LOCK_GUARD=raise, which
