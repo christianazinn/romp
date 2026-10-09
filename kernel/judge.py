@@ -4431,7 +4431,11 @@ def parsed_session(fsid, files, now, asm_mode_out=None, stats=None, states=None,
         stats["miss"] = True
         stats["key"] = key                             # the key the fresh tree is stored under (None when a stat failed)
     _PARSE_MISSES[0] += 1                                  # a cold parse (T323: /perf parses)
-    if key is not None:
+    released = em.asm_reseat_due(files[0], fsid, human) if hasattr(em, "asm_reseat_due") else False
+    if key is not None and not released:                   # (2026-10-08) a parse whose whole entry was released at a document
+        #                                                    write in the same call (the rewrite after a restore's refusal) built
+        #                                                    this tree from that entry: stored, it would hold every body for as long
+        #                                                    as the leaf stands; the next ask restores from the new document instead
         _parse_store(fsid, cut, key, session, leaf, human, (_am[-1] if _am else "full"))   # LRU, never a wholesale clear
     if fr is not None:                     # pin under the frame the KEY went into (never a re-read _frame: a
         with _frame_lock:                  #  parse spanning a pass boundary must not land keyless in the next

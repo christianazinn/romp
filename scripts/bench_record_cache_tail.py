@@ -32,14 +32,26 @@ time: `rewound` (the judges' memo road, em.rewound_uuids, retired by the append)
 em.file_rewound with the session id, then em.chain_membership as the judges call it), and `rewindHold` (the rewind gesture's
 kept chain, em.chain_membership with a pending cut and no session id). Each is warmed once per transcript at the boot, as the
 judges' first pass after a restart would (counted apart, `warm`).
+Every cycle also runs one ROUTINE-CALLER pass (2026-10-08, round two): one transcript, in rotation, gains a turn opened by a
+compaction (a boundary and its summary: an assembly fold cannot carry it, g:boundary), and is parsed through a stand-in named
+after one of the four kernel callers the deploy measured reading whole transcripts back (tasks_for, _auto_nudge_session,
+_plan_session, _bg_placed_tops; each stand-in calls parse_session itself, so the reads before a window are attributed to its
+name, as the kernel's are to the real caller's), then its settle writes the assembly document (asm_checkpoint_write from
+the parse's tree). The stand-ins drive the event model only; the real callers are driven by
+tests/test_record_cache_tail_r2.py. --doc-cap-mb sets the flat assembly document cap for every checkout alike (the devbox's
+leaves are about seven times this corpus's, so 2.3 MiB here stands for its 16 MiB: the documents of about half the large
+leaves exceed it, as there).
 Per cycle it records the wall time, the bytes the reader pulled off disk, the record cache's weight (/perf recordCache.bytes,
-the kernel's own estimate of resident bytes), the resident size and its high-water mark (VmRSS, VmHWM), and, where the
-checkout has the rule, the reads before a window. --repo picks the checkout whose event model runs: the base for
+the kernel's own estimate of resident bytes), the resident size and its high-water mark (VmRSS, VmHWM), the interpreter's
+allocated blocks (sys.getallocatedblocks, after a collection: the small allocations the deploy's perf reads counted), the
+assembly entries (whole and restored), and, where the checkout has the rule, the reads before a window, in total and by
+caller. --repo picks the checkout whose event model runs: the base for
 "before", this branch for "after" (ROMP_RECORD_CACHE_TAIL_MB=0 on this branch is the same as the base for the cache).
 
 Guards: refuses to start with under 20 GiB available, and stops with exit 3 once its own resident size passes --max-rss-gb
 (default 12). One process at a time."""
 import argparse
+import gc
 import json
 import os
 import random
@@ -221,6 +233,30 @@ def parse(em, path):
                             postal_log=[], now=time.time())
 
 
+def _args(path):
+    return dict(rompuuid=os.path.basename(path)[:-6], name="bench", dir="/w/notes-api", candidate_files=[path], states=None,
+                postal_log=[], now=time.time())
+
+
+# The stand-ins for the four kernel callers (see the module docstring). Each calls parse_session from its OWN frame: the
+# reader attributes a read before a window to the first frame outside the event model, so a shared helper would take the name.
+def tasks_for(em, path):
+    return em.parse_session(path, **_args(path))
+
+
+def _auto_nudge_session(em, path):
+    return em.parse_session(path, **_args(path))
+
+
+def _plan_session(em, path):
+    return em.parse_session(path, **_args(path))
+
+
+def _bg_placed_tops(em, path):
+    return em.parse_session(path, **_args(path))
+
+
+CALLERS = (tasks_for, _auto_nudge_session, _plan_session, _bg_placed_tops)
 META = {}
 
 
@@ -298,20 +334,30 @@ def _run(em, paths, ckpt, cycles, label, max_rss_gb, seed):
             raise SystemExit(3)
 
     def sample(c, t0, r0, c0, what):
+        wall = round(time.monotonic() - t0, 3)
+        gc.collect()                                    # after the wall: the blocks a collection would free are not held
         st = em.record_cache_stats()
         cold = em.cold_read_stats() if has_cold else {"passes": 0, "records": 0, "bytes": 0}
-        row = {"cycle": c, "what": what, "wallS": round(time.monotonic() - t0, 3), "readBytes": em.read_bytes_total() - r0,
+        by0, by1 = c0.get("byCaller") or {}, cold.get("byCaller") or {}
+        with em._ASM_LOCK:
+            asm = list(em._ASM_CACHE.values())
+        row = {"cycle": c, "what": what, "wallS": wall, "readBytes": em.read_bytes_total() - r0,
                "cacheBytes": st["bytes"], "entries": st["entries"], "tailOnly": (st.get("tailOnly") or {}).get("entries", 0),
-               "rssKiB": _status_kb("VmRSS"), "hwmKiB": _status_kb("VmHWM"),
-               "coldPasses": cold["passes"] - c0["passes"], "coldBytes": cold["bytes"] - c0["bytes"]}
+               "rssKiB": _status_kb("VmRSS"), "hwmKiB": _status_kb("VmHWM"), "blocks": sys.getallocatedblocks(),
+               "asmWhole": sum(1 for e in asm if not e.get("prefix") and not e.get("preTurns")),
+               "asmRestored": sum(1 for e in asm if e.get("prefix") or e.get("preTurns")),
+               "coldPasses": cold["passes"] - c0["passes"], "coldBytes": cold["bytes"] - c0["bytes"],
+               "coldRecords": cold["records"] - c0["records"],
+               "coldByCaller": {k: v["records"] - (by0.get(k) or {}).get("records", 0) for k, v in by1.items()
+                                if v["records"] != (by0.get(k) or {}).get("records", 0)}}
         rows.append(row)
-        sys.stderr.write("%s c%-3d %-30s %6.2fs read %7.1f MB cache %6.2f GB rss %5.2f GiB cold %d passes %.1f MB\n" % (
+        sys.stderr.write("%s c%-3d %-30s %6.2fs read %7.1f MB cache %6.2f GB rss %5.2f GiB blocks %5.1f M asm %d/%d cold %d recs %.1f MB\n" % (
             label, c, what, row["wallS"], row["readBytes"] / 1e6, row["cacheBytes"] / 1e9, row["rssKiB"] / (1024 ** 2),
-            row["coldPasses"], row["coldBytes"] / 1e6))
+            row["blocks"] / 1e6, row["asmWhole"], row["asmRestored"], row["coldRecords"], row["coldBytes"] / 1e6))
         return row
 
     def cold0():
-        return em.cold_read_stats() if has_cold else {"passes": 0, "records": 0, "bytes": 0}
+        return em.cold_read_stats() if has_cold else {"passes": 0, "records": 0, "bytes": 0, "byCaller": {}}
 
     # cycle 0: the boot over the documents
     t0, r0, c0 = time.monotonic(), em.read_bytes_total(), cold0()
@@ -351,6 +397,7 @@ def _run(em, paths, ckpt, cycles, label, max_rss_gb, seed):
         walks(0, p)
     for r in scen_rows:
         r["scenario"] += ":warm"
+    routine_rows = []
     n = len(paths)
     for c in range(1, cycles + 1):
         t0, r0, c0 = time.monotonic(), em.read_bytes_total(), cold0()
@@ -372,6 +419,22 @@ def _run(em, paths, ckpt, cycles, label, max_rss_gb, seed):
         guard()
         if first is not None:
             walks(c, first)                             # the judges' walks over a leaf that grew this cycle
+        rp = paths[c % n]                               # the routine-caller pass (see the module docstring)
+        w = writers[rp]
+        w.write(w.compact() + w.prompt() + w.tool_round() + w.reply())
+        caller = CALLERS[c % len(CALLERS)]
+        s0, t1 = cold0(), time.monotonic()
+        rerr, wrote = None, None
+        try:
+            tree = caller(em, rp)
+            s1 = cold0()
+            wrote = bool(em.asm_checkpoint_write(rp, os.path.basename(rp)[:-6], tree=tree))   # the settle after the turn
+            del tree
+        except Exception as e:                          # noqa: BLE001  a pass that fails is a row, never a stopped bench
+            rerr, s1 = repr(e)[:160], cold0()
+        routine_rows.append({"cycle": c, "caller": caller.__name__, "file": os.path.basename(rp),
+                             "wallS": round(time.monotonic() - t1, 4), "coldRecords": s1["records"] - s0["records"],
+                             "coldBytes": s1["bytes"] - s0["bytes"], "docWritten": wrote, "error": rerr})
         if c % 5 == 2:
             p = paths[(c // 5) % n]
             tree = parse(em, p)
@@ -389,8 +452,12 @@ def _run(em, paths, ckpt, cycles, label, max_rss_gb, seed):
             what.append("refold from 0")
         sample(c, t0, r0, c0, "+".join(what) or "steady")
     disk = sum(os.path.getsize(p) for p in paths)
-    out = {"label": label, "files": n, "diskBytes": disk, "cycles": cycles, "rows": rows, "walks": scen_rows,
+    out = {"label": label, "files": n, "diskBytes": disk, "cycles": cycles, "rows": rows, "walks": scen_rows, "routine": routine_rows,
+           "docCap": getattr(em, "_ASM_CKPT_CAP", None), "asmStats": dict(em._ASM_STATS),
+           "asmSkipped": dict((em.asm_checkpoint_stats() or {}).get("skipped") or {}),
            "recordCount": sum(len(em._JSONL_CACHE[p][4]) for p in paths if p in em._JSONL_CACHE),
+           "skeletonBytes": (em.record_cache_stats().get("tailOnly") or {}).get("skeletonBytes"),
+           "skeletons": (em.record_cache_stats().get("tailOnly") or {}).get("skeletons"),
            "tailBytes": getattr(em, "_TAIL_BYTES", None), "tailRecords": getattr(em, "_TAIL_RECORDS", None)}
     print(json.dumps(out))
 
@@ -422,6 +489,10 @@ def summarize(files, live_gib, live_cache_gb, live_rss_gb):
             "RSS GiB (end)": rows[-1]["rssKiB"] / (1024 ** 2),
             "peak RSS GiB": max(r["hwmKiB"] for r in rows) / (1024 ** 2),
             "tail-only entries (end)": rows[-1]["tailOnly"],
+            "allocated blocks (end, M)": (rows[-1]["blocks"] / 1e6) if "blocks" in rows[-1] else float("nan"),
+            "allocated blocks (max over cycles, M)": max((r.get("blocks") or 0) for r in rows) / 1e6 if "blocks" in rows[-1] else float("nan"),
+            "assembly entries whole / restored (end)": "%s / %s" % (rows[-1].get("asmWhole", "n/a"), rows[-1].get("asmRestored", "n/a")),
+            "records read before a window, all cycles": sum(r.get("coldRecords", 0) for r in steady),
             "records": d.get("recordCount"),
         }
     def walk_agg(d, out):
@@ -442,8 +513,27 @@ def summarize(files, live_gib, live_cache_gb, live_rss_gb):
                 if errs:
                     out["%s %s: errors" % (name, kind)] = str(errs)
         return out
-    labels = [l for l in ("before", "after") if l in runs] + [l for l in runs if l not in ("before", "after")]
-    table = {l: walk_agg(runs[l], agg(runs[l])) for l in labels}
+    def routine_agg(d, out):
+        rs = d.get("routine") or []
+        if not rs:
+            return out
+        out["routine pass: records before window per pass (median/max)"] = "%d / %d (n=%d)" % (
+            statistics.median(r["coldRecords"] for r in rs), max(r["coldRecords"] for r in rs), len(rs))
+        out["routine pass: MB before window, all passes"] = "%.1f" % (sum(r["coldBytes"] for r in rs) / 1e6)
+        for name in ("tasks_for", "_auto_nudge_session", "_plan_session", "_bg_placed_tops"):
+            sel = [r for r in rs if r["caller"] == name]
+            if sel:
+                out["routine pass %s: records before window (sum over %d passes)" % (name, len(sel))] = str(sum(r["coldRecords"] for r in sel))
+        out["routine pass: wall s (median/max)"] = "%.3f / %.3f" % (statistics.median(r["wallS"] for r in rs), max(r["wallS"] for r in rs))
+        out["routine pass: settles that wrote a document"] = "%d of %d" % (sum(1 for r in rs if r.get("docWritten")), len(rs))
+        errs = sum(1 for r in rs if r.get("error"))
+        if errs:
+            out["routine pass: errors"] = str(errs)
+        out["assembly documents skipped (run)"] = json.dumps(d.get("asmSkipped") or {}, sort_keys=True)
+        return out
+    order = ("before", "after", "base", "r1", "r2")
+    labels = [l for l in order if l in runs] + [l for l in runs if l not in order]
+    table = {l: routine_agg(runs[l], walk_agg(runs[l], agg(runs[l]))) for l in labels}
     keys = []
     for l in labels:
         keys += [k for k in table[l] if k not in keys]
@@ -455,6 +545,8 @@ def summarize(files, live_gib, live_cache_gb, live_rss_gb):
             v = table[l].get(k, "n/a")
             cells.append(("%.3f" % v) if isinstance(v, float) else str(v))
         print("| %s | %s |" % (k, " | ".join(cells)))
+    if "base" in runs and "r2" in runs:
+        extrapolate_r2(runs, table, labels)
     if "after" in runs and "before" in runs:
         b, a = table["before"], table["after"]
         disk_gib = b["disk GiB"]
@@ -465,7 +557,8 @@ def summarize(files, live_gib, live_cache_gb, live_rss_gb):
         print("EXTRAPOLATION (not a measurement) to %.1f GiB of live transcripts in 23 files:" % live_gib)
         before_w = live_gib * GIB * 3.0
         live_records = live_gib * GIB / per_rec
-        skel_b = 608                                       # the walk skeleton of each older record (600 bytes and its pointer)
+        ra = runs["after"]                                 # the walk skeleton of each older record: the run's own measure (each
+        skel_b = (ra["skeletonBytes"] / ra["skeletons"] + 8) if ra.get("skeletons") else 1000   #  skeleton by what it holds)
         after_w = 23 * tb * 3.0 + live_records * (20 + skel_b)   # offsets (16 bytes), a CRC (4) and a skeleton a record
         print("  cache weight whole (3 bytes a file byte): %.1f GB (tonight's measured cache: %.1f GB in 59 entries)" % (before_w / 1e9, live_cache_gb))
         print("  cache weight tail-only: 23 windows of %d MiB x 3 + %.1f M records x %d B of index and skeleton = %.2f GB" % (
@@ -477,6 +570,40 @@ def summarize(files, live_gib, live_cache_gb, live_rss_gb):
                   live_rss_gb, live_cache_gb, live_rss_gb - live_cache_gb + after_w / 1e9, live_rss_gb - live_cache_gb))
         print("  bench resident at the end: before %.2f GiB, after %.2f GiB over %.2f GiB on disk (peak %.2f vs %.2f GiB)" % (
             b["RSS GiB (end)"], a["RSS GiB (end)"], disk_gib, b["peak RSS GiB"], a["peak RSS GiB"]))
+
+
+LIVE_GIB = 20.0              # the devbox's live transcripts (about 20 GiB, 2026-10-07)
+LIVE_ENTRIES = 116           # cached record entries at the peak
+LIVE_BASE_BLOCKS = 352e6     # allocated blocks of the whole-cache build at half an hour (perf_same_age, 2026-10-07)
+LIVE_R1_BLOCKS = 355e6       # the round-one build at the same age (the deploy's read)
+LIVE_BASE_CACHE_GB = 26.9    # its record cache count then
+LIVE_BASE_RSS_GIB = 90.0     # resident before a restart, the whole-cache build
+
+
+def extrapolate_r2(runs, table, labels):
+    """Scale each run's end state per GiB on disk to the live set (an EXTRAPOLATION, not a measurement): the bench's heap is
+    transcripts plus an interpreter, the live heap is transcripts plus everything else the kernel holds, so the transcript part is
+    scaled by bytes on disk and the rest is the live base's remainder, the same for every build."""
+    scale = LIVE_GIB * GIB / runs["base"]["diskBytes"]
+    b = runs["base"]["rows"][-1]
+    print()
+    print("EXTRAPOLATION (not a measurement) to %.0f GiB of live transcripts (%d cached entries at the peak), by bytes on disk: x%.1f" % (
+        LIVE_GIB, LIVE_ENTRIES, scale))
+    base_blocks = b["blocks"] * scale
+    other = max(0.0, LIVE_BASE_BLOCKS - base_blocks)
+    print("  base's transcript blocks scaled: %.0f M; the live base build held %.0f M at half an hour, so %.0f M are the rest of the "
+          "kernel (taken as fixed)" % (base_blocks / 1e6, LIVE_BASE_BLOCKS / 1e6, other / 1e6))
+    for l in labels:
+        r = runs[l]["rows"][-1]
+        if "blocks" not in r:
+            continue
+        tb = r["blocks"] * scale
+        cache = r["cacheBytes"] * scale / 1e9
+        rss = (r["rssKiB"] / (1024 ** 2)) * scale
+        print("  %-6s blocks %6.0f M (transcripts %5.0f M + rest %4.0f M); record cache count %5.1f GB; transcript-side resident "
+              "%5.1f GiB" % (l, (tb + other) / 1e6, tb / 1e6, other / 1e6, cache, rss))
+    print("  measured live for comparison: base %.0f M blocks, round one %.0f M (half an hour); base cache count %.1f GB; resident "
+          "up to %.0f GiB before a restart" % (LIVE_BASE_BLOCKS / 1e6, LIVE_R1_BLOCKS / 1e6, LIVE_BASE_CACHE_GB, LIVE_BASE_RSS_GIB))
 
 
 def main():
@@ -493,6 +620,7 @@ def main():
     ap.add_argument("--live-gib", type=float, default=20.2)
     ap.add_argument("--live-cache-gb", type=float, default=49.5)
     ap.add_argument("--live-rss-gb", type=float, default=74.0)
+    ap.add_argument("--doc-cap-mb", type=float, default=0, help="the flat assembly document cap, MiB (0: the checkout's own)")
     ap.add_argument("inputs", nargs="*")
     a = ap.parse_args()
     if a.phase == "summarize":
@@ -503,6 +631,8 @@ def main():
     if _mem_available_gib() < 20:
         sys.exit("refusing: under 20 GiB available (%.1f)" % _mem_available_gib())
     em = load(a.repo, a.corpus)
+    if a.doc_cap_mb:
+        em._ASM_CKPT_CAP = int(a.doc_cap_mb * MIB)       # every checkout alike (see the module docstring)
     paths = leaves(a.corpus, a.files)
     if a.phase == "prep":
         prep(em, paths, a.ckpt)
