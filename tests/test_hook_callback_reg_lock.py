@@ -767,6 +767,171 @@ class RegWriterReview2(unittest.TestCase):
         self.assertEqual((sb.read_reg(Path(self.d), SID) or {}).get("n"), 11)
 
 
+class SessionEndFlushesItsQueue(unittest.TestCase):
+    """Review 3: every path where a session ends runs that session's queued registry jobs first, inline and in order,
+    and writes synchronously after them. Before, a save the dying thread queued (its name is still sdk:) could land after
+    the crash heal or the task-death notice and overwrite them, and a CLI death left the consumed offset only in memory."""
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.d, ignore_errors=True)
+        Path(self.d, "session-hosts").write_text("off")
+        self.logs = []
+        self.be = sb.SdkBackend(self.d, "/bin/true", lambda *a, **k: None, log=self.logs.append)
+        sb.write_reg(Path(self.d), SID, {"sid": SID, "name": "web", "cwd": self.d, "host": "TESTHOST", "alive": True})
+        self.s = sb.SdkSession(self.be, sb.read_reg(Path(self.d), SID))
+        self.ensured = []
+        self.be._ensure = lambda sid, *a, **k: self.ensured.append(list(self._reg(sid).get("queue") or []))
+
+    def _reg(self, sid=SID):
+        return sb.read_reg(Path(self.d), sid) or {}
+
+    def _on_loop(self, fn, wait=10.0):
+        th = threading.Thread(target=fn, name=LOOP_PREFIX + "web-end", daemon=True)
+        th.start()
+        th.join(wait)
+        return th
+
+    def _gate(self):
+        """Park the writer on another piece of work (no session, no lock) so this session's jobs stay queued."""
+        ev = threading.Event()
+        self._on_loop(lambda: self.be._reg_job(None, lambda: ev.wait(10)))
+        self.addCleanup(ev.set)
+        return ev
+
+    def test_the_held_text_survives_a_crash_heal_under_a_busy_lock(self):
+        new = {}
+        self.be._ensure = lambda sid, *a, **k: new.setdefault("s", sb.SdkSession(self.be, self._reg(sid)))
+        with self.s._lock:
+            self.s._pending[:] = ["held synthetic text"]       # put back by the hold's release at the CLI's death
+            self.s._pending_meta[:] = [{}]
+        ev = self._gate()
+        self.be._reg_lock.acquire()
+        try:
+            self._on_loop(self.s._persist_queue)              # the release's save on the dying sdk: thread: queued
+        finally:
+            self.be._reg_lock.release()
+        self.s.inflight = 1
+        self.be._heal_cut_session(self.s)
+        ev.set()
+        _drain_writer(self.be)
+        ns = new["s"]
+        with ns._lock:
+            mem = list(ns._pending)
+        self.assertEqual(mem, [sb.CRASH_RESUME_NUDGE, "held synthetic text"], "the new session lost the held text")
+        ns._persist_queue()
+        self.assertEqual(self._reg().get("queue"), [sb.CRASH_RESUME_NUDGE, "held synthetic text"])
+
+    def test_the_task_death_clear_survives_a_mirror_the_dying_session_queued(self):
+        with self.s._sub_lock:
+            self.s._bg_tasks["task-synthetic"] = {"desc": "a synthetic watcher", "since": 1, "type": "local_bash"}
+        ev = self._gate()
+        self._on_loop(self.s._mirror_bg_tasks)               # a task event just before the CLI died: queued
+        self.s.inflight = 0
+        self.be._on_session_gone(self.s)
+        ev.set()
+        _drain_writer(self.be)
+        self.assertEqual(self._reg().get("bgTasks"), [], "the queued mirror wrote the reported dead task back")
+        notes = [t for t in self._reg().get("queue") or [] if "synthetic watcher" in t]
+        self.assertEqual(len(notes), 1, "the death is reported once")
+
+    def test_a_restart_after_a_cli_death_does_not_replay_consumed_records(self):
+        """Records 3 to 39 consumed while another thread holds the lock, the CLI dies, the session leaves its host, the
+        kernel restarts before the next connect: the next kernel (no carry) replays nothing already consumed."""
+        reg = self._reg()
+        reg["hostAck"] = {"host": "4242:h1", "cli": "4343:c1", "offset": 2}
+        sb.write_reg(Path(self.d), SID, reg)
+        t1 = self.be._new_host_transport(self.s, "/nonexistent.sock", 2)
+        t1.hello = dict(HELLO)
+        t1.replay_end = 0
+        self.s._host = t1
+
+        def loop():
+            for off in range(3, 40):
+                self.s._host_ack_t = 0.0
+                t1._take(_rec(off))
+            t1.exit_info = {"t": "exit", "cause": "died", "code": -9}
+            leave = getattr(self.s, "_leave_host", None)       # the connect loop's finally (inline before it existed)
+            if leave is not None:
+                leave()
+            else:
+                if self.s._host is not None and getattr(self.s._host, "exit_info", None) is None:
+                    self.be._write_host_ack(self.s, force=True)
+                self.s._host = None
+        self.be._reg_lock.acquire()
+        try:
+            th = threading.Thread(target=loop, name=LOOP_PREFIX + "web-died3", daemon=True)
+            th.start()
+            th.join(1.0)
+        finally:
+            self.be._reg_lock.release()
+        th.join(10.0)
+        self.be._reg_flush(5.0)
+        self.assertEqual(self._reg().get("hostAck", {}).get("offset"), 39, "the departed host's final offset was not written")
+        be2 = sb.SdkBackend(self.d, "/bin/true", lambda *a, **k: None, log=self.logs.append)   # the next kernel
+        hdir = ht.host_dir(Path(self.d), SID)
+        hdir.mkdir(parents=True, exist_ok=True)
+        (hdir / "identity.json").write_text('{"pid": 4242, "start": "h1"}')
+        with open(hdir / "journal-0.jsonl", "w") as fh:
+            for off in range(45):                              # 40 to 44 were never consumed: they must replay
+                fh.write('{"type": "assistant", "n": %d}\n' % off)
+        replayed = []
+
+        class FakeClient:
+            def __init__(self, options=None, transport=None):
+                replayed.append(transport.ack_offset + 1)
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc):
+                return False
+        fake = types.ModuleType("claude_agent_sdk")
+        fake.ClaudeSDKClient = FakeClient
+        s2 = types.SimpleNamespace(sid=SID, name="web", _host=None, _seed_for_dead_cli=lambda cli: None)
+        with unittest.mock.patch.dict(sys.modules, {"claude_agent_sdk": fake}), \
+                unittest.mock.patch.object(be2, "_replay_drain", lambda *a, **k: asyncio.sleep(0)):
+            asyncio.run(be2._host_orphan_recover(s2, None, None, None, died=False))
+        self.assertEqual(replayed, [40], "the next kernel replayed from %r, not from the first unconsumed record" % replayed)
+
+    def test_a_clean_end_writes_no_departed_offset(self):
+        t1 = self.be._new_host_transport(self.s, "/nonexistent.sock", 2)
+        t1.hello = dict(HELLO)
+        t1.ack_offset = 9
+        t1.exit_info = {"t": "exit", "cause": "end"}
+        self.s._host = t1
+        self._on_loop(self.s._leave_host)
+        self.assertNotIn("hostAck", self._reg(), "a clean end drops hostAck; nothing may write it back")
+
+    def test_the_session_threads_end_leaves_no_queued_job_of_its_session(self):
+        """The real exit path (_run's finally, with the connect loop stubbed out): whatever the session had queued runs
+        before the end's writes, and nothing of it is left in the queue; another session's work is untouched."""
+        other = "5e1f0a77-2222-4333-8444-0000000000c2"
+        ev = self._gate()
+        order = []
+
+        def queue_some():
+            self.be._reg_job(("stopRecord", SID), lambda: order.append("stop-record"))
+            self.be._reg_job(("transcriptPath", SID), lambda: order.append("transcript"))
+            self.be._reg_job(("queue", other), lambda: order.append("other-session"))
+        self._on_loop(queue_some)
+        gone = []
+        orig_gone = self.be._on_session_gone
+        self.be._on_session_gone = lambda sess: (gone.append(list(order)), orig_gone(sess))
+
+        async def no_connect():
+            return None
+        self.s._amain = no_connect
+        th = self._on_loop(self.s._run)
+        self.assertFalse(th.is_alive())
+        left = [k for k in self.be._reg_jobs if isinstance(k, tuple) and len(k) == 2 and k[1] == SID]
+        self.assertEqual(left, [], "the session's end left its queued jobs behind")
+        self.assertEqual(gone, [["stop-record", "transcript"]], "the session's jobs ran, in order, before its end's writes")
+        self.assertIn(("queue", other), self.be._reg_jobs, "another session's queued work is left to the writer")
+        ev.set()
+        _drain_writer(self.be)
+        self.assertEqual(order, ["stop-record", "transcript", "other-session"])
+
 class SessionLoopRegLockGuard(unittest.TestCase):
     """The test-time rule: a session loop thread that takes the registry lock raises (ROMP_REG_LOCK_GUARD=raise, which
     tests/conftest.py sets for the suite), so a hook or handler that writes the registry on the loop fails its test."""
