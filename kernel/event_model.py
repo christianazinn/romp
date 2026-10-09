@@ -5012,10 +5012,11 @@ class FileAdapter:
                 # dedup, and this summary's text landed on the manual card). The fallback serves a
                 # summary whose boundary is not on record here: a restored assembly entry holds only
                 # the tail's records and carries last_boundary from its checkpoint.
-                bp = self.parent_of.get(u)
-                br = self.by_uuid.get(bp) if bp else None
-                own = bp if (br is not None and br.get("type") == "system"
-                             and br.get("subtype") == "compact_boundary") else last_boundary
+                # Since 2026-10-09 the link is followed up through attachment records (_summary_boundary):
+                # the CLI now writes boundary, attachments, then the summary parented on the last
+                # attachment, and the direct-parent test filed every such summary on the previous card.
+                br = _summary_boundary(r, self.by_uuid.get, self.parent_of.get)
+                own = br.get("uuid") if br is not None else last_boundary
                 stext = _text_of(_content(r.get("message")))
                 if own and stext:                      # attach to its own boundary; cap for transport
                     summaries[own] = stext[:SUMMARY_CAP] + (
@@ -6480,11 +6481,43 @@ def _asm_record_whole(r, ad, max_ppt, prior=None):
     return None
 
 
+_SUMMARY_ATTACH_HOPS = 8   # how many attachment records may sit between a compaction boundary and its summary (_summary_boundary)
+
+
+def _summary_boundary(rec, lookup, parent_of=None):
+    """The compact_boundary record the compaction summary `rec` belongs to, or None (2026-10-09). The Claude CLI writes a
+    compaction as the boundary, then attachment records (three on every live transcript read that day), then the summary,
+    parented on the LAST attachment and stamped about a second before the boundary; older writes parent the summary on the
+    boundary itself. So the walk follows parent links up through attachment records only, at most _SUMMARY_ATTACH_HOPS of
+    them: a chain that meets any other record (a prompt, a reply) before a boundary is an orphan summary, as before.
+    `lookup` maps a uuid to its record (or None); `parent_of`, when given, maps a uuid to its parent uuid (the whole parse's
+    repaired links), else each record's own parentUuid is followed. Read by the whole parse's own-boundary pick
+    (_prepass), the fold's orphan gate (_asm_summary_orphan) and the restore's (_restore_tail_refusal): with the summary's
+    direct parent required to be the boundary, every live compaction read as an orphan, so the restore refused and the fold
+    demoted to a whole parse of the transcript, and the whole parse filed the summary on the previous compaction's card."""
+    def up(r):
+        return parent_of(r.get("uuid")) if parent_of is not None else r.get("parentUuid")
+    p, seen = up(rec), set()
+    for _ in range(_SUMMARY_ATTACH_HOPS + 1):             # the direct parent, then one step past each attachment
+        if not p or p in seen:
+            return None
+        seen.add(p)
+        pr = lookup(p)
+        if not pr:
+            return None
+        t = pr.get("type")
+        if t == "system" and pr.get("subtype") == "compact_boundary":
+            return pr
+        if t != "attachment":
+            return None
+        p = up(pr)
+    return None
+
+
 def _asm_summary_orphan(r, prior, ad):
-    """Whether the compaction summary `r` is parented on no compaction boundary: its parent among the append's earlier records
-    (`prior`, uuid -> record) or the adapter's."""
-    pr = prior.get(r.get("parentUuid")) or ad.by_uuid.get(r.get("parentUuid")) or {}
-    return not (pr.get("type") == "system" and pr.get("subtype") == "compact_boundary")
+    """Whether the compaction summary `r` belongs to no compaction boundary (_summary_boundary): its chain read among the
+    append's earlier records (`prior`, uuid -> record) and the adapter's."""
+    return _summary_boundary(r, lambda u: prior.get(u) or ad.by_uuid.get(u)) is None
 
 
 def _asm_demote_whole(why):
@@ -8824,8 +8857,7 @@ def _restore_tail_refusal(ad, max_ppt, pre_gates, pre_boundary=None):
             if ts is None or ts < max_ppt:
                 return "stamp"
         if r.get("isCompactSummary") is True and pre_boundary is not None:
-            pr = ad.by_uuid.get(r.get("parentUuid")) or {}
-            if not (pr.get("type") == "system" and pr.get("subtype") == "compact_boundary"):
+            if _summary_boundary(r, ad.by_uuid.get) is None:   # through the attachments the CLI writes between them (2026-10-09)
                 return "summary"
         if pre_gates:
             pid = r.get("promptId")
