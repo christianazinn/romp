@@ -8729,13 +8729,14 @@ def _asm_restore_inner(key, leaf_path, candidate_files, links, rompuuid, postal_
             _tail_pin_clear(pin)                          # refused: nothing stands on the document, the window slides again
 
 
-def _restore_tail_refusal(ad, max_ppt, pre_gates):
+def _restore_tail_refusal(ad, max_ppt, pre_gates, pre_boundary=None):
     """Why a restore must refuse the tail the seeded adapter `ad` ingested, or None (2026-10-08). The checks a cold parse makes
     of the tail against the pre-cut part, which the document holds fixed:
       - stamp: a prompt, reply or compaction stamped before the carry's watermark (`max_ppt`), or with no stamp: the cold parse
         sorts it among the pre-cut turns (a prompt opens an old turn; a compaction's card moves);
-      - summary: a compaction summary parented on no compaction boundary of the tail: the cold parse attaches it to the last
-        boundary's card, which may be pre-cut;
+      - summary: a compaction summary parented on no compaction boundary of the tail while the carry names a pre-cut boundary
+        (`pre_boundary`): the cold parse attaches it to that boundary's card, which the document holds fixed (with no pre-cut
+        compaction there is no such card, and the restore builds what the cold parse does);
       - promptId: a record wearing a pre-cut prompt id that re-classifies the pre-cut record carrying it (a command wrapper of a
         typed slash command's raw twin, or any record wearing a pre-cut compaction summary's id);
       - skill: a Skill tool_use whose id a pre-cut payload record references.
@@ -8749,7 +8750,7 @@ def _restore_tail_refusal(ad, max_ppt, pre_gates):
             ts = parse_z(r.get("timestamp"))
             if ts is None or ts < max_ppt:
                 return "stamp"
-        if r.get("isCompactSummary") is True:
+        if r.get("isCompactSummary") is True and pre_boundary is not None:
             pr = ad.by_uuid.get(r.get("parentUuid")) or {}
             if not (pr.get("type") == "system" and pr.get("subtype") == "compact_boundary"):
                 return "summary"
@@ -8820,7 +8821,7 @@ def _asm_restore_from_doc(key, leaf_path, candidate_files, links, rompuuid, post
         ad.sdk_human = sdk_human
         st = _emit_state()
         st.update(_carry_decode(doc["carry"]))
-        why_ = _restore_tail_refusal(ad, st.get("max_ppt"), doc.get("preGates"))
+        why_ = _restore_tail_refusal(ad, st.get("max_ppt"), doc.get("preGates"), st.get("last_boundary"))
         if why_ is not None:
             # a tail the restore cannot answer (2026-10-08, reviews R1-1, N3, N4, N10d): a record a cold parse sorts or binds into
             # the pre-cut part, which the document holds fixed. Refused to the whole parse, at a boot as after a demotion, and
