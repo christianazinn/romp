@@ -8776,8 +8776,8 @@ def _restore_tail_refusal(ad, max_ppt, pre_gates, pre_boundary=None):
       - promptId: a record wearing a pre-cut prompt id that re-classifies the pre-cut record carrying it (a command wrapper of a
         typed slash command's raw twin, or any record wearing a pre-cut compaction summary's id);
       - skill: a Skill tool_use whose id a pre-cut payload record references.
-    The last two read the document's PRE-CUT gate sets (`pre_gates`, written since this change); a document without them is
-    not checked for them (its tail has none of the writer's knowledge), as before."""
+    The last two read the document's PRE-CUT gate sets (`pre_gates`, written since 2026-10-08); for a document written before
+    them the caller passes its whole-adapter gates, a superset (2026-10-09)."""
     if pre_gates:
         pre_gates = {k: set(v or ()) for k, v in pre_gates.items()}
     for r in ad.by_uuid.values():                         # the seeded adapter holds the tail's records alone
@@ -8883,7 +8883,15 @@ def _asm_restore_from_doc(key, leaf_path, candidate_files, links, rompuuid, post
         ad.sdk_human = sdk_human
         st = _emit_state()
         st.update(_carry_decode(doc["carry"]))
-        why_ = _restore_tail_refusal(ad, st.get("max_ppt"), doc.get("preGates"), st.get("last_boundary"))
+        pre_gates = doc.get("preGates")
+        legacy = pre_gates is None                        # a document written before preGates (every document at the deploy of
+        if legacy:                                        #  this change): its whole-adapter gates, a superset of the pre-cut sets
+            g_ = doc.get("gates") or {}                   #  (tail at write time included), so it refuses at least what preGates
+            pre_gates = {k: list(g_.get(k) or ()) for k in ("prompt_ids", "boundary_pids", "src_tool_links")}   # would (2026-10-09,
+            #                                               third review, must-fix 3: skipped, a wrapper or Skill link written after the
+            #                                               document restored a wrong tree, and the restore after a compaction kept it).
+            #                                               An over-refusal costs one whole parse; its rewrite carries preGates
+        why_ = _restore_tail_refusal(ad, st.get("max_ppt"), pre_gates, st.get("last_boundary"))
         if why_ is not None:
             # a tail the restore cannot answer (2026-10-08, reviews R1-1, N3, N4, N10d): a record a cold parse sorts or binds into
             # the pre-cut part, which the document holds fixed. Refused to the whole parse, at a boot as after a demotion, and

@@ -124,6 +124,56 @@ class ARecordOnTheSettledPreCutTip(_Base):
         self.assertEqual(got, self._ref(), d)
 
 
+class AnOldDocumentWithoutPreGates(_Base):
+    """Defect 3: the document written before preGates, a pre-cut twin (u10, pid-pre) and payload (u12, toolu_pre_sk), and a
+    tail record re-classifying one of them written after the document."""
+    def setUp(self):
+        _Base.setUp(self)
+        for r in self.recs:
+            if r.get("uuid") == "u10":
+                r["promptId"] = "pid-pre"
+                r["message"]["content"] = "/review"
+            if r.get("uuid") == "u12":
+                r["sourceToolUseID"] = "toolu_pre_sk"
+                r["message"]["content"] = "instructions for the deploy skill"
+        Path(self.path).write_text("".join(json.dumps(x) + "\n" for x in self.recs))
+
+    _wrapper = R.APreCutTwinAndPayload._wrapper
+    _skill = R.APreCutTwinAndPayload._skill
+    WRAP = WRAP
+
+    def _old(self, rec, compaction_after=False):
+        with T.knobs(WINDOW, 4, roots=[str(self.proj)]):
+            tree = self.parse()
+            self.assertTrue(em.asm_checkpoint_write(self.path, SID, tree=tree), em.asm_checkpoint_stats())
+            del tree
+            self._strip_pre_gates()
+            r_ = rec(self.parent)
+            self._write([r_])
+            self._reset()
+            tree, d = self._counted(self.parse)
+            em.hydrate(tree, SID)
+            got = [T._strip_tree(tree)]
+            if compaction_after:                          # the review: the restore after the compaction kept the wrong tree
+                self._write(R.tail_turn(50, r_["uuid"], self.t + 100, boundary=True))
+                tree = self.parse()
+                em.hydrate(tree, SID)
+                got.append(T._strip_tree(tree))
+        return d, got
+
+    def test_a_wrapper_at_the_first_boot(self):
+        d, got = self._old(self._wrapper)
+        self.assertEqual(got[0], self._ref(), d)
+
+    def test_a_skill_link_at_the_first_boot(self):
+        d, got = self._old(self._skill)
+        self.assertEqual(got[0], self._ref(), d)
+
+    def test_a_wrapper_then_a_compaction(self):
+        d, got = self._old(self._wrapper, compaction_after=True)
+        self.assertEqual(got[1], self._ref(), d)
+
+
 class TheCutSearchIsLinear(R.R2Base):
     """Should-fix: a kept prompt in the last turn stamped near the start steps the writer's cut back one turn per candidate;
     each candidate re-scanned every kept record and every record (d088e830b: 2.1 s at 1,000 turns, 69.8 s at 4,000 in the
