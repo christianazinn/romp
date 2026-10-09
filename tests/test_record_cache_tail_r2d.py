@@ -285,5 +285,108 @@ class TheCutSearchIsLinear(R.R2Base):
         self.assertLess(stale, 2 * plain + 0.25, (plain, stale))
 
 
+class TheRestOfAnAppendIsHeldToTheDocumentsWatermark(_Base):
+    """Pin for the second review's N6d (docMaxPpt): after a compaction restored the entry from the document, a summary
+    written a second before its own boundary, in the next append, restores again (the rest-of-append scan holds it to the
+    document's watermark, not to the entry's, which counts the tail). With the entry's watermark it takes a whole parse."""
+
+    def test_a_late_summary_restores(self):
+        def mutate():
+            bt = self.t + 30
+            b = self._boundary(7, bt)
+            self._write([b[0]])                            # the boundary alone: the restore after its demotion
+            self.parse()
+            s = dict(b[1], timestamp=iso(bt - 1))
+            self._write([s] + R.tail_turn(70, s["uuid"], bt + 10))
+        d, got = self._go(mutate)
+        self.assertEqual((d.get("full", 0), d.get("restore")), (0, 1), d)
+        self.assertEqual(got, self._ref())
+
+
+
+SID2 = "aaaaaaaa-4444-4222-8333-777777777777"
+
+
+class TheConvergePassChanges(R.R2Base):
+    """Pins for the second review's three converge-pass changes (3d5099957), each failing with the loop body reverted:
+    (a) the floor is spent once a pass, whether the write it lets through lands or is refused; (b) the owed mark goes only
+    with a write, so another session's row over the same leaf that returns False first leaves it to the row that can write;
+    (c) an owed leaf with no whole entry left is pruned."""
+
+    def _leaves(self, n):
+        from test_asm_checkpoint_served import transcript
+        paths = [self.path]
+        for i in range(1, n):
+            p = str(self.proj / ("bbbbbbbb-4444-4222-8333-%012d.jsonl" % i))
+            Path(p).write_text("".join(json.dumps(r) + "\n" for r in transcript(NOW - 86400, turns=160, compact_every=40)))
+            paths.append(p)
+        old = time.time() - 600
+        for p in paths:
+            os.utime(p, (old, old))
+        return paths
+
+    def _knobs(self, cap):
+        for name, val in (("CKPT_CONVERGE_MS", 5000.0), ("CKPT_CONVERGE_BYTES", cap), ("ASM_CONVERGE", True)):
+            saved = getattr(km, name); setattr(km, name, val); self.addCleanup(setattr, km, name, saved)
+        for t in (km._ASM_CONVERGE_DONE, km._ASM_CONVERGE_BLIP, km._ASM_CONVERGE_NOENTRY, km._ASM_CONVERGE_OWED):
+            t.clear()
+
+    def _pass(self):
+        km._begin_checkpoint_cycle()
+        return km._converge_assembly(time.time(), time.monotonic())
+
+    def test_a_the_floor_is_spent_once_a_pass(self):
+        paths = self._leaves(2)
+        with T.knobs(WINDOW, 4, roots=[str(self.proj)]):
+            for i, p in enumerate(paths):
+                km._parse(p, SID if i == 0 else "bbbbbbbb-4444-4222-8333-%012d" % i, NOW)
+            self._knobs(min(max(4096, os.path.getsize(p) // 64) for p in paths) - 1)
+            self.assertEqual(self._pass(), 0)             # both over the budget: both owed
+            self.assertEqual(len(km._ASM_CONVERGE_OWED), 2)
+            real, calls = em.asm_checkpoint_write, []
+            def refuse_first(leaf, *a, **kw):             # the floor's write refused (a structural skip, say)
+                calls.append(leaf)
+                if len(calls) == 1:
+                    (kw.get("reason_out") or []).append("noCut")
+                    return False
+                return real(leaf, *a, **kw)
+            em.asm_checkpoint_write = refuse_first
+            self.addCleanup(setattr, em, "asm_checkpoint_write", real)
+            self._pass()
+            self.assertEqual(len(calls), 1, "a second owed leaf took the floor in the same cycle: %r" % calls)
+            self._pass()
+            self.assertEqual(len(calls), 2, calls)
+
+    def test_b_a_sibling_rows_false_leaves_the_owed_mark(self):
+        self._leaves(1)                                   # quiescent
+        with T.knobs(WINDOW, 4, roots=[str(self.proj)]):
+            km._parse(self.path, SID, NOW)
+            km._parse(self.path, SID2, NOW)               # a second session's row over the same leaf
+            rows = [k for k in em.asm_whole_entries() if k[0] and str(k[0]) == os.path.realpath(self.path) or str(k[0]) == self.path]
+            self.assertGreaterEqual(len(rows), 2, em.asm_whole_entries())
+            self._knobs(max(4096, os.path.getsize(self.path) // 64) - 1)
+            self._pass()                                  # over the budget: owed
+            self.assertEqual(len(km._ASM_CONVERGE_OWED), 1, (em.asm_whole_entries(), em.asm_checkpoint_stats().get("converge"),
+                                                             em._asm_ckpt_file(self.path).exists()))
+            real, seen = km._converge_assembly_leaf, []
+            def first_row_false(leaf, sid, *a, **kw):     # the first row returns False (a flag mismatch, say)
+                seen.append(sid)
+                if len(seen) == 1:
+                    return False
+                return real(leaf, sid, *a, **kw)
+            km._converge_assembly_leaf = first_row_false
+            self.addCleanup(setattr, km, "_converge_assembly_leaf", real)
+            self.assertEqual(self._pass(), 1, "the row that can write took the floor (seen %r)" % seen)
+            self.assertTrue(em._asm_ckpt_file(self.path).exists())
+
+    def test_c_an_owed_leaf_with_no_whole_entry_is_pruned(self):
+        with T.knobs(WINDOW, 4, roots=[str(self.proj)]):
+            km._parse(self.path, SID, NOW)
+            self._knobs(10 ** 9)
+            km._ASM_CONVERGE_OWED[str(self.proj / "gone.jsonl")] = True
+            self._pass()
+            self.assertNotIn(str(self.proj / "gone.jsonl"), km._ASM_CONVERGE_OWED)
+
+
 if __name__ == "__main__":
     unittest.main()
