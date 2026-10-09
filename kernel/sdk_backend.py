@@ -5916,6 +5916,7 @@ class SdkSession:
         #   permission). Each ask site holds this from present to resolve (PR #875 review, 2026-09-02).
         self._lock = threading.Lock()
         self._persist_lock = threading.Lock()   # one queue-mirror snapshot and write at a time (_persist_queue)
+        self._persist_taken_lock = threading.Lock()   # _persist_taken_due's set and its read-and-clear, each atomic
         self._ready = threading.Event()
         # Boot-stagger hook (see BOOT_RESUME_CONCURRENCY): fired exactly once when this session's CLI
         # is demonstrably past its spawn+catch-up burst (first init message) or its thread dies —
@@ -6397,7 +6398,8 @@ class SdkSession:
         if on_session_loop() and not getattr(_REG_INLINE, "on", False):   # a session-ending path writes synchronously
             if self._persist_queue_try(taken):
                 return
-            self._persist_taken_due = getattr(self, "_persist_taken_due", False) or taken
+            with self._taken_flag_lock():
+                self._persist_taken_due = getattr(self, "_persist_taken_due", False) or taken
             self.backend._reg_job(("queue", self.sid), self._persist_queue_due)
             return
         with self._persist_lock:
@@ -6438,9 +6440,18 @@ class SdkSession:
             self._persist_lock.release()
 
     def _persist_queue_due(self):
-        """The queued persist (registry writer thread): one blocking persist of the queue as it stands now."""
-        taken, self._persist_taken_due = getattr(self, "_persist_taken_due", False), False
+        """The queued persist (registry writer thread): one blocking persist of the queue as it stands now. The taken
+        flag is read and cleared in one step under its lock (review 3): a flag the loop set between a bare read and the
+        clear was lost, and the postalTaken ids with it, so mail could be delivered twice after a kernel death."""
+        with self._taken_flag_lock():
+            taken, self._persist_taken_due = getattr(self, "_persist_taken_due", False), False
         self._persist_queue(taken)
+
+    def _taken_flag_lock(self):
+        lk = getattr(self, "_persist_taken_lock", None)
+        if lk is None:                          # a __new__-built stand-in skips __init__
+            lk = self._persist_taken_lock = threading.Lock()
+        return lk
 
     def interrupt(self, climb=True):
         """Escalating stop (the user 2026-07-10, terminal parity). The old body was `if self.loop and

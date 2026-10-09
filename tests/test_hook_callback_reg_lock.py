@@ -932,6 +932,46 @@ class SessionEndFlushesItsQueue(unittest.TestCase):
         _drain_writer(self.be)
         self.assertEqual(order, ["stop-record", "transcript", "other-session"])
 
+    def test_the_taken_flag_set_during_the_writers_read_is_never_lost(self):
+        """The writer's read-and-clear of the postal-taken flag and the loop's set are each atomic (review 3): a set that
+        lands between the writer's read and its clear used to be wiped, and the taken mail ids were never written, so a
+        kernel death could deliver that mail again."""
+        with self.s._lock:
+            self.s._pending[:] = ["a synthetic banner"]
+            self.s._pending_meta[:] = [{}]
+        self.s._postal_taken = ["mid-synthetic-1"]
+        sess, be, loops = self.s, self.be, []
+
+        def loop_sets_flag():                                  # the loop's lock-busy persist with taken=True
+            be._reg_lock.acquire()
+            try:
+                th = threading.Thread(target=lambda: sess._persist_queue(taken=True), name=LOOP_PREFIX + "web-taken",
+                                      daemon=True)
+                th.start()
+                th.join(0.5)                                   # with the fix it waits for the flag's lock here
+                loops.append(th)
+            finally:
+                be._reg_lock.release()
+
+        class Racing(type(sess)):
+            @property
+            def _persist_taken_due(self):
+                v = self.__dict__.get("_ptd", False)
+                if not loops:                                  # the loop runs between the writer's read and its clear
+                    loop_sets_flag()
+                return v
+
+            @_persist_taken_due.setter
+            def _persist_taken_due(self, v):
+                self.__dict__["_ptd"] = v
+        sess.__class__ = Racing
+        sess._persist_queue_due()                              # the writer's queued persist, reading the flag
+        for th in loops:
+            th.join(10.0)
+        _drain_writer(be)
+        self.assertEqual(self._reg().get("postalTaken"), ["mid-synthetic-1"], "the loop's taken flag was lost")
+
+
 class SessionLoopRegLockGuard(unittest.TestCase):
     """The test-time rule: a session loop thread that takes the registry lock raises (ROMP_REG_LOCK_GUARD=raise, which
     tests/conftest.py sets for the suite), so a hook or handler that writes the registry on the loop fails its test."""
