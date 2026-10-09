@@ -932,6 +932,18 @@ class SessionEndFlushesItsQueue(unittest.TestCase):
         _drain_writer(self.be)
         self.assertEqual(order, ["stop-record", "transcript", "other-session"])
 
+    def test_a_queued_refresh_never_lands_an_older_model_name_over_a_newer_learned_one(self):
+        class FakeClient:
+            async def get_context_usage(self):
+                return {"percentage": 40, "totalTokens": 80000, "model": "claude-sonnet-4-5"}
+        self.s.client = FakeClient()
+        ev = self._gate()
+        self._on_loop(lambda: asyncio.run(self.s._do_refresh_context()))
+        self._on_loop(lambda: self.s._learn_model(sb.pretty_model("claude-opus-4-1"), raw="claude-opus-4-1"))
+        ev.set()
+        _drain_writer(self.be)
+        self.assertEqual(self._reg().get("liveModel"), self.s.model, "a queued refresh landed an older model name")
+
     def test_the_taken_flag_set_during_the_writers_read_is_never_lost(self):
         """The writer's read-and-clear of the postal-taken flag and the loop's set are each atomic (review 3): a set that
         lands between the writer's read and its clear used to be wiped, and the taken mail ids were never written, so a

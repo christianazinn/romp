@@ -7201,7 +7201,7 @@ class SdkSession:
         if True:                          # modelPending is always written, as before (the refresh is its mirror)
             def write(upd=upd):           # through _reg_job: off this loop thread (2026-10-09); a newer refresh still
                 try:                      # queued replaces this one, so the latest values are the ones written
-                    self.backend._update_reg_with(self.sid, lambda: {**upd, "modelPending": bool(self._model_pending)})
+                    self.backend._update_reg_with(self.sid, lambda: {**upd, **self._live_model_fields()})
                 except Exception as e:
                     self.backend._log("context refresh (%s): registry write failed: %s" % (self.name, e))
             self.backend._reg_job(("liveCtx", self.sid), write)
@@ -8404,6 +8404,17 @@ class SdkSession:
             hook(self.sid, frm, to, cat, expl, scope, caps, episode)
         except Exception as e:
             self.backend._log("refusal-fallback card (%s): %s" % (self.name, e), problem=True)
+
+    def _live_model_fields(self) -> dict:
+        """The model mirrors as they stand NOW (read by a queued write when it runs, under the registry lock): the model
+        name and id, which _learn_model also writes synchronously, and modelPending, which set_model and its resolve do
+        (reviews 2 and 3: a refresh's captured values landed over a newer pick or a newer learned model)."""
+        out = {"modelPending": bool(self._model_pending)}
+        if self.model:
+            out["liveModel"] = self.model
+        if getattr(self, "_model_id", ""):
+            out["liveModelId"] = self._model_id
+        return out
 
     def _resolve_model_pending(self, pm) -> bool:
         """If a /model switch is pending and the observed live name `pm` now reflects the chosen alias,
@@ -11790,8 +11801,6 @@ REG_LOCK_LOOP_WRITERS_OWED = frozenset((
     "_on_message",                # per-message registry writes inside the receive loop (lastSid, and others)
     "_persist_cost_state",        # every result: the spend watermark the orphan replay de-duplicates against; queued, it
     #                               could trail the results it guards (moving it needs the same in-memory carry as hostAck)
-    "_write_host_ack_forced",     # the detach's last ack, synchronous on purpose (review 1, must-fix): written before the
-    #                               reconnect reads the registry; the in-memory carry now also covers that read
     "_persist_echoes",            # echo marks written from the loop
     "_learn_model", "_emit_ask", "_clear_ask",
     "_file_host_log_rows",
@@ -12901,17 +12910,18 @@ class SdkBackend:
                             "cli": "%s:%s" % (c.get("pid"), c.get("start")), "offset": int(t.ack_offset)}}
 
     def _write_host_ack_forced(self, sess, t) -> None:
-        """The detach's last ack, written before this returns, on whatever thread calls it (the session's loop, as it
-        leaves its host): a queued per-record ack for the session is dropped first, since this one carries the newer
-        offset. Named in REG_LOCK_LOOP_WRITERS_OWED: it takes the lock on the loop on purpose."""
+        """The detach's last ack, its values captured now, under a key of its own so a later per-record ack for the next
+        transport can never replace it; through _reg_job, so on a loop it is queued (review 3: the lock wait it took at
+        every reconnect is no longer needed: the in-memory carry makes a reconnect in this kernel exact, the monotonic
+        merge orders the writes, and a session's end flushes its queued jobs before the kernel can lose them)."""
         fields = self._host_ack_fields(t)
-        with self._reg_jobs_lock:
-            self._reg_jobs.pop(("hostAck", sess.sid), None)
-            self._reg_jobs_sid.pop(("hostAck", sess.sid), None)
-        try:
-            self._update_reg_with(sess.sid, lambda: fields)
-        except Exception as e:
-            self._log("host (%s): hostAck write failed: %s" % (getattr(sess, "name", "?"), e))
+
+        def write():
+            try:
+                self._update_reg_with(sess.sid, lambda: fields)
+            except Exception as e:
+                self._log("host (%s): hostAck write failed: %s" % (getattr(sess, "name", "?"), e))
+        self._reg_job(("hostAckFinal", sess.sid), write)
 
     def _write_host_ack_departed(self, sess, t) -> None:
         """A CLI that exited other than by a clean end: its host's final consumed offset, captured now and written
