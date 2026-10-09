@@ -6403,6 +6403,10 @@ def _asm_gates(entry, leaf_path, candidate_files, links):
     if old_leaf is None:
         return _asm_demote("empty-graph")
     parent_d, new_leaf = {}, old_leaf
+    rest_ppt = entry.get("docMaxPpt", max_ppt)    # what a record after a restorable demotion is held to: the document's watermark for a
+    #                                               restored entry, the stamp its restore checks against (2026-10-08, review N6d: the
+    #                                               entry's own watermark counts the tail, so a summary written a second before its own
+    #                                               boundary in the next append took a whole parse the restore would have answered)
     for i, r in enumerate(delta):
         t, u = r.get("type"), r.get("uuid")
         if u:
@@ -6411,7 +6415,7 @@ def _asm_gates(entry, leaf_path, candidate_files, links):
                 #                                    froze before the cut, so only the whole parse answers it (2026-10-08: it was
                 #                                    counted uuid-known, which a restored tail-only entry now restores)
             if u in ad.by_uuid or u in ((ad.seed or {}).get("verdicts") or {}):
-                return _asm_demote(_asm_rest_whole(delta, i, ad, max_ppt) or "uuid-known")
+                return _asm_demote_whole(_asm_rest_whole(delta, i, ad, rest_ppt) or "uuid-known")
                 #                                    a re-write rebinds last-write-wins index state; a RESTORED entry's adapter holds
                 #                                    only the tail's records, its pre-cut uuids live in the seed (round seven: a reuse
                 #                                    of a pre-cut uuid folded and served u1 a1 u2 a2 where a cold parse clears them)
@@ -6419,21 +6423,16 @@ def _asm_gates(entry, leaf_path, candidate_files, links):
             parent_d[u] = None if p == u else p
             new_leaf = u
         if t == "system" and r.get("subtype") == "compact_boundary":
-            return _asm_demote(_asm_rest_whole(delta, i, ad, max_ppt) or "boundary")   # sets the pre-pass's compaction gate and
+            return _asm_demote_whole(_asm_rest_whole(delta, i, ad, rest_ppt) or "boundary")   # sets the pre-pass's compaction gate and
             #                                                                             can re-seat adoptions
         if r.get("isCompactSummary") is True:
-            pb = r.get("parentUuid")
-            pr = next((x for x in delta[:i] if x.get("uuid") == pb), None) or ad.by_uuid.get(pb) or {}
-            if not (pr.get("type") == "system" and pr.get("subtype") == "compact_boundary"):
-                _asm_demote("summary")                 # not parented on a boundary: a cold parse attaches it to the last boundary's
-                _asm_stat("g:summary:orphan")          #  card, which may sit before the cut (2026-10-08, review p5): counted as the
-                _ASM_DEMOTE_TL.reason = "summary-orphan"   #  summary it is, routed to the whole parse (the reason the road reads)
-                return None
-            return _asm_demote(_asm_rest_whole(delta, i, ad, max_ppt) or "summary")    # attaches to its boundary and arms the
+            if _asm_summary_orphan(r, {x.get("uuid"): x for x in delta[:i] if x.get("uuid")}, ad):
+                return _asm_demote_whole("summary-orphan")
+            return _asm_demote_whole(_asm_rest_whole(delta, i, ad, rest_ppt) or "summary")   # attaches to its boundary and arms the
             #                                  restore dedup in the chronological pre-pass (the summary, not the boundary, 2026-09-19)
         why = _asm_record_whole(r, ad, max_ppt)
         if why is not None:
-            return _asm_demote(why)
+            return _asm_demote_whole(why)
     # Leaf descent: the new file-leaf must chain back to the old one THROUGH the delta — an
     # api_error spur re-parent, a rewind, and a /clear fork all fail here. parent_d.pop doubles
     # as the cycle guard; a delta with no uuid-bearing record passes trivially (leaf unmoved).
@@ -6446,7 +6445,7 @@ def _asm_gates(entry, leaf_path, candidate_files, links):
     return delta, leaf_recs
 
 
-def _asm_record_whole(r, ad, max_ppt):
+def _asm_record_whole(r, ad, max_ppt, prior=None):
     """The demotion a delta record `r` forces to the WHOLE parse, by the gates' rules, or None: a resurrected dangling target
     ("dangling"), a repeated prompt id of the kinds that re-classify old atoms ("promptid"), a Skill tool_use an ingested
     payload already references ("skill-link"), a conversational stamp unparseable or before the carry's watermark ("ts").
@@ -6454,6 +6453,9 @@ def _asm_record_whole(r, ad, max_ppt):
     t, u = r.get("type"), r.get("uuid")
     if u and u in ad.dangling:
         return "dangling"
+    if r.get("isCompactSummary") is True and _asm_summary_orphan(r, prior or {}, ad):
+        return "summary-orphan"               # off any boundary: a cold parse attaches it to the last boundary's card, which may sit
+        #                                       before the cut (review p5; N1, N2: the rule ran only on an append's first hit)
     if t == "user" and r.get("promptId") and r["promptId"] in ad.prompt_ids:
         # A repeated promptId is ROUTINE — every record of a turn wears its prompt's id, so tool results repeat it on nearly
         # every append (measured: this gate, unshaped, demoted 1863 of 1869 bursts on a live 46MB replay). Only two shapes can
@@ -6470,12 +6472,30 @@ def _asm_record_whole(r, ad, max_ppt):
             if isinstance(b, dict) and b.get("type") == "tool_use" and \
                     b.get("name") == "Skill" and b.get("id") in ad.src_tool_links:
                 return "skill-link"           # an already-ingested payload references it
-    if t in ("user", "assistant"):
-        ts = parse_z(r.get("timestamp"))
+    if t in ("user", "assistant") or (t == "system" and r.get("subtype") == "compact_boundary"):
+        ts = parse_z(r.get("timestamp"))      # the watermark counts compactions too (the carry's max_ppt, the writer's cut order)
         if ts is None or ts < max_ppt:
             return "ts"                       # the carry is valid only for a delta sorting at-or-after everything folded (the
             #                                   pre-pass sorts None first)
     return None
+
+
+def _asm_summary_orphan(r, prior, ad):
+    """Whether the compaction summary `r` is parented on no compaction boundary: its parent among the append's earlier records
+    (`prior`, uuid -> record) or the adapter's."""
+    pr = prior.get(r.get("parentUuid")) or ad.by_uuid.get(r.get("parentUuid")) or {}
+    return not (pr.get("type") == "system" and pr.get("subtype") == "compact_boundary")
+
+
+def _asm_demote_whole(why):
+    """_asm_demote, with an orphan summary counted as the summary it is (g:summary, read by the road counters) and routed by its
+    own reason (summary-orphan, which no restore road takes), g:summary:orphan beside it."""
+    if why == "summary-orphan":
+        _asm_demote("summary")
+        _asm_stat("g:summary:orphan")
+        _ASM_DEMOTE_TL.reason = "summary-orphan"
+        return None
+    return _asm_demote(why)
 
 
 def _asm_rest_whole(delta, i, ad, max_ppt):
@@ -6483,10 +6503,13 @@ def _asm_rest_whole(delta, i, ad, max_ppt):
     record's first demotion, and a restored tail-only entry now restores for some (_ASM_RESTORE_AFTER_DEMOTE_TAIL); an append
     whose first hit was one of those carried a later record the restore cannot answer (a prompt stamped before the cut landed in
     a tail turn, where a cold parse opens the old turn with it), so the rest of the append is read before the road is picked."""
+    prior = {x.get("uuid"): x for x in delta[:i] if x.get("uuid")}
     for r in delta[i:]:
-        why = _asm_record_whole(r, ad, max_ppt)
+        why = _asm_record_whole(r, ad, max_ppt, prior)
         if why is not None:
             return why
+        if r.get("uuid"):
+            prior[r["uuid"]] = r
     return None
 
 
@@ -8109,6 +8132,7 @@ def asm_checkpoint_write(leaf_path, rompuuid, sdk_human=False, tree=None, reason
                #                                             (absorbed attachments, shadowed copies): the restore's reuse check reads
                #                                             rows and these, so a tail record reusing any of them refuses (round two)
                "turns": turns_doc, "treeIdentity": _tree_identity_of_doc(turns_doc, identity) if turns_doc else None,
+               "preGates": _pre_cut_gates(all_recs, cut_seq),   # the gate sets of the pre-cut records alone (_restore_tail_refusal)
                "gates": {"prompt_ids": sorted(ad.prompt_ids), "boundary_pids": sorted(ad.boundary_pids),
                          "skill_use_ids": sorted(ad.skill_use_ids), "src_tool_links": sorted(ad.src_tool_links),
                          "dangling": sorted(ad.dangling)},
@@ -8184,6 +8208,23 @@ def asm_checkpoint_write(leaf_path, rompuuid, sdk_human=False, tree=None, reason
                 _asm_release(released)
                 _asm_stat("reseat:atWrite")
         return True
+
+
+def _pre_cut_gates(all_recs, cut_seq):
+    """The gate sets FileAdapter._ingest builds (prompt ids, compaction summaries' prompt ids, payload records' tool links), over
+    the records before the cut alone (2026-10-08): the document's `gates` come from the whole adapter, tail included, so a
+    restore checking a tail record against them would refuse every tail holding its own slash command."""
+    pids, bpids, links = set(), set(), set()
+    for sq, r in all_recs:
+        if sq >= cut_seq or r.get("type") != "user":
+            continue
+        if r.get("promptId"):
+            pids.add(r["promptId"])
+            if r.get("isCompactSummary") is True:
+                bpids.add(r["promptId"])
+        if r.get("sourceToolUseID"):
+            links.add(r["sourceToolUseID"])
+    return {"prompt_ids": sorted(pids), "boundary_pids": sorted(bpids), "src_tool_links": sorted(links)}
 
 
 def _carry_encode(st):
@@ -8658,6 +8699,7 @@ def _asm_restore_inner(key, leaf_path, candidate_files, links, rompuuid, postal_
     The pre-cut turns come from the document as lazy atoms; the tail is read from the cut and parsed through an
     adapter seeded with the pre-cut graph facts and the carried emit state; the prefix's identity is proven. `reseated`:
     the restore re-seats a whole entry on the document written from it (the entry carries the churn bound, _asm_gates)."""
+    _ASM_DEMOTE_TL.restore_refused = None                 # set by a content refusal (_restore_tail_refusal), read by _assemble
     if _asm_refusal_stands(leaf_path):
         _asm_stat("restore:refusedStanding")             # refused for the tail's shape at this very stat: no proof, no rewrite (round two)
         return None
@@ -8685,6 +8727,44 @@ def _asm_restore_inner(key, leaf_path, candidate_files, links, rompuuid, postal_
     finally:
         if served is None:
             _tail_pin_clear(pin)                          # refused: nothing stands on the document, the window slides again
+
+
+def _restore_tail_refusal(ad, max_ppt, pre_gates):
+    """Why a restore must refuse the tail the seeded adapter `ad` ingested, or None (2026-10-08). The checks a cold parse makes
+    of the tail against the pre-cut part, which the document holds fixed:
+      - stamp: a prompt, reply or compaction stamped before the carry's watermark (`max_ppt`), or with no stamp: the cold parse
+        sorts it among the pre-cut turns (a prompt opens an old turn; a compaction's card moves);
+      - summary: a compaction summary parented on no compaction boundary of the tail: the cold parse attaches it to the last
+        boundary's card, which may be pre-cut;
+      - promptId: a record wearing a pre-cut prompt id that re-classifies the pre-cut record carrying it (a command wrapper of a
+        typed slash command's raw twin, or any record wearing a pre-cut compaction summary's id);
+      - skill: a Skill tool_use whose id a pre-cut payload record references.
+    The last two read the document's PRE-CUT gate sets (`pre_gates`, written since this change); a document without them is
+    not checked for them (its tail has none of the writer's knowledge), as before."""
+    if pre_gates:
+        pre_gates = {k: set(v or ()) for k, v in pre_gates.items()}
+    for r in ad.by_uuid.values():                         # the seeded adapter holds the tail's records alone
+        t = r.get("type")
+        if max_ppt is not None and (t in ("user", "assistant") or (t == "system" and r.get("subtype") == "compact_boundary")):
+            ts = parse_z(r.get("timestamp"))
+            if ts is None or ts < max_ppt:
+                return "stamp"
+        if r.get("isCompactSummary") is True:
+            pr = ad.by_uuid.get(r.get("parentUuid")) or {}
+            if not (pr.get("type") == "system" and pr.get("subtype") == "compact_boundary"):
+                return "summary"
+        if pre_gates:
+            pid = r.get("promptId")
+            if t == "user" and pid and pid in pre_gates.get("prompt_ids", ()):
+                txt = _text_of(_content(r.get("message"))) or ""
+                if pid in pre_gates.get("boundary_pids", ()) or (CMD_WRAP_RE.match(txt) and not is_skill_load_wrapper(txt)):
+                    return "promptId"
+            if t == "assistant" and pre_gates.get("src_tool_links"):
+                for b in _content(r.get("message")) or []:
+                    if isinstance(b, dict) and b.get("type") == "tool_use" and b.get("name") == "Skill" \
+                            and b.get("id") in pre_gates["src_tool_links"]:
+                        return "skill"
+    return None
 
 
 def _asm_restore_from_doc(key, leaf_path, candidate_files, links, rompuuid, postal_index, sdk_human, reseated, doc, pin):
@@ -8740,18 +8820,19 @@ def _asm_restore_from_doc(key, leaf_path, candidate_files, links, rompuuid, post
         ad.sdk_human = sdk_human
         st = _emit_state()
         st.update(_carry_decode(doc["carry"]))
+        why_ = _restore_tail_refusal(ad, st.get("max_ppt"), doc.get("preGates"))
+        if why_ is not None:
+            # a tail the restore cannot answer (2026-10-08, reviews R1-1, N3, N4, N10d): a record a cold parse sorts or binds into
+            # the pre-cut part, which the document holds fixed. Refused to the whole parse, at a boot as after a demotion, and
+            # recorded like a chain refusal, so parse_session rewrites the document from that whole parse at once (the tail then
+            # lies inside its pre-cut part) and the whole entry it builds is not kept whole (_assemble), so the rewrite releases it
+            _asm_stat("restore:%sRefused" % why_)
+            _ASM_DEMOTE_TL.restore_refused = why_
+            with _ASM_CKPT_LOCK:
+                _ASM_CHAIN_REFUSED_PATHS[os.path.realpath(str(leaf_path))] = (
+                    "content", int((((doc.get("files") or {}).get(Path(leaf_path).stem) or {}).get("cut") or [0])[0]))
+            return None
         mp = st.get("max_ppt")
-        if mp is not None:
-            for r_ in ad.by_uuid.values():                # the seeded adapter holds the tail's records alone
-                if r_.get("type") in ("user", "assistant"):
-                    ts_ = parse_z(r_.get("timestamp"))
-                    if ts_ is None or ts_ < mp:
-                        # a tail record stamped before the carry's watermark (2026-10-08, review R1-1): a cold parse sorts it into
-                        # the pre-cut turns (a prompt opens an old turn), where the document holds them fixed, so the restore
-                        # cannot give its tree; refused to the whole parse, at a boot as after a demotion. The fold's own gate (ts)
-                        # holds the same line for an append
-                        _asm_stat("restore:stampRefused")
-                        return None
         kept = ad.kept_uuids(ad.active_path())
         order = _chrono(ad, kept)
         ad._prepass(order, st)
@@ -8763,6 +8844,7 @@ def _asm_restore_from_doc(key, leaf_path, candidate_files, links, rompuuid, post
                  "skipped": {f["path"]: (f["size"], f["mtime"]) for f in doc["files"].values() if f.get("skip")},
                  "docPre": sum((int(f["size"]) if f.get("skip") else int((f.get("cut") or [0])[0])) for f in doc["files"].values()),
                  "docCutOff": int(((doc["files"].get(Path(leaf_path).stem) or {}).get("cut") or [0])[0]),
+                 "docMaxPpt": mp if mp is not None else 0,   # the carry's watermark: what the restore held the tail to (_asm_gates)
                  "path": str(leaf_path), "pin": pin}       # as handed: the reader's key for the same leaf; the window pin
         #        docPre: the pre-cut bytes over the lineage; docCutOff: the leaf's cut offset. The fold's gate demotes this entry
         #        to a whole parse when the tail past the cut reaches the share (tailShare), so the settle rewrites the cut
@@ -8976,6 +9058,9 @@ def hydrate(atoms, rompuuid=None, by=None):
                     hk = "%s:%s" % (_read_stage() or "none", by)
                     hbs[hk] = hbs.get(hk, 0) + ln
                     if a.get("uuid"):
+                        _old = _HYDRATED.pop(a["uuid"], None)   # an entry kept for an atom needing less (a re-read): its bytes go
+                        if _old is not None:                    #  before the new ones count, and the new one takes the LRU tail
+                            _HYDRATED_BYTES[0] -= _old[1]
                         _HYDRATED[a["uuid"]] = (_hydrated_keep(rec, lz), ln); _HYDRATED_BYTES[0] += ln
                         while _HYDRATED_BYTES[0] > _HYDRATED_CAP and _HYDRATED:
                             _old = _HYDRATED.pop(next(iter(_HYDRATED)))    # the least recently used body goes first
@@ -9073,7 +9158,11 @@ def _assemble(leaf_path, candidate_files, links, rompuuid, postal_index, sdk_hum
                     # refusal (else every settle would write a document and every miss after it refuse it and parse whole); nor is
                     # any entry whose parse follows a refusal that left the document standing (the chain proof, a standing mark:
                     # the same tail refuses the next document too). Either way the entry stays whole and folds, as before the re-seat
-                    keep_whole = _why == "reseat" or asm_document_stands(leaf_path)
+                    keep_whole = _why == "reseat" or (asm_document_stands(leaf_path)
+                                                       and not getattr(_ASM_DEMOTE_TL, "restore_refused", None))
+                    #                                   a content refusal (a tail record the restore cannot answer) is healed by the
+                    #                                   rewrite parse_session makes from this whole parse: not kept whole, so the
+                    #                                   rewrite releases the entry (2026-10-08, review: three boots stayed whole)
             elif _CKPT_DIR_FN is not None:
                 with _ASM_LOCK:
                     due = _ASM_RESEAT_DUE.pop(key, None)  # the writer released this key's whole entry (asm_checkpoint_write)
@@ -9085,8 +9174,9 @@ def _assemble(leaf_path, candidate_files, links, rompuuid, postal_index, sdk_hum
                         _asm_stat("g:reseat"); _asm_stat("restore:afterDemote")   # the re-seat's own counts, as at the next parse
                     _mode("restore")
                     return served
-                keep_whole = bool(due) or asm_document_stands(leaf_path)   # a boot's refusal that left the document standing, or a
-                #                                                             released re-seat the restore refused: as above
+                keep_whole = bool(due) or (asm_document_stands(leaf_path)   # a boot's refusal that left the document standing, or a
+                                           and not getattr(_ASM_DEMOTE_TL, "restore_refused", None))   # released re-seat the
+                #                                   restore refused: as above; a content refusal is healed by the rewrite (as above)
             # A full parse names its road (T398): an entry the gates DEMOTED (the g:<reason> beside it: the leaf's record
             # entry replaced by a from-zero read, a lineage file moved), a leaf with NO document file, a document that
             # stood but was REFUSED at the restore (its fallback reason counted beside), or no checkpoint directory at all.
