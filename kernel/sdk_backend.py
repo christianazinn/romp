@@ -6639,6 +6639,14 @@ class SdkSession:
                                              cursor=u)
         except Exception:
             seen = None
+        take = u.get("take")
+        if seen is False and isinstance(take, tuple) and len(take) == 2 and take[0] == "removed":
+            # the CLI removed the text unread before it exited (a hook dropped it; _untaken_taken's third answer, which no
+            # turn frame arrived to act on): re-heading would hand it to the same hook again, so it takes the take's road
+            _unread = getattr(self.backend, "_feed_removed_unread", None)
+            if _unread is not None:
+                _unread(self.sid, u, take[1])
+            return
         if seen is False or (seen is None and not self.resume_sid):
             with self._lock:
                 self._q_prepend(*self._unfeed_parts_locked([item]))   # back at the head under its own id (a joined text: each part under its own)
@@ -7786,6 +7794,10 @@ class SdkSession:
                         # at or after the file's size now (_transcript_mark's argument).
                         self._untaken = {"text": str(item), "item": item, "fresh": fresh, "settled": False,
                                          "qid": (_meta or {}).get("qid"),   # the copy's id, for the /clear-echo retire at the TAKE
+                                         # every send id the fed text carries (a joined text: each part's), so a take
+                                         # with no record of its own lands or flags each echo by id
+                                         "qids": list(_joined_qids) if _joined_qids else
+                                                 [q for q in [(_meta or {}).get("qid")] if q],
                                          "t": int(time.time()), "off": None, "fsid": None}
                 if item is None:
                     await self._input_wake.wait()   # idle, or holding behind a wedged turn → wait for a change
@@ -8901,7 +8913,12 @@ class SdkSession:
           * fed MID-turn, the turn still running: the text's record LANDED, the queued_command
             attachment a mid-turn splice leaves at a tool boundary (the same record _text_landed reads
             for the re-delivery guard), scanned from the feed-time mark forward. This is the accelerator:
-            the next text can follow it into the same turn instead of waiting for the turn to end.
+            the next text can follow it into the same turn instead of waiting for the turn to end. The
+            CLI's queue-operation remove of the text with reason absorbed_mid_turn is the same take
+            (2026-10-09: on one CLI version it was the ONLY record some mid-turn takes left, and a hold
+            waiting for the attachment parked a long-running session's queue for over an hour); a remove
+            for any other reason (dropped_by_hook) releases the hold as well, since the text is no longer
+            in the CLI's queue, and is reported as removed unread, never as delivered.
         Only turn frames count (_turn_frame: the init, assistant messages, the CLI's own user records,
         results); a task, hook, rate-limit or progress frame proves nothing about the queue. The scan is
         bounded: it resumes at the last complete line it read and skips a file that has not grown.
@@ -8924,7 +8941,14 @@ class SdkSession:
                               "record" % (self.name, u.get("scan_error") or "transcript unreadable"),
                               problem=True, key=("feed-hold-scan", self.sid))
             return isinstance(msg, ResultMessage)
-        return seen is True
+        if seen is True:
+            return True
+        # The CLI's queue-operation REMOVE of the text for a reason other than absorbed_mid_turn (dropped_by_hook
+        # first among them; _text_landed leaves the verdict in u["take"]): the text is off the CLI's queue, so the
+        # next one can no longer fuse with it and the hold releases, but the turn never read it. _on_message hands
+        # it to the backend as a text the CLI removed unread (_feed_removed_unread), never as a delivery.
+        take = u.get("take")
+        return isinstance(take, tuple) and len(take) == 2 and take[0] == "removed"
 
     def _on_message(self, msg, AssistantMessage, ResultMessage, SystemMessage):
         if getattr(self, "inflight", None) == 0 and getattr(self, "_lock", None) is not None \
@@ -8977,8 +9001,24 @@ class SdkSession:
             # result frame is read against the state the text was fed into.
             _took = self._untaken
             self._untaken = None
+            _how = (_took or {}).get("take")
+            if isinstance(_how, tuple):
+                # the CLI REMOVED the text unread (a hook dropped it): released, not delivered. No read stamp for its mail,
+                # no /clear take; the backend flags its echoes never delivered and says so once (_feed_removed_unread;
+                # getattr: a stand-in backend in tests has none)
+                _unread = getattr(self.backend, "_feed_removed_unread", None)
+                if _unread is not None:
+                    _unread(self.sid, _took, _how[1])
+                _took = None
+            elif _how == "absorbed":
+                # taken into the running turn with no record of its own (the absorbed_mid_turn removal): its echoes land
+                # by id, since no record will carry their text for the chat's by-text retire (_feed_taken_by_removal)
+                _absorbed = getattr(self.backend, "_feed_taken_by_removal", None)
+                if _absorbed is not None:
+                    _absorbed(self.sid, _took)
             # a postal banner the CLI has now taken: the model has the mail, and the sender's read stamp is due (2026-10-03)
-            self.backend._report_postal_take(self.sid, postal_mids((_took or {}).get("text") or ""), "taken")
+            if _took is not None:
+                self.backend._report_postal_take(self.sid, postal_mids(_took.get("text") or ""), "taken")
             # a /clear the CLI has now TAKEN: record its echo's identity so it retires on THIS copy's own
             # boundary (the flip it causes, or its own turn's settle), never by text and never before the CLI
             # takes it (a still-queued or fed-but-untaken /clear is left owed, so an unplanned death flags it).
@@ -11016,6 +11056,51 @@ def _landed_texts(rec: dict) -> set:
         if ck:
             out.add(ck)
     return out
+
+
+# The CLI's reason on a queue-operation remove that means the text went INTO the running turn: the model reads
+# it at the turn's next step. Every other reason (dropped_by_hook: a hook dropped it; and the rest the CLI writes)
+# took the text off the queue WITHOUT the running turn reading it.
+QUEUE_REMOVE_ABSORBED = "absorbed_mid_turn"
+
+
+def _queue_removal(rec: dict):
+    """(reason, texts) for a queue-operation REMOVE that names both its reason and its text, else None. `texts` is
+    the removed text keyed the way _landed_texts keys a landing (echo_text_key: the joined text and each block, and
+    a slash send's words too), so a fed text matches its removal by the same rule it matches its record.
+
+    Why it is read (2026-10-09): the CLI writes {"type": "queue-operation", "operation": "remove", "reason": ...,
+    "content": ...} when a queued text leaves its queue. Until then every mid-turn take (reason absorbed_mid_turn)
+    also left a queued_command attachment, the record the feed hold waited for; on one CLI version some absorbed
+    removals came with no attachment at all, the hold never saw its take, and busy sessions stopped receiving
+    queued texts until their turn ended, which a long-running session never does. A remove with NO reason (an
+    older CLI, or a content-addressed discard the kernel's ledger fold reads) says nothing about delivery and reads
+    as None here, as does a remove with no text, which cannot be matched to a fed text."""
+    if rec.get("type") != "queue-operation" or rec.get("operation") != "remove":
+        return None
+    reason = rec.get("reason")
+    if not isinstance(reason, str) or not reason:
+        return None
+    c = rec.get("content")
+    if isinstance(c, str):
+        blocks = [c]
+    elif isinstance(c, list):
+        blocks = [str(b.get("text") or "") for b in c if isinstance(b, dict) and b.get("type") == "text"]
+    else:
+        return None
+    out: set = set()
+    joined = echo_text_key(" ".join(blocks))
+    if joined:
+        out.add(joined)
+    for b in blocks:
+        cb = echo_text_key(b)
+        if cb:
+            out.add(cb)
+    for k in list(out):
+        ck = command_text_key(k)
+        if ck:
+            out.add(ck)
+    return (reason, out) if out else None
 
 
 def _record_epoch(ts) -> int | None:
@@ -15047,6 +15132,119 @@ class SdkBackend:
         if changed:
             self._persist_echoes(sid)
 
+    def _count_feed_take(self, kind: str) -> int:
+        """Bump this kernel life's count of feed-hold releases of `kind` (feed_take_counts) and return the new count."""
+        lock = getattr(self, "_lock", None)
+        with (lock if lock is not None else threading.Lock()):
+            counts = getattr(self, "_feed_take_counts", None)
+            if counts is None:
+                counts = self._feed_take_counts = {}   # created here: __new__-built doubles skip __init__
+            counts[kind] = int(counts.get(kind) or 0) + 1
+            return counts[kind]
+
+    def feed_take_counts(self) -> dict:
+        """How many feed holds this kernel life released on a queue-operation REMOVE rather than a landed record:
+        `absorbed_removal` (taken into the running turn with no record of its own, _feed_taken_by_removal) and
+        `removed:<reason>` (taken off the queue unread, _feed_removed_unread). A copy, for a diagnostics read."""
+        with self._lock:
+            return dict(getattr(self, "_feed_take_counts", None) or {})
+
+    def _echoes_for_take(self, d: dict, qids, text: str) -> list:
+        """The unsettled input echoes (in the live tail `d`, under _live_lock) a fed text taken with no record of its own
+        speaks for: the echoes stashed under its send ids (`qids`: a joined text names every part's), and only when no
+        id names one, the echoes wearing its text (echo_lookup_keys, so a part fed inside a joined text answers to the
+        joined text too). Command feedback, dropped and already-landed echoes are never returned."""
+        def open_echo(a):
+            return a is not None and a.get("_echo_text") and not a.get("command") \
+                and not a.get("dropped") and not a.get("_landed")
+        hit = [d.get(q) for q in (qids or ()) if open_echo(d.get(q))]
+        if hit or qids:
+            return hit
+        want = set(echo_keys(text or ""))
+        return [a for a in d.values() if open_echo(a) and want & set(echo_lookup_keys(a))] if want else []
+
+    def _session_label(self, sid: str) -> str:
+        s = getattr(self, "sessions", {}).get(sid)
+        return "%s %s" % (getattr(s, "name", None) or "session", sid[:8])
+
+    def _feed_taken_by_removal(self, sid: str, took: dict) -> None:
+        """The CLI took the fed text `took` (the feed hold, SdkSession._untaken) into its running turn and the only record
+        of it is the queue-operation remove with reason absorbed_mid_turn (_queue_removal; 2026-10-09). The hold is
+        already released; this is the landing's bookkeeping. No user record or queued_command attachment carries the
+        text, so the chat's by-text retire (prune_live against the kernel's atoms) will never meet the echo: the echoes
+        it speaks for (_echoes_for_take) get the landing verdict `_landed` (the boot scan's, mirrored to the reg), which
+        prune_live retires and the flag paths leave alone, exactly as for a joined text whose record a teardown found
+        (_land_joined_echoes). Counted (feed_take_counts); the first such take per session per kernel life is a log
+        line, the rest are counted only. Never raises: bookkeeping must not break the stream that saw the take."""
+        try:
+            n = self._count_feed_take("absorbed_removal")
+            changed = False
+            with self._live_lock:
+                d = self._live.get(sid) or {}
+                for a in self._echoes_for_take(d, took.get("qids"), took.get("text") or ""):
+                    a["_landed"] = True
+                    changed = True
+                if changed:
+                    self._touch_live(sid)
+            if changed:
+                self._persist_echoes(sid)
+                self._wake_push()
+            seen = getattr(self, "_absorbed_take_logged", None)
+            if seen is None:
+                seen = self._absorbed_take_logged = set()
+            if sid not in seen:
+                seen.add(sid)
+                self._log("feed hold (%s): the CLI took a fed text into its running turn and recorded only its queue "
+                          "removal (absorbed_mid_turn), no message record: released on the removal, its echo landed "
+                          "by id (%d such take%s this kernel life; later ones are counted, not logged)"
+                          % (self._session_label(sid), n, "" if n == 1 else "s"), problem=False)
+        except Exception as e:
+            self._log("feed hold (%s): bookkeeping for a take on an absorbed removal failed: %s: %s"
+                      % (sid[:8], type(e).__name__, _mask_ids(e)), problem=True, key=("feed-absorbed-bookkeeping", sid))
+
+    def _feed_removed_unread(self, sid: str, took: dict, reason: str) -> None:
+        """The CLI removed the fed text `took` from its queue for `reason` (dropped_by_hook, or any reason but
+        absorbed_mid_turn): the hold is released, since the text can no longer fuse with the next one, but the running
+        turn never read it. Not a delivery, and NOT re-fed: this follows the prompt gate's refusal (mark_echo_refused),
+        the existing road for a text the CLI was told not to run. A hook's drop is that hook's decision, and re-heading
+        the text would hand it to the same hook again, a loop that drops it every time; the person resends it if they
+        still want it. So the echoes it speaks for (_echoes_for_take) are flagged dropped AND refused, the reason riding
+        as refusedWhy (kept in the chat as never delivered, dismissable, never re-delivered, both flags on the mirror);
+        their fed ledger entries go (no landing will come); and one problem-ring line per text names the session, the
+        reason and any mail ids it carried (a repeat of the same text counts on that entry). Its mail gets no read stamp
+        (the caller skips _report_postal_take), so the sender's receipt keeps reading unread. Never raises."""
+        try:
+            self._count_feed_take("removed:%s" % reason)
+            text = took.get("text") or ""
+            why = "removed from the session's queue unread (%s)" % reason
+            flagged = []
+            with self._live_lock:
+                d = self._live.get(sid) or {}
+                for a in self._echoes_for_take(d, took.get("qids"), text):
+                    a["dropped"] = True
+                    a["refused"] = True
+                    a["refusedWhy"] = why
+                    flagged.append(a.get("uuid"))
+                if flagged:
+                    self._touch_live(sid)
+            for q in list(took.get("qids") or []) + flagged:
+                if q:
+                    self.forget_fed(sid, q)
+            mids = postal_mids(text)
+            self._log("feed hold (%s): the CLI removed a fed text from its queue without the turn reading it (reason "
+                      "%s): not delivered and not re-fed, since the same hook would drop it again; %s%s: %.80r"
+                      % (self._session_label(sid), reason,
+                         ("%d echo%s kept in the chat as never delivered" % (len(flagged), "" if len(flagged) == 1 else "es"))
+                         if flagged else "no echo to flag",
+                         ("; mail %s stays unread" % ", ".join(mids)) if mids else "", text),
+                      problem=True, key=("feed-removed-unread", sid, hashlib.sha1(text.encode("utf-8", "replace")).hexdigest()[:12]))
+            if flagged:
+                self._persist_echoes(sid)
+                self._wake_push()
+        except Exception as e:
+            self._log("feed hold (%s): bookkeeping for a text the CLI removed unread failed: %s: %s"
+                      % (sid[:8], type(e).__name__, _mask_ids(e)), problem=True, key=("feed-removed-bookkeeping", sid))
+
     def _transcript_mark(self, sid: str):
         """(byte size, fsid) of the sid's current transcript at this instant — the send-time mark an echo
         carries as _echo_off / _echo_fsid (mirrored as off / fsid), so _text_landed can start its scan
@@ -15479,20 +15677,49 @@ class SdkBackend:
         fails to parse and is skipped like any other non-record line. `cursor`, a dict the caller keeps
         across calls, makes a repeated scan resumable (_records_from_mark: the scan starts where the last
         call stopped and skips a file that has not grown); a scan that raises records the fault's text in
-        it as `scan_error`, for the caller's one log line, and still answers None."""
+        it as `scan_error`, for the caller's one log line, and still answers None.
+
+        A queue-operation remove with reason absorbed_mid_turn naming the text is a landing too (2026-10-09): the CLI
+        took the text into the running turn, and on some CLI versions that removal is the ONLY record such a take
+        leaves (_queue_removal). A remove for any other reason is not a landing here (False, as before it was read):
+        _text_take tells it apart for the feed hold, which must release on it without calling the text delivered. The
+        verdict's kind rides back in `cursor` as `take` (the hold is the cursor: _untaken_taken reads it after this call,
+        which stays its one entry, so a test double that stands in for this method still drives the hold)."""
+        took = self._text_take(sid, text, t, off, fsid, cursor)
+        if isinstance(cursor, dict):
+            cursor["take"] = took or None              # "record", "absorbed", ("removed", reason), or None: no take yet
+        if took is None:
+            return None
+        return took in ("record", "absorbed")
+
+    def _text_take(self, sid: str, text: str, t: int | None = None, off=None, fsid=None, cursor=None):
+        """_text_landed's scan, saying WHICH event took `text` off the CLI's queue (the feed hold, _untaken_taken, acts
+        on each differently): "record" (a native user record or a queued_command attachment carries it), "absorbed"
+        (a queue-operation remove, reason absorbed_mid_turn, names it: taken into the running turn with no record of
+        its own), ("removed", reason) (a remove for another reason names it, dropped_by_hook first among them: off the
+        queue, NOT read by the turn), False (readable, none of these), None (unreadable; `cursor` gets `scan_error`).
+        The first matching record in file order wins, under the same mark, cursor and send-time floor as a landing."""
         try:
             # the plain key and, for a slash send, its words (echo_keys): the send's own record is the
             # CLI's wrapper, which _landed_texts reads as "/name args" the way the kernel's prune does
             want = set(echo_keys(text))
             floor = int(t or 0)
-            for rec in _records_from_mark(self.state_dir, sid, off, fsid, (b'"user"', b'"queued_command"'),
+            for rec in _records_from_mark(self.state_dir, sid, off, fsid,
+                                          (b'"user"', b'"queued_command"', b'"queue-operation"'),
                                           cursor=cursor if isinstance(cursor, dict) else None):
-                if not (want & _landed_texts(rec)):
+                removal = _queue_removal(rec)
+                if removal is not None:
+                    if not (want & removal[1]):
+                        continue
+                    verdict = "absorbed" if removal[0] == QUEUE_REMOVE_ABSORBED else ("removed", removal[0])
+                elif want & _landed_texts(rec):
+                    verdict = "record"
+                else:
                     continue
                 ts = _record_epoch(rec.get("timestamp"))
                 if floor and ts is not None and ts < floor:
                     continue                           # an earlier record wearing the same words
-                return True
+                return verdict
             return False
         except Exception as e:
             if isinstance(cursor, dict):       # the caller's one log line names the fault (_untaken_taken)
