@@ -6648,6 +6648,11 @@ class SdkSession:
             if v is not None:
                 u["take"] = v
                 seen = v in ("record", "absorbed")
+                if v == "absorbed":
+                    self._note_absorbed(u)
+                    _absorbed = getattr(self.backend, "_feed_taken_by_removal", None)
+                    if _absorbed is not None:
+                        _absorbed(self.sid, u)       # its echoes land by id, as at a live take (no record will carry them)
         take = u.get("take")
         if seen is False and isinstance(take, tuple) and len(take) == 2 and take[0] == "removed":
             # the CLI removed the text unread before it exited (a hook dropped it; _untaken_taken's third answer, which no
@@ -6770,7 +6775,8 @@ class SdkSession:
                 out.append(t)
                 continue
             try:
-                seen = self.backend._text_landed(self.sid, t)
+                # taken with only its queue removal (_note_absorbed): landed, though no record carries its text
+                seen = True if self._taken_absorbed(t) else self.backend._text_landed(self.sid, t)
             except Exception:
                 seen = None
             if seen is True:
@@ -6822,7 +6828,8 @@ class SdkSession:
                 # same mail twice. True is definitive (the banner keys to itself, markers included, under
                 # echo_text_key); False or None proceeds, a miss being no proof of loss (the abandoned client may
                 # still have been flushing the record). Review fix, 2026-09-12.
-                seen = self.backend._text_landed(self.sid, text)
+                # a banner the CLI took with only its queue removal (_note_absorbed) landed too, with no record to scan
+                seen = True if self._taken_absorbed(text) else self.backend._text_landed(self.sid, text)
                 if seen is True:
                     self.backend._log("stranded mail (%s): a banner fed to the abandoned client landed in the "
                                       "transcript before the teardown; the resumed conversation carries it, not handed "
@@ -7822,9 +7829,12 @@ class SdkSession:
                     self._untaken["off"], self._untaken["fsid"] = off, fsid
                 led = getattr(self, "_qledger", None)
                 if isinstance(off, int) and fsid is not None and (led is None or led.get("fsid") != str(fsid)):
-                    # the queue ledger starts at this client's first feed (or a new transcript file): everything this
-                    # text's removal can be told apart from is enqueued at or after this mark (_queue_ledger_fold)
-                    self._qledger = {"fsid": str(fsid), "scan_off": off, "entries": [], "n": 0}
+                    # the queue ledger starts at this client's first feed (or a new transcript file): a fresh CLI's queue
+                    # starts empty, so everything this text's removal can be told apart from is enqueued at or after this
+                    # mark; a CLI the host kept may still hold texts queued before it, so an attach reads from the start
+                    # (_queue_ledger_fold)
+                    start = 0 if getattr(self, "_host_is_attach", False) else off
+                    self._qledger = {"fsid": str(fsid), "scan_off": start, "entries": [], "n": 0}
                 self._persist_queue()               # the fed turn leaves the persisted queue (it lands in the transcript)
                 if fresh:
                     self.since = int(time.time())    # a new turn starts now (mid-turn forwards keep the turn's clock)
@@ -8912,6 +8922,23 @@ class SdkSession:
             return getattr(msg, "subtype", None) == "init"
         return type(msg).__name__.lstrip("_") == "UserMessage"
 
+    def _note_absorbed(self, u):
+        """Remember that the CLI took the fed text of hold `u` into its running turn with only its queue removal to show
+        for it (no record carries the text), so the teardown checks that ask whether a fed text LANDED
+        (_split_stranded_joins, _return_stranded_mail) answer yes for it instead of reading the transcript, where a
+        text match cannot find it: a banner read as not landed is handed back to the bus and delivered twice. Bounded."""
+        keys = getattr(self, "_absorbed_keys", None)
+        if keys is None:
+            keys = self._absorbed_keys = deque(maxlen=64)
+        k = echo_text_key(u.get("text") or "")
+        if k:
+            keys.append(k)
+
+    def _taken_absorbed(self, text) -> bool:
+        """Did this session see the CLI take `text` with only its queue removal (_note_absorbed)?"""
+        k = echo_text_key(text or "")
+        return bool(k) and k in (getattr(self, "_absorbed_keys", None) or ())
+
     def _ledger_take(self, u):
         """The hold `u`'s take as the session's queue ledger reads it (_queue_ledger_fold, _queue_ledger_verdict):
         "absorbed", "record", ("removed", reason), or None (no verdict yet, no ledger, or a read that failed: the hold
@@ -9050,6 +9077,7 @@ class SdkSession:
             elif _how == "absorbed":
                 # taken into the running turn with no record of its own (the absorbed_mid_turn removal): its echoes land
                 # by id, since no record will carry their text for the chat's by-text retire (_feed_taken_by_removal)
+                self._note_absorbed(_took)
                 _absorbed = getattr(self.backend, "_feed_taken_by_removal", None)
                 if _absorbed is not None:
                     _absorbed(self.sid, _took)
@@ -11182,6 +11210,10 @@ def _queue_text_keys(c) -> set:
     return out
 
 
+# A CLI harness notice at the head of a queued text: a twin of event_model.SYSTEM_WRAPPER_RE, mirrored rather than read,
+# since the backend's threads never reach the event model (tests/test_stage_marks.py); the take tests pin the two equal.
+_CLI_NOTICE_RE = re.compile(r"^\s*(?:\[SYSTEM NOTIFICATION - NOT USER INPUT\]|<(?:task-notification|system-reminder)\b)")
+
 QUEUE_LEDGER_CAP = 512      # entries a session's queue ledger keeps (resolved ones included, for the verdict read)
 
 
@@ -11199,7 +11231,7 @@ def _queue_ledger_fold(state_dir, sid: str, led: dict) -> None:
 
     Rules, per record in file order (`led["entries"]`, each {n, pos, keys, notice, res}; `res` None while pending):
       * enqueue: a new pending entry at its byte offset `pos`, keyed by its content (None when it has none); `notice`
-        marks a CLI harness notice (a task notification, a system reminder: event_model.SYSTEM_WRAPPER_RE), whose own
+        marks a CLI harness notice (a task notification, a system reminder: _CLI_NOTICE_RE), whose own
         removal always carries its text;
       * remove WITH content: resolves the oldest pending entry with a common key, with the record's reason ("remove"
         when it has none); a remove naming no tracked entry is an item queued before the ledger began, ignored;
@@ -11209,8 +11241,11 @@ def _queue_ledger_fold(state_dir, sid: str, led: dict) -> None:
       * popAll: resolves every pending entry, "popAll".
     The ledger starts at the first feed of a client (SdkSession creates it with the feed's transcript mark), so the text
     fed before the current one is IN it: a late content-less removal of that earlier text resolves the earlier entry,
-    never the current one. Items the CLI queued before the ledger began are not in it; a content-less removal of such an
-    item would resolve the oldest tracked entry (documented residual: a CLI the previous kernel fed, kept by its host).
+    never the current one. A client that ATTACHED to a CLI its session host kept alive starts the ledger at the file's
+    start instead: that CLI may still hold a text the previous kernel fed, enqueued before this client's first feed, and
+    a ledger missing it would hand that text's late removal to the text fed now, which then fuses with the next one
+    (the review of the first cut). Reading from the start also brings in entries a dead CLI never resolved; they can only
+    absorb a removal and leave the current text held (waiting for its attachment or its turn's end), never release it.
     A new transcript file (a /clear, a fork) restarts the ledger at that file's start. The read resumes after the last
     complete line, skips a line still being written, and keeps QUEUE_LEDGER_CAP entries. Raises when the transcript
     cannot be read; the caller turns that into no verdict."""
@@ -11247,7 +11282,7 @@ def _queue_ledger_fold(state_dir, sid: str, led: dict) -> None:
                     c = rec.get("content")
                     led["n"] = int(led.get("n") or 0) + 1
                     entries.append({"n": led["n"], "pos": at, "keys": _queue_text_keys(c) or None,
-                                    "notice": isinstance(c, str) and bool(_em.SYSTEM_WRAPPER_RE.match(c)), "res": None})
+                                    "notice": isinstance(c, str) and bool(_CLI_NOTICE_RE.match(c)), "res": None})
                 elif op == "remove":
                     reason = rec.get("reason") if isinstance(rec.get("reason"), str) and rec.get("reason") else "remove"
                     keys = _queue_text_keys(rec.get("content"))

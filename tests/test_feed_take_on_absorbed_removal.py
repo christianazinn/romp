@@ -207,6 +207,46 @@ class TakeOnTheCLIsQueueRemoval(unittest.TestCase):
         self._wait(lambda: len(c.writes) == 4, "C fed on B's removal")
         self.assertEqual(c.writes[3], ("note C", "turn-1"))
 
+    def test_an_attach_to_a_surviving_cli_reads_the_queue_it_already_holds(self):
+        """A kernel restart attaches to a CLI its session host kept alive, and that CLI still holds text A, enqueued
+        before this client's first feed. A's late content-less removal must resolve A, not the text B fed now: the
+        ledger of an attach folds the transcript from its start, so A is in it."""
+        s, c = self.s, self._first_turn()
+        self._append(_enqueue_op("note A"))                 # queued in the surviving CLI by the previous kernel
+        s._qledger = None                                   # this client's ledger is new...
+        s._host_is_attach = True                            # ...and the client attached to the CLI its host kept
+        s.enqueue("note B")
+        self._wait(lambda: len(c.writes) == 2, "B fed")
+        self._append(_enqueue_op("note B"))
+        s.enqueue("note C")
+        self._append(_remove_op(None))                      # A's late removal
+        self._assistant(c)
+        self._settle()
+        self.assertEqual(len(c.writes), 2, "A's removal is A's: C is not fed to fuse with B")
+        self._append(_remove_op(None))                      # B's own
+        self._assistant(c)
+        self._wait(lambda: len(c.writes) == 3, "C fed on B's removal")
+
+    def test_a_banner_taken_by_its_removal_is_not_handed_back_at_a_teardown(self):
+        """A teardown mid-turn hands every stranded banner that did not land back to the bus. A banner the CLI took with
+        only its content-less removal has no record to find, so the session's own memory of the take answers: the mail
+        is not handed back and delivered a second time."""
+        s, c = self.s, self._first_turn()
+        handed = []
+        self.be.postal_restore = lambda sid, mids: handed.append(list(mids)) or set(mids)
+        b = _banner(_mid(4))
+        s.enqueue_postal(b, [_mid(4)])
+        self._wait(lambda: len(c.writes) == 2, "the mail forwarded")
+        self._append(_enqueue_op(b))
+        self._append(_remove_op(None))
+        self._assistant(c)
+        self._wait(lambda: s._untaken is None, "taken by its removal")
+        s.loop.call_soon_threadsafe(lambda: (setattr(s, "_reconnect", True), s._wake_set()))
+        self._wait(lambda: len(self._Client.instances) == 2 and s.client is self._Client.instances[1], "the forced reconnect")
+        self._settle()
+        self.assertEqual(handed, [], "the turn read it: not handed back to the bus")
+        self.assertNotIn(b, s.pending(), "nor re-headed")
+
     def test_a_pending_notice_ahead_does_not_take_the_content_less_removal(self):
         """A CLI notice queued ahead of the fed text keeps its own text on its removal; a content-less removal is the
         fed text's, and the notice's later removal (with its text) changes nothing."""
@@ -379,6 +419,10 @@ class TheLandingScanReadsRemovals(unittest.TestCase):
         before = led["scan_off"]
         sb._queue_ledger_fold(self.state, SID, led)
         self.assertEqual(led["scan_off"], before, "resumes where it stopped")
+
+    def test_the_notice_rule_is_the_event_models(self):
+        self.assertEqual(sb._CLI_NOTICE_RE.pattern, sb._em.SYSTEM_WRAPPER_RE.pattern,
+                         "the ledger's notice test is a twin of the event model's (backend threads never read it)")
 
     def test_a_content_block_list_removal_matches_too(self):
         rec = _remove_op(None)
