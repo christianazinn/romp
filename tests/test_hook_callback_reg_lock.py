@@ -251,6 +251,22 @@ class HooksNotBehindRegLock(unittest.TestCase):
         self.assertEqual(ans, {})
         self.assertEqual(self._reg().get("transcriptPath"), "/x/moved.jsonl")
 
+    def test_context_refresh(self):
+        """Review 1 reproduced the context refresh (it always writes: modelPending is set on every call) leaving a hook
+        unanswered while the lock was held; at the branch tip it is queued under a per-session key."""
+        class FakeClient:                              # the SDK's get_context_usage control request, answered at once
+            async def get_context_usage(self):
+                return {"percentage": 42, "totalTokens": 84000, "model": ""}
+        self.s.client = FakeClient()
+
+        async def refresh():
+            await self.s._do_refresh_context()
+            return {}
+        answered, ans = self._answer_under_held_lock(refresh)
+        self.assertTrue(answered, "the context refresh waited on the registry lock")
+        self.assertEqual(self._reg().get("liveCtx"), 42, "the refreshed context lands once the lock frees")
+        self.assertEqual(self._reg().get("liveCtxTokens"), 84000)
+
     def test_background_task_mirror_never_writes_back_a_cleared_set(self):
         """The bgTasks mirror reads the live set when its write runs: a mirror queued while a task ran, then a clear
         (_drop_live_work), lands [] even though the earlier mirror was queued first."""
@@ -309,7 +325,7 @@ class QueueMirrorOnTheLoop(HooksNotBehindRegLock):
     # the inherited hook tests run once, in HooksNotBehindRegLock
     test_post_tool_use_ledger_hook = test_post_tool_use_failure_ledger_hook = test_stop_hook = None
     test_schedule_tool_hook = test_facts_tool_hook = test_worktree_tool_hook_transcript_path = None
-    test_background_task_mirror_never_writes_back_a_cleared_set = None
+    test_background_task_mirror_never_writes_back_a_cleared_set = test_context_refresh = None
 
 
 def _rec(off):

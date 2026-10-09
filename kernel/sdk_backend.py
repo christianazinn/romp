@@ -11674,7 +11674,8 @@ _REG_LOCK_HELPERS = frozenset(("_check", "acquire", "__enter__", "_update_reg", 
 # raises. Remove a name when its writer moves; never add one to make a test pass.
 REG_LOCK_LOOP_WRITERS_OWED = frozenset((
     "_on_message",                # per-message registry writes inside the receive loop (lastSid, and others)
-    "_persist_cost_state",        # every result: the spend watermark
+    "_persist_cost_state",        # every result: the spend watermark the orphan replay de-duplicates against; queued, it
+    #                               could trail the results it guards (moving it needs the same in-memory carry as hostAck)
     "_write_host_ack_forced",     # the detach's last ack, synchronous on purpose (review 1, must-fix): written before the
     #                               reconnect reads the registry; the in-memory carry now also covers that read
     "_persist_echoes",            # echo marks written from the loop
