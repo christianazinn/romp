@@ -590,6 +590,97 @@ class RegWriterStart(unittest.TestCase):
                          "work queued behind a dead writer was never run")
 
 
+class QueuedJobsTakeValues(HooksNotBehindRegLock):
+    """Review 2 of the hook move (must-fix): a queued registry job read live session state when the writer ran, not when
+    the hook fired. Stop stamped the turn opener at write time, so a romp notice fed between the human's turn end and the
+    write marked the turn "injected" and the phone notice was skipped; the schedule and ledger records took their clock
+    and the CLI's process generation late the same way. Every moved hook now captures those values when it fires."""
+
+    def _hold_lock_while(self, on_loop, then):
+        """Hold the registry lock; run `on_loop` on a session-loop thread (it must not wait on the lock), then `then`
+        (the session moving on while the write is queued); release, drain the writer."""
+        self.be._reg_lock.acquire()
+        try:
+            th = threading.Thread(target=on_loop, name=LOOP_PREFIX + "web-capture", daemon=True)
+            th.start()
+            th.join(3.0)
+            self.assertFalse(th.is_alive(), "the hook waited on the registry lock")
+            then()
+        finally:
+            self.be._reg_lock.release()
+        _drain_writer(self.be)
+
+    def test_a_notice_fed_between_the_stop_hook_and_the_writer_does_not_change_what_stop_records(self):
+        self.s._note_turn_opener("human", fresh=True)        # a human's turn
+        inp = {"hook_event_name": "Stop", "session_crons": [], "background_tasks": [], "transcript_path": "/x/t.jsonl"}
+        fired = {}
+
+        def hook():
+            fired["at"] = time.time()
+            asyncio.run(self.s._stop_hook(inp, None, None))
+
+        def notice_fed():
+            time.sleep(1.1)                                   # the writer runs later than the hook, by a whole second
+            self.s._note_turn_opener("injected", fresh=True)   # the result arrived; a queued romp notice opened a turn
+        self._hold_lock_while(hook, notice_fed)
+        reg = self._reg()
+        self.assertEqual(reg.get("lastTurnOpener"), "human", "Stop recorded the opener of the turn after it")
+        self.assertLessEqual(abs(reg.get("lastStopAt", 0) - int(fired["at"])), 0, "Stop's stamp is the hook's moment")
+
+    def test_a_delete_armed_after_the_stop_hook_is_not_completed_by_that_turn_end(self):
+        calls = []
+        self.be._complete_rewind_wait = lambda s: calls.append(s.sid)
+        inp = {"hook_event_name": "Stop", "session_crons": [], "background_tasks": []}
+
+        def arm():
+            self.s._rewind_wait = True                        # a delete-while-busy armed after this turn ended
+        self._hold_lock_while(lambda: asyncio.run(self.s._stop_hook(inp, None, None)), arm)
+        self.assertEqual(calls, [], "an older turn end completed a delete armed after it")
+
+    def test_the_ledger_and_schedule_records_keep_the_hooks_clock_and_process_generation(self):
+        launch = {"hook_event_name": "PostToolUse", "tool_name": "Bash", "tool_use_id": "toolu_synthetic_9",
+                  "tool_input": {"command": "sleep 100", "run_in_background": True},
+                  "tool_response": {"backgroundTaskId": "bgtask-synthetic-9", "stdout": "x" * 100_000}}
+        wake = {"hook_event_name": "PostToolUse", "tool_name": "ScheduleWakeup",
+                "tool_input": {"delaySeconds": 600, "prompt": "check the synthetic build", "reason": "poll"}}
+        gen0, fired = self.s.proc_gen, {}
+
+        def hooks():
+            fired["at"] = time.time()
+            asyncio.run(self.s._ledger_tool_hook(launch, "toolu_synthetic_9", None))
+            asyncio.run(self.s._sched_tool_hook(wake, None, None))
+            held = [fn for fn in self.be._reg_jobs.values()]
+            fired["closure"] = repr([c.cell_contents for fn in held for c in (fn.__closure__ or ())])
+
+        def moved_on():
+            time.sleep(1.1)
+            self.s.proc_gen = "a-later-cli-generation"         # the CLI was replaced before the writer ran
+        self._hold_lock_while(hooks, moved_on)
+        entry = (self._reg().get("bgLedger") or [{}])[0]
+        self.assertEqual(entry.get("procGen"), gen0)
+        self.assertEqual(entry.get("armedAt"), int(fired["at"]))
+        cron = (self._reg().get("sessionCrons") or [{}])[0]
+        self.assertEqual(cron.get("procGen"), gen0)
+        self.assertAlmostEqual(cron.get("dueEpoch"), fired["at"] + 600, delta=0.5)
+        self.assertNotIn("x" * 1000, fired["closure"], "a queued job held the whole Bash output")
+
+    def test_a_foreground_bash_queues_nothing(self):
+        fg = {"hook_event_name": "PostToolUse", "tool_name": "Bash", "tool_use_id": "toolu_synthetic_10",
+              "tool_input": {"command": "ls"}, "tool_response": {"stdout": "x" * 100_000}}
+        seen = {}
+
+        def hook():
+            asyncio.run(self.s._ledger_tool_hook(fg, "toolu_synthetic_10", None))
+            seen["queued"] = len(self.be._reg_jobs)
+        self._hold_lock_while(hook, lambda: None)
+        self.assertEqual(seen["queued"], 0)
+
+    # the inherited hook tests run once, in HooksNotBehindRegLock
+    test_post_tool_use_ledger_hook = test_post_tool_use_failure_ledger_hook = test_stop_hook = None
+    test_schedule_tool_hook = test_facts_tool_hook = test_worktree_tool_hook_transcript_path = None
+    test_background_task_mirror_never_writes_back_a_cleared_set = test_context_refresh = None
+
+
 class SessionLoopRegLockGuard(unittest.TestCase):
     """The test-time rule: a session loop thread that takes the registry lock raises (ROMP_REG_LOCK_GUARD=raise, which
     tests/conftest.py sets for the suite), so a hook or handler that writes the registry on the loop fails its test."""

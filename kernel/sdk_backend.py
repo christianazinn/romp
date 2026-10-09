@@ -35,6 +35,7 @@ import time
 import traceback
 import uuid
 import collections
+import copy
 from collections import deque
 from pathlib import Path
 
@@ -9973,14 +9974,49 @@ class SdkSession:
         self._record_transcript_path(inp)
         return {}
 
+    def _hook_capture(self, **extra) -> dict:
+        """What a moved hook's queued registry work needs from the session, captured as VALUES when the hook fires
+        (review 2 of the hook move, must-fix): the job runs later on the registry writer, and by then the session has
+        moved on (a romp notice fed after a human's turn made Stop stamp the turn "injected" and the phone buzz was
+        skipped). A queued registry job never reads live session state when it runs; the registry itself, the
+        read-modify-write base, is still read at write time."""
+        cap = {"at": time.time(), "proc_gen": str(getattr(self, "proc_gen", "") or "")}
+        cap.update(extra)
+        return cap
+
+    @staticmethod
+    def _hook_slim(inp, keys, sub=None) -> dict:
+        """The hook input fields a queued job reads, copied (never the whole input: a Bash response can be megabytes,
+        and a queue held behind a stuck lock would keep every one). `sub` names nested dicts and the keys kept in each;
+        strings are cut at 2,000 characters (every reader cuts shorter)."""
+        def val(v):
+            if isinstance(v, str):
+                return v[:2000]
+            return copy.deepcopy(v)
+        src = inp if isinstance(inp, dict) else {}
+        out = {k: val(src[k]) for k in keys if k in src}
+        for k, ks in (sub or {}).items():
+            d = src.get(k)
+            if isinstance(d, dict):
+                out[k] = {kk: val(d[kk]) for kk in ks if kk in d}
+            elif k in src:
+                out[k] = val(d)
+        return out
+
     async def _stop_hook(self, inp, tool_use_id, context):
         """Stop: answered at once; its registry work (_stop_apply) goes through _reg_job, so on the session's loop it
         is queued for the registry writer instead of waiting on the registry lock there (2026-10-09). The answer never
-        depended on the registry: it is {} on every path."""
-        self.backend._reg_job(None, lambda: self._stop_apply(inp, tool_use_id, context))
+        depended on the registry: it is {} on every path. Captured now (_hook_capture): the clock, the turn's opener,
+        the CLI's process generation and whether a delete-while-busy waits on this turn end; the transcript path is
+        recorded here too (its own keyed write), so a later hook's newer path is never overwritten by this one."""
+        cap = self._hook_capture(opener=getattr(self, "_turn_opener", None) or "human",
+                                 rewind_wait=bool(getattr(self, "_rewind_wait", False)))
+        self._record_transcript_path(inp)
+        slim = self._hook_slim(inp, ("session_crons", "background_tasks"))
+        self.backend._reg_job(None, lambda: self._stop_apply(slim, tool_use_id, context, cap=cap))
         return {}
 
-    def _stop_apply(self, inp, tool_use_id=None, context=None):
+    def _stop_apply(self, inp, tool_use_id=None, context=None, cap=None):
         """At turn-end, CLEAR the awaiting overlay (awaiting:false). Background SHELL tasks don't ride
         this overlay: they were excluded from awaiting entirely on 2026-07-07 (a leftover dev server /
         `tail -f` pinned an idle session to a working flavor off a lossy transcript scrape), and when the
@@ -9988,8 +10024,14 @@ class SdkSession:
         the signal came from the CLI's DESIGNED task lifecycle stream instead — the live _bg_tasks set
         (see _on_task_event), terminal-status-cleared, no overlay records needed. So this hook still
         ignores inp['background_tasks'] and just clears any stale awaiting:true — keeping the overlay
-        channel available for signals that need durability across a backend restart."""
-        self._record_transcript_path(inp)   # where the CLI writes, for discovery (see the helper)
+        channel available for signals that need durability across a backend restart.
+
+        `cap` is what the hook captured when it fired (_stop_hook); a direct call (off any loop) captures now."""
+        if cap is None:
+            cap = self._hook_capture(opener=getattr(self, "_turn_opener", None) or "human",
+                                     rewind_wait=bool(getattr(self, "_rewind_wait", False)))
+            self._record_transcript_path(inp)   # where the CLI writes, for discovery (see the helper)
+        proc_gen = cap["proc_gen"]
         append_awaiting(self.backend.state_dir, self.sid, False)
         # Record the ARMED TIMER SET (the hook payload's session_crons: CronCreate crons, ScheduleWakeup
         # wakeups, /loop ticks). Session-scoped timers live ONLY in the CLI process's memory — the tool
@@ -10006,7 +10048,7 @@ class SdkSession:
                 if prev is None:
                     # the except below logs it — skip, never wipe the armed set (field-gutting class)
                     raise OSError("reg unreadable — session_crons record skipped rather than wiping the armed set")
-                nw = time.time()
+                nw = cap["at"]
                 known = {c.get("id"): c for c in (prev.get("sessionCrons") or []) if isinstance(c, dict)}
                 # Adoption pool for the CALL-TIME records (_sched_tool_hook): a toolhook entry knows the
                 # EXACT dueEpoch but minted its own id; the payload entry carries the CLI's id but no
@@ -10037,7 +10079,7 @@ class SdkSession:
                                  # one-shot's due moment never shifts when later turns rewrite the set
                                  "armedAt": float(src.get("armedAt") or nw),
                                  "dueEpoch": (float(src["dueEpoch"]) if src.get("dueEpoch") else None),
-                                 "procGen": str(src.get("procGen") or self.proc_gen)})
+                                 "procGen": str(src.get("procGen") or proc_gen)})
                 # MERGE, don't overwrite: a recycled process LOSES ScheduleWakeup one-shots (verified
                 # live 2026-08-28), so the fresh process's payload lacks them — and blindly writing the
                 # payload would erase the very record deliver_lost_wakeups needs. An absent one-shot
@@ -10050,7 +10092,7 @@ class SdkSession:
                 for c in (prev.get("sessionCrons") or []):
                     if (isinstance(c, dict) and not c.get("recurring") and c.get("id") not in have
                             and id(c) not in adopted
-                            and str(c.get("procGen") or "") != self.proc_gen):
+                            and str(c.get("procGen") or "") != proc_gen):
                         slim.append(c)
                 if slim != prev.get("sessionCrons"):
                     self.backend._update_reg(self.sid, sessionCrons=slim, sessionCronsAt=int(nw))
@@ -10066,7 +10108,7 @@ class SdkSession:
         try:
             bg = inp.get("background_tasks") if isinstance(inp, dict) else None
             if isinstance(bg, list):
-                nw = int(time.time())
+                nw = int(cap["at"])
                 lr = self._ledger_read()
                 if lr is None:
                     raise OSError("reg unreadable — reconcile skipped")   # the except below logs it
@@ -10078,7 +10120,7 @@ class SdkSession:
                     tid = str(e.get("tid") or "")
                     if tid and tid in running:
                         kept.append(e)
-                    elif str(e.get("procGen") or "") != self.proc_gen:
+                    elif str(e.get("procGen") or "") != proc_gen:
                         ended.append({"tid": e.get("tid"), "why": "processDied", "at": nw})
                     elif tid and e.get("tool") == "bash":
                         # only SHELLS are proven to ride the payload (probe 2026-08-28) — a monitor
@@ -10093,7 +10135,7 @@ class SdkSession:
                         kept.append({"tid": tid, "toolUseId": None, "tool": str(t.get("type") or "shell"),
                                      "desc": str(t.get("description") or "")[:300], "armedAt": nw,
                                      "deadlineEpoch": None, "persistent": False,
-                                     "procGen": self.proc_gen, "agentId": None, "src": "stopReconcile"})
+                                     "procGen": proc_gen, "agentId": None, "src": "stopReconcile"})
                 lr0 = self._ledger_read()
                 if lr0 is not None and (kept != lr0[0] or ended != lr0[1]):
                     self._ledger_write(kept, ended)
@@ -10107,13 +10149,13 @@ class SdkSession:
         # the human's turns only. No open seen (a session object born mid-turn at a kernel restart, a
         # CLI that stamps no origin) reads "human" — fail OPEN on the buzz, never silently drop it.
         try:
-            self.backend._update_reg(self.sid, lastStopAt=int(time.time()),
-                                     lastTurnOpener=getattr(self, "_turn_opener", None) or "human")
+            self.backend._update_reg(self.sid, lastStopAt=int(cap["at"]), lastTurnOpener=cap["opener"])
         except Exception:
             pass
         # delete-while-busy: the turn this delete interrupted has ENDED — complete the arm here,
-        # on the same turn-end fact that stamps lastStopAt (never a sleep)
-        if getattr(self, "_rewind_wait", False):
+        # on the same turn-end fact that stamps lastStopAt (never a sleep). Only when the wait stood as the hook fired: a
+        # delete armed after this turn ended waits for its own turn end (_complete_rewind_wait re-checks the flag itself)
+        if cap["rewind_wait"]:
             try:
                 self.backend._complete_rewind_wait(self)
             except Exception as e:
@@ -10123,11 +10165,15 @@ class SdkSession:
 
     async def _sched_tool_hook(self, inp, tool_use_id, context):
         """PostToolUse on the scheduling tools: answered at once, its registry work (_sched_tool_apply) through _reg_job
-        (see _stop_hook). The answer is {} on every path."""
-        self.backend._reg_job(None, lambda: self._sched_tool_apply(inp, tool_use_id, context))
+        (see _stop_hook). The answer is {} on every path. Captured now: the clock (the arm's absolute due time is
+        counted from the call, not from when the writer ran) and the CLI's process generation."""
+        cap = self._hook_capture()
+        slim = self._hook_slim(inp, ("tool_name",), {"tool_input": ("stop", "delaySeconds", "prompt", "reason", "name",
+                                                                      "id", "schedule")})
+        self.backend._reg_job(None, lambda: self._sched_tool_apply(slim, tool_use_id, context, cap=cap))
         return {}
 
-    def _sched_tool_apply(self, inp, tool_use_id=None, context=None):
+    def _sched_tool_apply(self, inp, tool_use_id=None, context=None, cap=None):
         """PostToolUse on the scheduling tools (ScheduleWakeup / CronCreate / CronDelete): record the
         arm at the CALL moment with an ABSOLUTE due time, instead of waiting for the turn's Stop hook.
         End-of-turn-only recording had three holes (review of #769, 2026-08-28): armedAt stamped at
@@ -10143,7 +10189,8 @@ class SdkSession:
             targs = (inp or {}).get("tool_input") or {}
             if not isinstance(targs, dict):
                 return {}
-            nw = time.time()
+            cap = cap if cap is not None else self._hook_capture()
+            nw, proc_gen = cap["at"], cap["proc_gen"]
             prev = read_reg_for_rmw(self.backend.state_dir, self.sid)
             if prev is None:
                 self.backend._log("sched tool hook (%s): reg unreadable — skipping this record "
@@ -10168,14 +10215,14 @@ class SdkSession:
                 cur = [c for c in cur if not (c.get("src") == "toolhook" and not c.get("recurring"))]
                 cur.append({"id": "toolhook-%d" % int(due), "cron": "", "prompt": prompt,
                             "kind": str(targs.get("reason") or "")[:120], "recurring": False,
-                            "armedAt": nw, "dueEpoch": due, "procGen": self.proc_gen, "src": "toolhook"})
+                            "armedAt": nw, "dueEpoch": due, "procGen": proc_gen, "src": "toolhook"})
             elif tname == "CronCreate":
                 nm = str(targs.get("name") or targs.get("id") or ("cron-%d" % int(nw)))
                 cur = [c for c in cur if c.get("id") != nm]
                 cur.append({"id": nm, "cron": str(targs.get("schedule") or ""),
                             "prompt": str(targs.get("prompt") or "")[:500], "kind": "cron",
                             "recurring": True, "armedAt": nw, "dueEpoch": None,
-                            "procGen": self.proc_gen, "src": "toolhook"})
+                            "procGen": proc_gen, "src": "toolhook"})
             elif tname == "CronDelete":
                 nm = str(targs.get("name") or targs.get("id") or "")
                 if not nm:
@@ -10408,11 +10455,23 @@ class SdkSession:
     async def _ledger_tool_hook(self, inp, tool_use_id, context):
         """PostToolUse on Bash/Monitor/TaskStop: answered at once, its registry work (_ledger_tool_apply) through
         _reg_job (see _stop_hook). This hook fires after EVERY Bash call, which made it the commonest wait on the
-        registry lock once hostAck had moved off the loop (2026-10-09). The answer is {} on every path."""
-        self.backend._reg_job(None, lambda: self._ledger_tool_apply(inp, tool_use_id, context))
+        registry lock once hostAck had moved off the loop (2026-10-09). The answer is {} on every path. A call that
+        records nothing (a foreground Bash, a tool outside the ledger) queues nothing; the rest capture the clock and
+        the CLI's process generation now, with only the input fields the record reads (never a Bash output)."""
+        tname = str((inp or {}).get("tool_name") or "") if isinstance(inp, dict) else ""
+        targs = (inp or {}).get("tool_input") if isinstance(inp, dict) else None
+        if tname != "TaskStop" and (tname not in self._LEDGER_TOOLS
+                                    or (tname == "Bash" and not (isinstance(targs, dict) and targs.get("run_in_background")))):
+            return {}
+        cap = self._hook_capture()
+        slim = self._hook_slim(inp, ("tool_name", "tool_use_id", "agent_id"),
+                               {"tool_input": ("task_id", "taskId", "id", "shell_id", "run_in_background", "persistent",
+                                               "timeout_ms", "description", "prompt", "command"),
+                                "tool_response": ("backgroundTaskId", "task_id", "taskId", "id")})
+        self.backend._reg_job(None, lambda: self._ledger_tool_apply(slim, tool_use_id, context, cap=cap))
         return {}
 
-    def _ledger_tool_apply(self, inp, tool_use_id=None, context=None):
+    def _ledger_tool_apply(self, inp, tool_use_id=None, context=None, cap=None):
         """PostToolUse on the launch/stop tools. Defensive throughout: an unrecognized shape records
         nothing and logs — the Stop-hook reconciler and the lifecycle stream remain the safety nets."""
         try:
@@ -10423,7 +10482,8 @@ class SdkSession:
                 return {}
             if not isinstance(tresp, dict):
                 tresp = {}
-            nw = time.time()
+            cap = cap if cap is not None else self._hook_capture()
+            nw = cap["at"]
             lr = self._ledger_read()
             if lr is None:
                 return {}                             # skip, never wipe — the next event re-records
@@ -10458,7 +10518,7 @@ class SdkSession:
             entry = {"tid": tid or None, "toolUseId": tuid,
                      "tool": tname.lower(), "desc": desc, "armedAt": int(nw),
                      "deadlineEpoch": deadline, "persistent": persistent,
-                     "procGen": self.proc_gen,
+                     "procGen": cap["proc_gen"],
                      "agentId": str((inp or {}).get("agent_id") or "") or None, "src": "hook"}
             live = [e for e in live
                     if not (tid and str(e.get("tid")) == tid)
@@ -10473,11 +10533,13 @@ class SdkSession:
 
     async def _ledger_fail_hook(self, inp, tool_use_id, context):
         """PostToolUseFailure: answered at once, its registry work (_ledger_fail_apply) through _reg_job (see
-        _stop_hook). The answer is {} on every path."""
-        self.backend._reg_job(None, lambda: self._ledger_fail_apply(inp, tool_use_id, context))
+        _stop_hook). The answer is {} on every path. Captured now: the clock (the tombstone's time)."""
+        cap = self._hook_capture()
+        slim = self._hook_slim(inp, ("tool_use_id", "is_interrupt"))
+        self.backend._reg_job(None, lambda: self._ledger_fail_apply(slim, tool_use_id, context, cap=cap))
         return {}
 
-    def _ledger_fail_apply(self, inp, tool_use_id=None, context=None):
+    def _ledger_fail_apply(self, inp, tool_use_id=None, context=None, cap=None):
         """PostToolUseFailure on the launch tools: a launch whose ack ERRORED never started — drop any
         entry recorded for it so it cannot hold an awaiting gate open as a phantom wait (probe-verified
         2026-08-28: the event emits with error + is_interrupt; a DENIED tool does not reach here)."""
@@ -10494,7 +10556,7 @@ class SdkSession:
                 why = "interrupted" if (inp or {}).get("is_interrupt") else "launch-failed"
                 ended.append({"tid": next((e.get("tid") for e in live
                                            if str(e.get("toolUseId")) == tuid), None),
-                              "why": why, "at": int(time.time())})
+                              "why": why, "at": int((cap or self._hook_capture())["at"])})
                 self._ledger_write(kept, ended)
                 self.backend._poke()
         except Exception as e:
@@ -10515,11 +10577,15 @@ class SdkSession:
         """PostToolUse on the interaction-facts tools: answered at once, its registry work (_facts_tool_apply) through
         _reg_job (see _stop_hook). Its read-then-write pairs stay correct: they ran unlocked on the loop because the loop
         was their only writer, and queued work runs one item at a time on one writer thread, which is now that only
-        writer. The answer is {} on every path."""
-        self.backend._reg_job(None, lambda: self._facts_tool_apply(inp, tool_use_id, context))
+        writer. The answer is {} on every path. Captured now: the clock (each record's time)."""
+        cap = self._hook_capture()
+        slim = self._hook_slim(inp, ("tool_name", "agent_id"),
+                               {"tool_input": ("taskId", "message"),
+                                "tool_response": ("taskId", "pushSent", "localSent", "commandName")})
+        self.backend._reg_job(None, lambda: self._facts_tool_apply(slim, tool_use_id, context, cap=cap))
         return {}
 
-    def _facts_tool_apply(self, inp, tool_use_id=None, context=None):
+    def _facts_tool_apply(self, inp, tool_use_id=None, context=None, cap=None):
         try:
             tname = str((inp or {}).get("tool_name") or "")
             targs = (inp or {}).get("tool_input") or {}
@@ -10528,7 +10594,7 @@ class SdkSession:
                 targs = {}
             if not isinstance(tresp, dict):
                 tresp = {}
-            nw = int(time.time())
+            nw = int((cap if cap is not None else self._hook_capture())["at"])
             aid = str((inp or {}).get("agent_id") or "") or None
             if tname in ("TaskCreate", "TaskUpdate"):
                 # a capped TAIL, not a slot (review 2026-08-29): parallel subagents cluster task
