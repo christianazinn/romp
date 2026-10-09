@@ -675,10 +675,72 @@ class QueuedJobsTakeValues(HooksNotBehindRegLock):
         self._hold_lock_while(hook, lambda: None)
         self.assertEqual(seen["queued"], 0)
 
+    def test_a_requeued_key_moves_to_the_back(self):
+        """Review 2 (should-fix): a re-queued key kept its old place, so its newer value ran ahead of work queued after
+        the older one; it now takes the back of the line."""
+        order = []
+
+        def queue():
+            self.be._reg_job(("k1", SID), lambda: order.append("k1-old"))
+            self.be._reg_job(("k2", SID), lambda: order.append("k2"))
+            self.be._reg_job(("k1", SID), lambda: order.append("k1-new"))
+        self._hold_lock_while(queue, lambda: None)
+        # the writer may have popped k1-old before the lock mattered (these jobs take no lock); what may never happen is
+        # the newer k1 running ahead of k2
+        self.assertIn(order, (["k2", "k1-new"], ["k1-old", "k2", "k1-new"]), order)
+
     # the inherited hook tests run once, in HooksNotBehindRegLock
     test_post_tool_use_ledger_hook = test_post_tool_use_failure_ledger_hook = test_stop_hook = None
     test_schedule_tool_hook = test_facts_tool_hook = test_worktree_tool_hook_transcript_path = None
     test_background_task_mirror_never_writes_back_a_cleared_set = test_context_refresh = None
+
+
+class RegWriterReview2(unittest.TestCase):
+    """Review 2 (should-fix): the writer could stop for good silently, and the queue could grow without a word."""
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.d, ignore_errors=True)
+        Path(self.d, "session-hosts").write_text("off")
+        self.logs = []
+        self.be = sb.SdkBackend(self.d, "/bin/true", lambda *a, **k: None, log=self.logs.append)
+        sb.write_reg(Path(self.d), SID, {"sid": SID, "name": "web", "alive": True})
+
+    def _on_loop(self, fn):
+        th = threading.Thread(target=fn, name=LOOP_PREFIX + "web-r2", daemon=True)
+        th.start()
+        th.join(10.0)
+
+    def test_a_writer_killed_by_an_unexpected_error_says_so_and_the_next_write_starts_a_fresh_one(self):
+        class Fatal(BaseException):
+            pass
+
+        def boom():
+            raise Fatal()
+        hook = threading.excepthook
+        threading.excepthook = lambda args: None             # the writer's death is the point; keep it off the run's report
+        self.addCleanup(setattr, threading, "excepthook", hook)
+        self._on_loop(lambda: self.be._reg_job(None, boom))
+        deadline = time.time() + 5
+        while time.time() < deadline and self.be._reg_writer is not None:
+            time.sleep(0.02)
+        self.assertTrue(any("stopped on an unexpected error" in str(l) for l in self.logs), self.logs)
+        self._on_loop(lambda: self.be._reg_job(None, lambda: self.be._update_reg(SID, lastTurnOpener="after")))
+        _drain_writer(self.be)
+        self.assertEqual((sb.read_reg(Path(self.d), SID) or {}).get("lastTurnOpener"), "after")
+
+    def test_a_long_queue_is_logged_once(self):
+        orig = sb.REG_JOBS_WARN
+        sb.REG_JOBS_WARN = 5
+        self.addCleanup(setattr, sb, "REG_JOBS_WARN", orig)
+        self.be._reg_lock.acquire()
+        try:
+            self._on_loop(lambda: [self.be._reg_job(None, lambda i=i: self.be._update_reg(SID, n=i)) for i in range(12)])
+        finally:
+            self.be._reg_lock.release()
+        _drain_writer(self.be)
+        self.assertEqual(sum(1 for l in self.logs if "registry writes queued" in str(l)), 1, self.logs)
+        self.assertEqual((sb.read_reg(Path(self.d), SID) or {}).get("n"), 11)
 
 
 class SessionLoopRegLockGuard(unittest.TestCase):

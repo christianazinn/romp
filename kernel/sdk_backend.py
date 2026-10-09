@@ -11766,6 +11766,12 @@ def _host_ack_backwards(old, new) -> bool:
         return False
 
 
+# The registry-writer queue (SdkBackend._reg_jobs): a keyed entry coalesces, so keyed work is bounded by sessions times
+# keys per session (hostAck, queue, liveCtx, transcriptPath, bgTasks, modelPending: six); unkeyed work (one item per hook
+# that fires: Stop, the scheduling, ledger, failure and facts hooks, a rewind completion) grows while the lock is stuck,
+# each item a few hundred bytes since hooks copy only the fields they record. Past this many items the writer logs once.
+REG_JOBS_WARN = 2000
+
 # Set (per thread) while SdkBackend._reg_run_queue_inline runs queued registry work on a session loop because the writer
 # thread could not be started: a degraded path that takes the lock on the loop knowingly, so the guard lets it through.
 _REG_INLINE = threading.local()
@@ -11901,6 +11907,7 @@ class SdkBackend:
         self._reg_jobs_seq = 0
         self._reg_writer = None
         self._reg_writer_start_failed = False     # the writer's failed start is logged once per backend (_reg_job)
+        self._reg_jobs_warned = False             # the queue passed REG_JOBS_WARN; re-armed once it drains below half
         self._reg_inline_lock = threading.RLock() # one inline runner at a time when the writer cannot start; re-entrant,
         #                                           since a queued item can queue more (the Stop hook's transcriptPath)
         # sid -> (host identity "pid:start", offset): the newest offset this kernel CONSUMED from a session's host, kept in
@@ -12864,23 +12871,39 @@ class SdkBackend:
         if not on_session_loop():
             fn()
             return
+        big = dead = False
+        failed = None
         with self._reg_jobs_lock:
             if key is None:
                 self._reg_jobs_seq += 1
                 key = ("job", self._reg_jobs_seq)
+            # a re-queued key takes the new value AND the back of the line (review 2): kept in its old place, it ran
+            # ahead of work queued after the value it now carries, so an older write could land after a newer one
+            self._reg_jobs.pop(key, None)
             self._reg_jobs[key] = fn
+            n = len(self._reg_jobs)
+            if n >= REG_JOBS_WARN and not self._reg_jobs_warned:
+                self._reg_jobs_warned, big = True, True
+            elif n < REG_JOBS_WARN // 2:
+                self._reg_jobs_warned = False
             w = self._reg_writer
-            if w is not None and w.is_alive():
-                return
-            th = threading.Thread(target=self._reg_writer_run, name="romp-reg-writer", daemon=True)
-            try:
-                th.start()
-            except Exception as e:                # RuntimeError("can't start new thread"), or anything else start raises
-                self._reg_writer = None
-                failed = e
-            else:
-                self._reg_writer = th
-                return
+            if w is None or not w.is_alive():
+                dead = w is not None
+                th = threading.Thread(target=self._reg_writer_run, name="romp-reg-writer", daemon=True)
+                try:
+                    th.start()
+                except Exception as e:            # RuntimeError("can't start new thread"), or anything else start raises
+                    self._reg_writer = None
+                    failed = e
+                else:
+                    self._reg_writer = th
+        if big:
+            self._log_quiet("registry writer: %d registry writes queued (the registry lock is slow or stuck); said once "
+                            "until the queue drains below %d" % (n, REG_JOBS_WARN // 2))
+        if dead:
+            self._log_quiet("registry writer: the writer thread had died; a fresh one replaced it")
+        if failed is None:
+            return
         if not getattr(self, "_reg_writer_start_failed", False):
             self._reg_writer_start_failed = True
             self._log("registry writer: could not start a thread (%s: %s); queued registry work runs on the calling "
@@ -12941,12 +12964,14 @@ class SdkBackend:
         the lock for its own writes, as the code it came from did, so a callback inside an item cannot deadlock on it.
         However it ends, it clears its own slot, so the next queued item starts a fresh writer."""
         me = threading.current_thread()
+        clean = False
         try:
             while True:
                 with self._reg_jobs_lock:
                     if not self._reg_jobs:
                         if self._reg_writer is me:
                             self._reg_writer = None
+                        clean = True
                         return
                     key, fn = self._reg_jobs.popitem(last=False)
                 try:
@@ -12957,6 +12982,10 @@ class SdkBackend:
             with self._reg_jobs_lock:
                 if self._reg_writer is me:
                     self._reg_writer = None
+                left = len(self._reg_jobs)
+            if not clean:   # a BaseException out of an item (the items' own Exceptions are caught above): say so once here
+                self._log_quiet("registry writer: stopped on an unexpected error with %d write(s) queued; the next queued "
+                                "write starts a fresh writer" % left)
 
     def _write_host_ack_now(self, sess) -> None:
         """The hostAck registry write itself, from the session's CURRENT transport, read UNDER _reg_lock (see
