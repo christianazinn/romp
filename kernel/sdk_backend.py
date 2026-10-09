@@ -34,6 +34,7 @@ import threading
 import time
 import traceback
 import uuid
+import collections
 from collections import deque
 from pathlib import Path
 
@@ -6385,19 +6386,59 @@ class SdkSession:
         repeat check), snapshotted in the SAME hold as the queue: every write of those ids carries the queue as it
         stood with them, and an id is only ever added in the hold that queues its banner (enqueue_postal), so the
         ids on disk never run ahead of the queue on disk, whatever a kernel death interrupts (2026-09-29). A write
-        without it leaves the stored ids as they were."""
+        without it leaves the stored ids as they were.
+
+        On the session's LOOP thread it never waits (2026-10-09): a loop waiting on the registry lock answers none of
+        its hooks. It TRIES the locks; when all are free it writes at once, as before, so a text the feeder pops is off
+        the disk queue before it is fed. When one is busy it queues the persist for the registry writer under one key,
+        which re-snapshots _pending when it runs, so the disk still ends at the latest queue."""
+        if on_session_loop():
+            if self._persist_queue_try(taken):
+                return
+            self._persist_taken_due = getattr(self, "_persist_taken_due", False) or taken
+            self.backend._reg_job(("queue", self.sid), self._persist_queue_due)
+            return
         with self._persist_lock:
             with self._lock:
-                snap = list(self._pending)
-                metas = list(self._pending_meta)
-                extra = {"postalTaken": list(self._postal_taken)} if taken else {}
-            qmeta = [{"text": t, "qid": m["qid"], "qts": m.get("qts"), **({"paths": m["paths"]} if m.get("paths") else {}),
-                      **({"fromUser": True} if m.get("fromUser") is True else {})} if isinstance(m, dict) and m.get("qid") else {"text": t}
-                     for t, m in zip(snap, metas)]        # every position, so the restore aligns the run as a block
+                snap, qmeta, extra = self._queue_snapshot(taken)
             try:
                 self.backend._update_reg(self.sid, queue=snap, queueMeta=qmeta, **extra)
             except Exception:
                 self.backend._log("persist queue (%s): %s" % (self.name, traceback.format_exc()))
+
+    def _queue_snapshot(self, taken: bool):
+        """(queue, queueMeta, extra) for the registry; the caller holds self._lock."""
+        snap = list(self._pending)
+        metas = list(self._pending_meta)
+        extra = {"postalTaken": list(self._postal_taken)} if taken else {}
+        qmeta = [{"text": t, "qid": m["qid"], "qts": m.get("qts"), **({"paths": m["paths"]} if m.get("paths") else {}),
+                  **({"fromUser": True} if m.get("fromUser") is True else {})} if isinstance(m, dict) and m.get("qid") else {"text": t}
+                 for t, m in zip(snap, metas)]        # every position, so the restore aligns the run as a block
+        return snap, qmeta, extra
+
+    def _persist_queue_try(self, taken: bool) -> bool:
+        """_persist_queue's whole step without waiting on any lock: False, nothing written, when one is busy."""
+        if not self._persist_lock.acquire(blocking=False):
+            return False
+        try:
+            if not self._lock.acquire(blocking=False):
+                return False
+            try:
+                snap, qmeta, extra = self._queue_snapshot(taken)
+            finally:
+                self._lock.release()
+            try:
+                return self.backend._update_reg_try(self.sid, queue=snap, queueMeta=qmeta, **extra)
+            except Exception:
+                self.backend._log("persist queue (%s): %s" % (self.name, traceback.format_exc()))
+                return True                   # it ran and failed, as the blocking path's failure does: logged, not queued
+        finally:
+            self._persist_lock.release()
+
+    def _persist_queue_due(self):
+        """The queued persist (registry writer thread): one blocking persist of the queue as it stands now."""
+        taken, self._persist_taken_due = getattr(self, "_persist_taken_due", False), False
+        self._persist_queue(taken)
 
     def interrupt(self, climb=True):
         """Escalating stop (the user 2026-07-10, terminal parity). The old body was `if self.loop and
@@ -7143,10 +7184,12 @@ class SdkSession:
         if self._ctx_tokens is not None:
             upd["liveCtxTokens"] = self._ctx_tokens
         if upd:
-            try:
-                self.backend._update_reg(self.sid, **upd)
-            except Exception as e:
-                self.backend._log("context refresh (%s): registry write failed: %s" % (self.name, e))
+            def write(upd=upd):           # through _reg_job: off this loop thread (2026-10-09); a newer refresh still
+                try:                      # queued replaces this one, so the latest values are the ones written
+                    self.backend._update_reg(self.sid, **upd)
+                except Exception as e:
+                    self.backend._log("context refresh (%s): registry write failed: %s" % (self.name, e))
+            self.backend._reg_job(("liveCtx", self.sid), write)
         # A moved context % or model is news the panes should see now, not at the next backstop. (This
         # poke had been separated from the `changed` it reads and left sitting in refresh_usage below,
         # where the name is undefined — so every /usage click raised NameError instead, and a context
@@ -9915,10 +9958,13 @@ class SdkSession:
         tp = inp.get("transcript_path") if isinstance(inp, dict) else None
         if tp and tp != getattr(self, "_last_transcript_path", None):
             self._last_transcript_path = tp
-            try:
-                self.backend._update_reg(self.sid, transcriptPath=str(tp))
-            except Exception as e:
-                self.backend._log("transcriptPath record (%s) failed: %s" % (self.name, e))
+
+            def write(tp=tp):             # through _reg_job: off the session loop (2026-10-09); a newer path still queued
+                try:                      # replaces this write under the same key, so the latest path is the one written
+                    self.backend._update_reg(self.sid, transcriptPath=str(tp))
+                except Exception as e:
+                    self.backend._log("transcriptPath record (%s) failed: %s" % (self.name, e))
+            self.backend._reg_job(("transcriptPath", self.sid), write)
 
     async def _worktree_tool_hook(self, inp, tool_use_id, context):
         """PostToolUse on EnterWorktree / ExitWorktree: the call itself relocates the transcript and
@@ -9928,6 +9974,13 @@ class SdkSession:
         return {}
 
     async def _stop_hook(self, inp, tool_use_id, context):
+        """Stop: answered at once; its registry work (_stop_apply) goes through _reg_job, so on the session's loop it
+        is queued for the registry writer instead of waiting on the registry lock there (2026-10-09). The answer never
+        depended on the registry: it is {} on every path."""
+        self.backend._reg_job(None, lambda: self._stop_apply(inp, tool_use_id, context))
+        return {}
+
+    def _stop_apply(self, inp, tool_use_id=None, context=None):
         """At turn-end, CLEAR the awaiting overlay (awaiting:false). Background SHELL tasks don't ride
         this overlay: they were excluded from awaiting entirely on 2026-07-07 (a leftover dev server /
         `tail -f` pinned an idle session to a working flavor off a lossy transcript scrape), and when the
@@ -10069,6 +10122,12 @@ class SdkSession:
         return {}
 
     async def _sched_tool_hook(self, inp, tool_use_id, context):
+        """PostToolUse on the scheduling tools: answered at once, its registry work (_sched_tool_apply) through _reg_job
+        (see _stop_hook). The answer is {} on every path."""
+        self.backend._reg_job(None, lambda: self._sched_tool_apply(inp, tool_use_id, context))
+        return {}
+
+    def _sched_tool_apply(self, inp, tool_use_id=None, context=None):
         """PostToolUse on the scheduling tools (ScheduleWakeup / CronCreate / CronDelete): record the
         arm at the CALL moment with an ABSOLUTE due time, instead of waiting for the turn's Stop hook.
         End-of-turn-only recording had three holes (review of #769, 2026-08-28): armedAt stamped at
@@ -10347,6 +10406,13 @@ class SdkSession:
                                  bgLedgerEnded=ended[-self._LEDGER_TOMBSTONES:])
 
     async def _ledger_tool_hook(self, inp, tool_use_id, context):
+        """PostToolUse on Bash/Monitor/TaskStop: answered at once, its registry work (_ledger_tool_apply) through
+        _reg_job (see _stop_hook). This hook fires after EVERY Bash call, which made it the commonest wait on the
+        registry lock once hostAck had moved off the loop (2026-10-09). The answer is {} on every path."""
+        self.backend._reg_job(None, lambda: self._ledger_tool_apply(inp, tool_use_id, context))
+        return {}
+
+    def _ledger_tool_apply(self, inp, tool_use_id=None, context=None):
         """PostToolUse on the launch/stop tools. Defensive throughout: an unrecognized shape records
         nothing and logs — the Stop-hook reconciler and the lifecycle stream remain the safety nets."""
         try:
@@ -10406,6 +10472,12 @@ class SdkSession:
         return {}
 
     async def _ledger_fail_hook(self, inp, tool_use_id, context):
+        """PostToolUseFailure: answered at once, its registry work (_ledger_fail_apply) through _reg_job (see
+        _stop_hook). The answer is {} on every path."""
+        self.backend._reg_job(None, lambda: self._ledger_fail_apply(inp, tool_use_id, context))
+        return {}
+
+    def _ledger_fail_apply(self, inp, tool_use_id=None, context=None):
         """PostToolUseFailure on the launch tools: a launch whose ack ERRORED never started — drop any
         entry recorded for it so it cannot hold an awaiting gate open as a phantom wait (probe-verified
         2026-08-28: the event emits with error + is_interrupt; a DENIED tool does not reach here)."""
@@ -10440,6 +10512,14 @@ class SdkSession:
     _TASK_WRITES_CAP = 15
 
     async def _facts_tool_hook(self, inp, tool_use_id, context):
+        """PostToolUse on the interaction-facts tools: answered at once, its registry work (_facts_tool_apply) through
+        _reg_job (see _stop_hook). Its read-then-write pairs stay correct: they ran unlocked on the loop because the loop
+        was their only writer, and queued work runs one item at a time on one writer thread, which is now that only
+        writer. The answer is {} on every path."""
+        self.backend._reg_job(None, lambda: self._facts_tool_apply(inp, tool_use_id, context))
+        return {}
+
+    def _facts_tool_apply(self, inp, tool_use_id=None, context=None):
         try:
             tname = str((inp or {}).get("tool_name") or "")
             targs = (inp or {}).get("tool_input") or {}
@@ -10555,10 +10635,7 @@ class SdkSession:
                 if note not in self._pending:      # a flapping reconnect must not stack the same notice
                     self._q_append(note)
             self._persist_queue()
-            try:
-                self.backend._update_reg(self.sid, bgTasks=[])   # reported — never re-notify these deaths
-            except Exception as e:
-                self.backend._log("live work (%s): bgTasks mirror clear failed: %s" % (self.name, e))
+            self._mirror_bg_tasks()   # the set was cleared above: writes [] (reported — never re-notify these deaths)
         if n or died:
             self.backend._log("live work (%s): dropped %d subagent%s and %d background task%s on %s — they ran "
                               "inside the abandoned CLI" % (self.name, n, "" if n == 1 else "s",
@@ -10744,10 +10821,7 @@ class SdkSession:
             # notification that can never arrive (nimbus's dead campaign watcher, the user 2026-07-11).
             # Cleared when the deaths are reported (reconcile / _on_session_gone); tasks that END
             # normally clear here, so the mirror never false-alarms.
-            try:
-                self.backend._update_reg(self.sid, bgTasks=self._live_bg_tasks())
-            except Exception as e:
-                self.backend._log("background tasks (%s): registry mirror write failed: %s" % (self.name, e))
+            self._mirror_bg_tasks()
         if changed or sub_changed:
             self.backend._poke()
             self._try_switch_reconnect()   # a task's end may be what a switch's ask waited for
@@ -10824,6 +10898,18 @@ class SdkSession:
         except Exception as e:
             self.backend._log("rewind_files (%s): control request failed for %s: %s" % (self.name, uuid, e))
         self.backend._poke()
+
+    def _mirror_bg_tasks(self) -> None:
+        """Write the live background-task set to the registry (bgTasks) through _reg_job, so a session loop never waits
+        on the registry lock for it (2026-10-09). The set is read from memory UNDER the lock, when the write runs, and
+        the queue key coalesces: whatever ran last before the write (a task ending, _drop_live_work clearing the set) is
+        what lands, so a mirror queued before a clear can never write the cleared tasks back."""
+        def write():
+            try:
+                self.backend._update_reg_with(self.sid, lambda: {"bgTasks": self._live_bg_tasks()})
+            except Exception as e:
+                self.backend._log("background tasks (%s): registry mirror write failed: %s" % (self.name, e))
+        self.backend._reg_job(("bgTasks", self.sid), write)
 
     def _live_bg_tasks(self) -> list:
         """The background tasks running RIGHT NOW: [{"desc","type","since","toolUseId","lastTool","taskId"}],
@@ -11527,6 +11613,101 @@ def _evict_live_overflow(d: dict, cap: int = LIVE_TAIL_CAP) -> int:
 
 
 # ---------------------------------------------------------------------------
+# The registry lock, and the rule that a session loop never waits on it (2026-10-09).
+# ---------------------------------------------------------------------------
+
+# Every session's hook callbacks are answered on that session's own asyncio loop, a thread named with this prefix
+# (SdkSession.start). A loop that waits on the backend's one registry lock answers NO hook until the lock frees: under
+# load that was minutes at a time, and the CLI refused prompts and stalled tools at its own hook deadlines (540 s, 180 s
+# for subagent hooks). So registry writes made on a session loop are queued for the backend's writer thread
+# (SdkBackend._reg_job), and the lock enforces the rule in the test suite.
+SESSION_LOOP_THREAD_PREFIX = "sdk:"
+# "raise" (the test suite, tests/conftest.py) or "record": a session loop thread that takes _reg_lock raises
+# RegLockOnSessionLoop / is appended to REG_LOCK_GUARD_SEEN. Unset (production): no check beyond one env lookup.
+REG_LOCK_GUARD_ENV = "ROMP_REG_LOCK_GUARD"
+REG_LOCK_GUARD_LOG_ENV = "ROMP_REG_LOCK_GUARD_LOG"   # a file each guarded hit is appended to (the suite fails on any line)
+REG_LOCK_GUARD_SEEN: list = []
+# The lock's own helpers: the guard names the first frame of this file OUTSIDE them as the writer.
+_REG_LOCK_HELPERS = frozenset(("_check", "acquire", "__enter__", "_update_reg", "_update_reg_with", "_reg_merge_locked",
+                               "_write_reg_locked", "_update_reg_dropping", "_update_reg_try"))
+# Writers measured still taking the lock on a session loop when the rule went in (2026-10-09: a full test-suite run in
+# record mode), each OWED a move off the loop. The guard lets exactly these writers through; any other writer on a loop
+# raises. Remove a name when its writer moves; never add one to make a test pass.
+REG_LOCK_LOOP_WRITERS_OWED = frozenset((
+    "_on_message",                # per-message registry writes inside the receive loop (lastSid, and others)
+    "_persist_cost_state",        # every result: the spend watermark
+    "_persist_echoes",            # echo marks written from the loop
+    "_learn_model", "_emit_ask", "_clear_ask",
+    "_file_host_log_rows",
+    # connect and teardown: the session's own start and end, while hooks are rare
+    "_persist_login_evidence", "_fresh_cli_stamp", "_fresh_cli_decision", "_amain", "_host_stand_down",
+    "_host_ended", "_record_launch_error", "_heal_cut_session", "_ensure",
+))
+
+
+class RegLockOnSessionLoop(RuntimeError):
+    """A session loop thread took the backend's registry lock (see SESSION_LOOP_THREAD_PREFIX); test suite only."""
+
+
+def on_session_loop() -> bool:
+    """Whether the calling thread is a session's own loop thread."""
+    return threading.current_thread().name.startswith(SESSION_LOOP_THREAD_PREFIX)
+
+
+class _RegLock:
+    """SdkBackend._reg_lock: a plain threading.Lock, plus the session-loop guard (REG_LOCK_GUARD_ENV)."""
+    __slots__ = ("_lock",)
+
+    def __init__(self):
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def _check():
+        mode = os.environ.get(REG_LOCK_GUARD_ENV)
+        if not mode or not on_session_loop():
+            return
+        f, chain, writer = sys._getframe(2), [], None
+        while f is not None and len(chain) < 8:
+            chain.append("%s:%d" % (f.f_code.co_name, f.f_lineno))
+            if writer is None and f.f_code.co_filename == __file__ and f.f_code.co_name not in _REG_LOCK_HELPERS:
+                writer = f.f_code.co_name
+            f = f.f_back
+        if writer in REG_LOCK_LOOP_WRITERS_OWED:
+            return
+        REG_LOCK_GUARD_SEEN.append((threading.current_thread().name, tuple(chain)))
+        log = os.environ.get(REG_LOCK_GUARD_LOG_ENV)
+        if log:                       # a raise a handler swallows still fails the run: the suite reads this file at its end
+            try:
+                with open(log, "a", encoding="utf-8") as fh:
+                    fh.write("%s\t%s\n" % (threading.current_thread().name, " < ".join(chain)))
+            except OSError:
+                pass
+        if mode == "raise":
+            raise RegLockOnSessionLoop("a session loop thread (%s) took the registry lock: %s"
+                                       % (threading.current_thread().name, " < ".join(chain)))
+
+    def acquire(self, blocking=True, timeout=-1):
+        if blocking:                  # a non-blocking try never waits, so it never stalls a loop: allowed anywhere
+            self._check()
+        return self._lock.acquire(blocking, timeout)
+
+    def release(self):
+        self._lock.release()
+
+    def locked(self):
+        return self._lock.locked()
+
+    def __enter__(self):
+        self._check()
+        self._lock.acquire()
+        return True
+
+    def __exit__(self, *exc):
+        self._lock.release()
+        return False
+
+
+# ---------------------------------------------------------------------------
 # The backend.
 # ---------------------------------------------------------------------------
 
@@ -11585,13 +11766,14 @@ class SdkBackend:
         self._seed_writes: dict = {}              # tok → {sid, value, prior, priorTok}: set_model's optimistic
         #                                             writes to the SHARED sdk-defaults `model`, pending the
         #                                             CLI's verdict (see _seed_write_pending); under _defaults_lock
-        self._reg_lock = threading.Lock()         # serializes _update_reg read-modify-writes (queue mirror
-        #                                           writes come from kernel AND loop threads)
-        # hostAck writes OFF the session loops (2026-10-09): sid -> session whose ack is due, drained by one writer
-        # thread per backend (_host_ack_writer); see _write_host_ack for why the loop thread must never wait on _reg_lock
-        self._host_ack_due: dict = {}
-        self._host_ack_lock = threading.Lock()
-        self._host_ack_thread = None
+        self._reg_lock = _RegLock()               # serializes _update_reg read-modify-writes (kernel threads and the
+        #                                           registry writer below; never a session loop: see _RegLock)
+        # Registry work queued by session loops (2026-10-09; _reg_job): key -> callable, run in order by one writer
+        # thread per backend (_reg_writer_run). A keyed entry (hostAck, a mirror) coalesces in place; None keys never do.
+        self._reg_jobs: "collections.OrderedDict" = collections.OrderedDict()
+        self._reg_jobs_lock = threading.Lock()
+        self._reg_jobs_seq = 0
+        self._reg_writer = None
         self._pending_ask: dict[str, bool] = {}   # sid -> has an ask awaiting answer
         self._live: dict[str, dict] = {}          # sid -> {key -> atom}: the in-memory LIVE TAIL (ahead of disk)
         self._live_rev: dict[str, int] = {}       # sid -> count of changes to its live tail (add/edit/drop/flag):
@@ -12447,15 +12629,15 @@ class SdkBackend:
         once a second, and always on detach. Acknowledged means received by this process, not persisted:
         derived state is rebuilt from the transcript and the journal anyway.
 
-        The per-record call (the transport's on_ack) NEVER writes on the calling thread (2026-10-09). It runs on the
-        session's own loop thread, inside the record hand-over the SDK's reader pulls, and that loop is the only place
-        the session's hook callbacks are answered. _update_reg takes _reg_lock, one lock for EVERY session's registry
-        read-modify-write, so a loop waiting there answered no hook at all for as long as other threads kept the lock
-        busy: sessions lost every prompt, tool and stop hook to the CLI's 540 s deadline (subagent hooks to its 180 s
-        one) for up to 90 minutes, and a stack read of the live kernel found 18 of its 34 session threads parked on this
-        call. So the call only marks the session due and returns; one writer thread per backend (_host_ack_writer) does
-        the write, reading the session's transport under the lock, so a session that has left its host writes nothing.
-        `force` (the detach path's last ack, as the session leaves its loop) still writes before it returns."""
+        The per-record call (the transport's on_ack) runs on the session's own loop thread, inside the record hand-over
+        the SDK's reader pulls, and that loop is the only place the session's hook callbacks are answered. Written there,
+        through _update_reg and the one registry lock every session shares, a busy lock stopped the loop: sessions lost
+        every prompt, tool and stop hook to the CLI's 540 s deadline (subagent hooks to its 180 s one) for up to 90
+        minutes, and a stack read of the live kernel found 18 of its 34 session threads parked on this call (2026-10-09).
+        So the write goes through _reg_job: queued for the registry writer when called on a session loop, made at once
+        anywhere else. The per-record write reads the session's transport under the lock, so a session that has left its
+        host writes nothing stale. `force` (the detach path's last ack) captures its values NOW, while the transport is
+        still the session's, under the same queue key, so it replaces any per-record write still queued for the session."""
         t = sess._host
         if t is None or getattr(t, "hello", None) is None or getattr(t, "exit_info", None) is not None:
             return                # no host, no hello yet, or a host that reported its exit (its ack is history)
@@ -12464,30 +12646,57 @@ class SdkBackend:
             return
         sess._host_ack_t = now
         if force:
-            self._write_host_ack_now(sess)
+            fields = self._host_ack_fields(t)
+            self._reg_job(("hostAck", sess.sid), lambda: self._reg_write_logged(sess, "hostAck", lambda: fields))
             return
-        with self._host_ack_lock:
-            self._host_ack_due[sess.sid] = sess
-            if self._host_ack_thread is None:
-                self._host_ack_thread = threading.Thread(target=self._host_ack_writer, name="romp-host-ack",
-                                                         daemon=True)
-                self._host_ack_thread.start()
+        self._reg_job(("hostAck", sess.sid), lambda: self._write_host_ack_now(sess))
 
-    def _host_ack_writer(self) -> None:
-        """The hostAck writer: drains the due sessions, one registry write each, and exits when nothing is due (the next
-        due mark starts a fresh one), so an idle backend holds no thread. Marks that arrive while a write waits on
-        _reg_lock coalesce into one entry per session, so a busy lock costs at most one queued write per session."""
+    @staticmethod
+    def _host_ack_fields(t) -> dict:
+        h = t.hello.get("host") or {}
+        c = t.hello.get("cli") or {}
+        return {"hostAck": {"host": "%s:%s" % (h.get("pid"), h.get("start")),
+                            "cli": "%s:%s" % (c.get("pid"), c.get("start")), "offset": int(t.ack_offset)}}
+
+    def _reg_write_logged(self, sess, what: str, make_fields) -> None:
+        try:
+            self._update_reg_with(sess.sid, make_fields)
+        except Exception as e:
+            self._log("host (%s): %s write failed: %s" % (getattr(sess, "name", "?"), what, e))
+
+    def _reg_job(self, key, fn) -> None:
+        """Run registry work `fn` now, unless the caller is a session's loop thread (on_session_loop): there it is queued
+        for the registry writer (_reg_writer_run) and this returns at once, because a session loop that waits on
+        _reg_lock answers none of its session's hook callbacks (see SESSION_LOOP_THREAD_PREFIX). Queued work runs in the
+        order it was queued, one item at a time, on one thread, so one session's writes keep their order and the writer
+        is the only one making them. A `key` coalesces: queuing a key already waiting replaces its callable in place (the
+        mirrors and hostAck, whose latest value is the only one worth writing); key None never coalesces."""
+        if not on_session_loop():
+            fn()
+            return
+        with self._reg_jobs_lock:
+            if key is None:
+                self._reg_jobs_seq += 1
+                key = ("job", self._reg_jobs_seq)
+            self._reg_jobs[key] = fn
+            if self._reg_writer is None:
+                self._reg_writer = threading.Thread(target=self._reg_writer_run, name="romp-reg-writer", daemon=True)
+                self._reg_writer.start()
+
+    def _reg_writer_run(self) -> None:
+        """The registry writer: runs queued registry work oldest first and exits when none is left (the next queued item
+        starts a fresh one), so an idle backend holds no thread. It never holds _reg_lock across an item: each item takes
+        the lock for its own writes, as the code it came from did, so a callback inside an item cannot deadlock on it."""
         while True:
-            with self._host_ack_lock:
-                if not self._host_ack_due:
-                    self._host_ack_thread = None
+            with self._reg_jobs_lock:
+                if not self._reg_jobs:
+                    self._reg_writer = None
                     return
-                due, self._host_ack_due = self._host_ack_due, {}
-            for sess in due.values():
-                try:
-                    self._write_host_ack_now(sess)
-                except Exception as e:                # one session's failure never strands the others' acks
-                    self._log("host (%s): hostAck write failed: %s" % (getattr(sess, "name", "?"), e))
+                key, fn = self._reg_jobs.popitem(last=False)
+            try:
+                fn()
+            except Exception as e:                    # one item's failure never strands the rest
+                self._log("registry writer: queued %s write failed: %s" % (key[0], e))
 
     def _write_host_ack_now(self, sess) -> None:
         """The hostAck registry write itself, from the session's CURRENT transport, read UNDER _reg_lock (see
@@ -18600,23 +18809,38 @@ class SdkBackend:
     def _update_reg_with(self, sid: str, make_fields):
         """_update_reg with the fields computed UNDER _reg_lock: `make_fields()` returns the fields to merge, or None to
         write nothing. For a writer whose value can go stale while it waits on the lock (the deferred hostAck)."""
-        with self._reg_lock:                       # kernel + loop threads both write (queue mirror);
-            fields = make_fields()
-            if fields is None:
+        with self._reg_lock:                       # kernel threads and the registry writer both write;
+            self._reg_merge_locked(sid, make_fields)
+
+    def _update_reg_try(self, sid: str, **fields) -> bool:
+        """_update_reg WITHOUT waiting: False, and nothing written, when another thread holds _reg_lock. For a session
+        loop thread that must not wait on the lock but should write at once when it is free (the queue mirror)."""
+        if not self._reg_lock.acquire(blocking=False):
+            return False
+        try:
+            self._reg_merge_locked(sid, lambda: fields)
+        finally:
+            self._reg_lock.release()
+        return True
+
+    def _reg_merge_locked(self, sid: str, make_fields) -> None:
+        """The read-modify-write itself; the caller holds _reg_lock."""
+        fields = make_fields()
+        if fields is None:
+            return
+        reg = read_reg(self.state_dir, sid)    # unserialized RMWs would drop fields
+        if reg is None:
+            if not _reg_absent_for_write(_reg_path(self.state_dir, sid)):
+                # the reg EXISTS but would not read: writing {sid}+fields here GUTS it — no
+                # alive, no name — and a gutted reg vanishes from every listing until a full
+                # rewrite (the 2026-08-31 blink class). Losing one mirror update is the far
+                # smaller harm: the next update lands on the healed read.
+                sys.stderr.write("update_reg: %s unreadable — skipping a %s write rather than "
+                                 "gutting the reg\n" % (sid[:8], "/".join(sorted(fields))))
                 return
-            reg = read_reg(self.state_dir, sid)    # unserialized RMWs would drop fields
-            if reg is None:
-                if not _reg_absent_for_write(_reg_path(self.state_dir, sid)):
-                    # the reg EXISTS but would not read: writing {sid}+fields here GUTS it — no
-                    # alive, no name — and a gutted reg vanishes from every listing until a full
-                    # rewrite (the 2026-08-31 blink class). Losing one mirror update is the far
-                    # smaller harm: the next update lands on the healed read.
-                    sys.stderr.write("update_reg: %s unreadable — skipping a %s write rather than "
-                                     "gutting the reg\n" % (sid[:8], "/".join(sorted(fields))))
-                    return
-                reg = {"sid": sid}
-            reg.update(fields)
-            write_reg(self.state_dir, sid, reg)
+            reg = {"sid": sid}
+        reg.update(fields)
+        write_reg(self.state_dir, sid, reg)
 
     def _reg_for_flip(self, sid: str):
         """The RMW base for a VISIBILITY FLIP (kill/resume/promote) when the disk read fails but

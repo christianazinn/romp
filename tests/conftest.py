@@ -66,11 +66,35 @@ def pytest_sessionfinish(session, exitstatus):
     behind, so nothing is swept from under a fixture still closing. The package's atexit hook does the
     same at interpreter exit; both are idempotent, and pytest_unconfigure below takes the root itself
     afterwards."""
+    _fail_on_reg_lock_guard_hits(session)
     try:
         from tests import remove_made_dirs
     except Exception:
         return
     remove_made_dirs()
+
+
+def _fail_on_reg_lock_guard_hits(session):
+    """A session loop thread that waited on the registry lock fails the run even when a handler swallowed the guard's
+    raise (sdk_backend._RegLock appends every hit to ROMP_REG_LOCK_GUARD_LOG). Read in the process that owns the file,
+    before the run's directories are removed."""
+    path = os.environ.get("ROMP_REG_LOCK_GUARD_LOG") or ""
+    if not path or not os.path.isfile(path) or os.environ.get("PYTEST_XDIST_WORKER"):
+        return
+    with open(path, encoding="utf-8") as fh:
+        hits = sorted(set(line.rstrip("\n") for line in fh if line.strip()))
+    if not hits:
+        return
+    tr = session.config.pluginmanager.get_plugin("terminalreporter")
+    lines = ["a session loop thread took the registry lock (%d distinct site(s)); move the write off the loop "
+             "(SdkBackend._reg_job):" % len(hits)] + ["  " + h[:300] for h in hits[:20]]
+    if tr is not None:
+        tr.write_sep("=", "registry lock taken on a session loop", red=True)
+        for line in lines:
+            tr.write_line(line)
+    else:
+        sys.stderr.write("\n".join(lines) + "\n")
+    session.exitstatus = pytest.ExitCode.TESTS_FAILED
 
 
 def pytest_unconfigure(config):
@@ -94,6 +118,9 @@ os.environ["GIT_AUTHOR_EMAIL"] = os.environ["GIT_COMMITTER_EMAIL"] = "tests@exam
 
 os.environ["XDG_STATE_HOME"] = tempfile.mkdtemp(prefix="romp-tests-state-")   # inside the root; the hook records it
 os.environ.pop("ROMP_STATE_DIR", None)  # a live kernel exports this to its sessions; it outranks the XDG floor
+# the registry-lock guard's hit file (see ROMP_REG_LOCK_GUARD below): one per run, in the controller's state root, which xdist
+# workers inherit; _fail_on_reg_lock_guard_hits reads it at the run's end
+os.environ.setdefault("ROMP_REG_LOCK_GUARD_LOG", os.path.join(os.environ["XDG_STATE_HOME"], "reg-lock-guard-hits.tsv"))
 # the postal bus port likewise (2026-09-11): a machine whose bus runs on a named port hands ROMP_POSTAL_PORT to every
 # session's shell, and a test run from one would carry the machine's name into every lab and in-process kernel; the
 # bus refuses its fixed port under a test unless the port is the run's own, which the marker beside a port says
@@ -110,6 +137,10 @@ os.environ["ROMP_GC_FREEZE"] = "off"   # #1735: the freeze is on live, off in th
 #                                        test interpreter's heap and leaks that state to another test; the freeze's own tests drive the
 #                                        controller directly (tests/test_gc_freeze.py), and a lab that wants it sets ROMP_GC_FREEZE=on in its
 #                                        kernel's env. tests/__init__.py carries the same line for the unittest runner
+os.environ.setdefault("ROMP_REG_LOCK_GUARD", "raise")   # 2026-10-09: a session loop thread (sdk:*) that waits on the backend's
+#                                        registry lock raises, so a hook or handler that writes the registry on the loop fails its test
+#                                        (sdk_backend._RegLock; the writers still owed are named in REG_LOCK_LOOP_WRITERS_OWED). "record"
+#                                        collects instead of raising. tests/__init__.py carries the same line for the unittest runner
 # No test spawns a per-session HOST by omission (2026-09-11, T348): hosts are on by default now, so a backend built over
 # a state dir with no `session-hosts` file starts a real bin/romp-session-host for any session it connects. The root the
 # runner floors carries the toggle set to off from the start, re-asserted per test below (a test that deletes or rewrites
