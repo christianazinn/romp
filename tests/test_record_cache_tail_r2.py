@@ -443,6 +443,193 @@ class ADanglingTargetResurrectedInTheTail(OnlyAWholeParseAnswersWhatMovesAFrozen
         self.assertEqual(self._tree(self._resurrect, boot=True), self._ref())
 
 
+class _Roads(R2Base):
+    """Helpers: the tree after a mutation (and optionally a restart), with the parse's counters, against a cold whole parse."""
+    _ref = OnlyAWholeParseAnswersWhatMovesAFrozenAtom._ref
+    _stale = OnlyAWholeParseAnswersWhatMovesAFrozenAtom._stale
+    _write = OnlyAWholeParseAnswersWhatMovesAFrozenAtom._write
+
+    def _go(self, mutate, boot=False):
+        with T.knobs(WINDOW, 4, roots=[str(self.proj)]):
+            self.restored()
+            mutate()
+            if boot:
+                self._reset()
+            s0 = dict(em._ASM_STATS)
+            tree = self.parse()
+            d = {k: v - s0.get(k, 0) for k, v in em._ASM_STATS.items() if v != s0.get(k, 0)}
+            em.hydrate(tree, SID)
+            got = T._strip_tree(tree)
+        return d, got
+
+    def _boundary(self, k, t):
+        return [{"type": "system", "subtype": "compact_boundary", "uuid": "xb%d" % k, "parentUuid": None,
+                 "logicalParentUuid": self.parent, "timestamp": iso(t),
+                 "compactMetadata": {"trigger": "auto", "preTokens": 160000, "postTokens": 9000}},
+                {"type": "user", "uuid": "xs%d" % k, "parentUuid": "xb%d" % k, "timestamp": iso(t + 1), "isCompactSummary": True,
+                 "message": {"role": "user", "content": "summary so far: %d" % k}}]
+
+    def _orphan(self, u, parent, t):
+        return {"type": "user", "uuid": u, "parentUuid": parent, "timestamp": iso(t), "isCompactSummary": True,
+                "message": {"role": "user", "content": "summary so far: an orphan %s" % u}}
+
+
+class TheSecondReviewsShapes(_Roads):
+    """Second review of 2026-10-08 (N1 to N4): each gives the cold whole parse's tree. On c8219856f: N1 and N2 keep the old
+    summary at the pre-cut card (the orphan rule ran on an append's first hit only), N3 the same at a boot, N4 and N4b keep a
+    prompt where the cold parse puts the compaction card (the restore read user and assistant stamps only)."""
+
+    def _stale_compaction(self):
+        recs = self._boundary(1, self.t)                  # the boundary alone stamped inside turn 150, before the document's
+        recs[0]["timestamp"] = iso(NOW - 86400 + 150 * 60 + 30)   # watermark; its summary and the next turn current
+        self._write(recs)
+        self.parent = recs[-1]["uuid"]
+        self.append()
+
+    def test_n4_a_compaction_stamped_before_the_watermark(self):
+        self.assertEqual(self._go(self._stale_compaction)[1], self._ref())
+
+    def test_n4b_the_same_at_a_boot(self):
+        d, got = self._go(self._stale_compaction, boot=True)
+        self.assertEqual(d.get("restore:stampRefused"), 1, d)
+        self.assertEqual(got, self._ref())
+
+    def test_n1_a_duplicate_then_an_orphan_summary(self):
+        def mutate():
+            recs = self.append()
+            self.parse()
+            self._write([recs[-1], self._orphan("o1", recs[-1]["uuid"], self.t + 5)])
+            self.parent, self.t = "o1", self.t + 10
+            self.append()
+        d, got = self._go(mutate)
+        self.assertEqual(d.get("g:summary:orphan"), 1, "the rest of the append was read: %r" % d)
+        self.assertEqual(got, self._ref())
+
+    def test_n2_a_compaction_then_an_orphan_summary_stamped_before_it(self):
+        def mutate():
+            b = self._boundary(2, self.t + 20)            # the orphan chains on the new summary (no boundary), stamped after the
+            self._write(b + [self._orphan("o2", b[-1]["uuid"], self.t + 10)])   # watermark and before the new boundary
+        d, got = self._go(mutate)
+        self.assertEqual(got, self._ref())
+
+    def test_n3_a_boot_restore_over_an_orphan_summary(self):
+        def mutate():
+            self._write([self._orphan("o3", self.parent, self.t)])
+            self.parent, self.t = "o3", self.t + 5
+            self.append()
+        d, got = self._go(mutate, boot=True)
+        self.assertEqual(d.get("restore:summaryRefused"), 1, d)
+        self.assertEqual(got, self._ref())
+
+
+class APreCutTwinAndPayload(_Roads):
+    """A typed slash command's raw twin (u10, promptId pid-pre) and a Skill payload record (u12, linked to toolu_pre_sk) before
+    the cut. A command wrapper wearing pid-pre, or a Skill tool_use on toolu_pre_sk, in the tail re-classifies the pre-cut record:
+    only a whole parse answers it. After a compaction in the same append, the rest of the append is read (the demotion is named
+    promptid or skill-link and no restore is attempted: these fail with _asm_rest_whole's body removed); at a boot, the restore
+    refuses it from the document's pre-cut gate sets. On c8219856f the boot cases restore a different tree (163 against 162 and
+    164 against 163 turns)."""
+    WRAP = "<command-name>/review</command-name>\n<command-message>review</command-message>\n<command-args></command-args>"
+
+    def setUp(self):
+        super().setUp()
+        for r in self.recs:
+            if r.get("uuid") == "u10":
+                r["promptId"] = "pid-pre"
+                r["message"]["content"] = "/review"
+            if r.get("uuid") == "u12":
+                r["sourceToolUseID"] = "toolu_pre_sk"
+                r["message"]["content"] = "instructions for the deploy skill"
+        Path(self.path).write_text("".join(json.dumps(x) + "\n" for x in self.recs))
+
+    def _wrapper(self, parent):
+        return {"type": "user", "uuid": "wr1", "parentUuid": parent, "timestamp": iso(self.t + 40), "promptId": "pid-pre",
+                "cwd": "/w/notes-api", "message": {"role": "user", "content": self.WRAP}}
+
+    def _skill(self, parent):
+        return {"type": "assistant", "uuid": "sk1", "parentUuid": parent, "timestamp": iso(self.t + 50), "cwd": "/w/notes-api",
+                "message": {"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_pre_sk", "name": "Skill",
+                                                               "input": {"skill": "deploy"}}], "stop_reason": "tool_use"}}
+
+    def _after_compaction(self, rec):
+        def mutate():
+            recs = tail_turn(self.k, self.parent, self.t, boundary=True)
+            self._write(recs + [rec(recs[-1]["uuid"])])
+        return mutate
+
+    def test_a_wrapper_after_a_compaction(self):
+        d, got = self._go(self._after_compaction(self._wrapper))
+        self.assertEqual((d.get("g:promptid"), d.get("restore:afterDemote")), (1, None), d)
+        self.assertEqual(got, self._ref())
+
+    def test_a_skill_link_after_a_compaction(self):
+        d, got = self._go(self._after_compaction(self._skill))
+        self.assertEqual((d.get("g:skill-link"), d.get("restore:afterDemote")), (1, None), d)
+        self.assertEqual(got, self._ref())
+
+    def test_a_wrapper_at_a_boot(self):
+        d, got = self._go(lambda: self._write([self._wrapper(self.parent)]), boot=True)
+        self.assertEqual(d.get("restore:promptIdRefused"), 1, d)
+        self.assertEqual(got, self._ref())
+
+    def test_a_skill_link_at_a_boot(self):
+        d, got = self._go(lambda: self._write([self._skill(self.parent)]), boot=True)
+        self.assertEqual(d.get("restore:skillRefused"), 1, d)
+        self.assertEqual(got, self._ref())
+
+
+class ARefusedStampHeals(_Roads):
+    """Second review (3): a restore refused for a stamp left the document as it was, so an idle leaf paid the refusal and a
+    whole parse at every boot. Now the whole parse after the refusal rewrites the document (write:afterRefusal), and the next
+    boot restores from it: no refusal, no whole parse, the cold parse's tree. On c8219856f the next boot refuses again.
+    (The writer keeps stamps in order across its cut, so a record stamped early but written last puts the new cut before it:
+    the tail past that cut is long, the entry is not released in this process, and an idle leaf's restored entry holds that
+    tail until later turns let the cut move past the record.)"""
+
+    def test_the_next_boot_restores(self):
+        with T.knobs(WINDOW, 4, roots=[str(self.proj)]):
+            tree = self.parse()
+            self.assertTrue(em.asm_checkpoint_write(self.path, SID, tree=tree))
+            del tree
+            self._write(self._stale(self.parent, 9))
+            old = time.time() - 600
+            os.utime(self.path, (old, old))               # idle: nothing appends after this
+            self._reset()
+            s0 = dict(em._ASM_STATS)
+            km._parse(self.path, SID, NOW)                # boot one
+            d1 = {k: v - s0.get(k, 0) for k, v in em._ASM_STATS.items() if v != s0.get(k, 0)}
+            self.assertEqual(d1.get("restore:stampRefused"), 1, d1)
+            self.assertEqual(d1.get("write:afterRefusal"), 1, d1)
+            self._reset()
+            s0 = dict(em._ASM_STATS)
+            tree = self.parse()                           # boot two
+            d2 = {k: v - s0.get(k, 0) for k, v in em._ASM_STATS.items() if v != s0.get(k, 0)}
+            self.assertEqual((d2.get("restore"), d2.get("full", 0), d2.get("restore:stampRefused")), (1, 0, None), d2)
+            em.hydrate(tree, SID)
+            got = T._strip_tree(tree)
+        self.assertEqual(got, self._ref())
+
+
+class TheDanglingShortCut(_Roads):
+    """The dangling target's own demotion takes the whole parse without a restore attempt (the chain proof would refuse it too,
+    so the tree alone cannot tell): pinned by its counters."""
+    _resurrect = ADanglingTargetResurrectedInTheTail._resurrect
+
+    def setUp(self):
+        super().setUp()
+        for r in self.recs:
+            if r.get("uuid") == "b40":
+                real = r["logicalParentUuid"]
+                r["logicalParentUuid"] = "ghost40"
+                r["compactMetadata"]["preservedSegment"] = {"tailUuid": real, "anchorUuid": real, "headUuid": real}
+        Path(self.path).write_text("".join(json.dumps(x) + "\n" for x in self.recs))
+
+    def test_no_restore_is_attempted(self):
+        d, got = self._go(self._resurrect)
+        self.assertEqual((d.get("g:dangling"), d.get("restore:chainRefused")), (1, None), d)
+        self.assertEqual(got, self._ref())
+
+
 SID2 = "aaaaaaaa-4444-4222-8333-666666666666"
 
 
@@ -479,6 +666,33 @@ class TheConvergePassReachesALeafLargerThanItsBudget(R2Base):
             self.assertTrue(em._asm_ckpt_file(small).exists(), "the leaf behind it was not held")
             self.assertEqual(written, 2)
             self.assertEqual(em.asm_whole_entries(), [], "both whole entries released")
+
+
+class TheConvergePassDoesNotStopAtALeafTooLarge(R2Base):
+    """Second review (4): the small leaf behind a leaf over the budget is written in the FIRST pass (the large one is owed and
+    skipped); with the old break back, the small leaf waits. Then the owed leaf takes the next cycle alone."""
+
+    def test_one_pass(self):
+        small = str(self.proj / (SID2 + ".jsonl"))
+        Path(small).write_text("".join(json.dumps(r) + "\n" for r in transcript(NOW - 86400, turns=100, compact_every=40)))
+        old = time.time() - 600
+        for p in (self.path, small):
+            os.utime(p, (old, old))
+        est = max(4096, os.path.getsize(self.path) // 64)
+        with T.knobs(WINDOW, 4, roots=[str(self.proj)]):
+            km._parse(self.path, SID, NOW)
+            km._parse(small, SID2, NOW)
+            for name, val in (("CKPT_CONVERGE_MS", 5000.0), ("CKPT_CONVERGE_BYTES", est - 1), ("ASM_CONVERGE", True)):
+                saved = getattr(km, name); setattr(km, name, val); self.addCleanup(setattr, km, name, saved)
+            for t in (km._ASM_CONVERGE_DONE, km._ASM_CONVERGE_BLIP, km._ASM_CONVERGE_NOENTRY, getattr(km, "_ASM_CONVERGE_OWED", {})):
+                t.clear()
+            km._begin_checkpoint_cycle()
+            km._converge_assembly(time.time(), time.monotonic())
+            self.assertTrue(em._asm_ckpt_file(small).exists(), "the small leaf was written in the first pass")
+            self.assertFalse(em._asm_ckpt_file(self.path).exists(), "the large one waits a cycle (owed)")
+            km._begin_checkpoint_cycle()
+            km._converge_assembly(time.time(), time.monotonic())
+            self.assertTrue(em._asm_ckpt_file(self.path).exists(), "the owed leaf took the next cycle alone")
 
 
 class TheHydrationMemoKeepsWhatAtomsRead(unittest.TestCase):
