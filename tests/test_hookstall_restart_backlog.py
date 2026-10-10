@@ -221,6 +221,8 @@ class Review1ScenariosQueuedFinal(_Adapted):
             order = [k[0] for k in list(self.be._reg_jobs)]
             blk.release()
         self.assertEqual(r, 13)
+        # both are read-position saves (review 5): the final joins the END of the saves block, behind the per-record
+        # job queued before it, so the order holds whether or not hostAckFinal is one of REG_ACK_KEYS
         self.assertEqual(order, ["hostAck", "hostAckFinal"], order)
         self._assert_each_once("4242:h1", 6, 13)
         self._assert_monotonic_per_host()

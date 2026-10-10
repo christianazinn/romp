@@ -11828,9 +11828,11 @@ def _host_ack_backwards(old, new) -> bool:
 # that fires: Stop, the scheduling, ledger, failure and facts hooks, a rewind completion) grows while the lock is stuck,
 # each item a few hundred bytes since hooks copy only the fields they record. Past this many items the writer logs once.
 REG_JOBS_WARN = 2000
-# Registry writer queue keys of the read-position saves (hostAck): a block at the queue's head that the writer alternates
-# with everything else (SdkBackend._reg_job, _reg_pick_locked; review 5)
-REG_ACK_KEYS = frozenset({"hostAck"})
+# Registry writer queue keys of the read-position saves: the per-record hostAck and a reconnecting leave's hostAckFinal (a
+# final left at the back waited behind the session's own backlog, and a restart before the new host's hello lost it:
+# review 5, must-fix 3). A block at the queue's head that the writer alternates with everything else (SdkBackend._reg_job,
+# _reg_pick_locked; review 5)
+REG_ACK_KEYS = frozenset({"hostAck", "hostAckFinal"})
 
 # A host exit the kernel asked for, or the host's own idle grace: hostAck and the host's directory are dropped
 # (_host_ended). Any other cause (died, crash, lost) keeps them, and the departed host's last offset is written.
