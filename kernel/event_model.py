@@ -981,6 +981,10 @@ _CKPT_DIR_FN = None               # () -> Path of the checkpoint directory; None
 _CKPT_STATS = {"restored": 0, "writes": 0, "swept": 0, "skippedFolds": 0, "fallbacks": {}, "restoredFolds": {}, "droppedRestores": 0,
                "docConsults": 0,      # fold documents loaded by the shared validated read (seeded: the key stands before the first load)
                "oversizeFolds": {}, "coldFolds": {}, "coldWrites": {},
+               "cursorOutside": {},   # per fold name: restores refused because the document's cursor (or its cut) lay outside the
+#                                       reader entry's held records (2026-10-10: silent before; each such fold then refolded)
+               "refoldWalks": {},     # per fold name: {"count", "records"} of every refold's walk from record 0, a walk that read
+#                                       nothing (the entry already indexed from 0) included; `refolds` counts only the ones that read
                "refolds": {},         # per fold name: {"count", "bytes"} of whole refolds that READ (a fold with no cursor and nothing to
 #                                       restore over a tail entry reads the file whole; T377 named the boot's whole reads this way)
                "converge": {"passes": 0, "writes": 0, "bytes": 0, "heals": 0, "healBytes": 0, "primed": 0, "deferred": 0,
@@ -1076,6 +1080,8 @@ _DROP_KEPT = set()                # the paths whose drop is held for that reason
 _CKPT_LOCK = threading.Lock()
 _CKPT_PENDING = {}                # path -> {"count": N, "gen": g, "folds": {name: {"count", "state"}}} restores not yet taken
 _CKPT_SEQ = {}                    # path -> the seq of the last checkpoint read or written for it
+_CKPT_OUTSIDE = {}                # path -> the fold names of a document whose cut lay outside the reader entry's held records
+#                                   (_ckpt_pending), each counted once under cursorOutside by its fold's _restored_cursor
 _FOLD_DIRTY = set()               # paths whose fold cursors moved since their checkpoint was last written
 _FOLD_REG = {}                    # checkpoint name -> the fold's cursor dict (fold_records registers at first call)
 _GEN = [0]                        # the reader's generation counter: every from-zero read and every restored entry takes the
@@ -1192,6 +1198,7 @@ def set_checkpoint_dir(fn):
         _ASM_DOC_MEMO.clear(); _ASM_DOC_MEMO_BYTES[0] = 0   # nor does a memoized assembly document, the seeded walk's or the restore's (round two)
     with _CKPT_LOCK:
         _CKPT_PENDING.clear(); _CKPT_SEQ.clear(); _FOLD_DIRTY.clear(); _CKPT_DOC_FOLDS.clear(); _DROP_OWED.clear(); _DROP_KEPT.clear()
+        _CKPT_OUTSIDE.clear()
         _RETIRED_FOLDS.clear()                            # a retirement never outlives a state rebind (round two, low 2)
         _DOC_MEMO.clear(); _DOC_MEMO_BYTES[0] = 0         # nor does a memoized document (the harnesses' fresh process is this setter)
         _CKPT_CYCLE["cap"] = _ckpt_cycle_default_cap(); _CKPT_CYCLE["spent"] = 0
@@ -1323,6 +1330,46 @@ def _checkpoint_entry(path, st):
     return (float(doc.get("mtime") or 0), int(doc["size"]), offset, bytes.fromhex(doc.get("guard") or ""), [], count, gen)
 
 
+def _entry_start(path, cut):
+    """Where a restore that reads `path` from the assembly document's cut `cut` (byte offset, record count, guard bytes)
+    starts the reader's entry: the EARLIER of that cut and the file's fold document's cut, so every fold the document
+    carries resumes over the entry (2026-10-10). The fold document's cut is the lowest cursor it wrote; on 7 of 8 big live
+    transcripts it lay a few hundred records before the assembly cut (each written at its own event), and an entry begun at
+    the assembly cut held none of the records from there, so each fold's restore found its cursor outside the held records
+    and the fold read the whole file and walked every record from 0. The assembly keeps its own cut: the adapter and the
+    chain proof ingest from it over an entry that starts earlier (FileAdapter, _tail_chains_over). The fold document is read
+    through the shared memo (no fresh read when a consult already loaded it); its cut is taken only when the stat stands for
+    it and its guard bytes verify on disk (one 64-byte read), else the assembly cut alone, so a stale fold document never
+    turns the assembly's restore into a whole read. No read at all when the reader's entry already holds the fold's cut."""
+    if _CKPT_DIR_FN is None:
+        return cut
+    key = str(path)
+    doc = _ckpt_doc_shared(key)
+    if doc is None:
+        return cut
+    try:
+        off, count, guard = int(doc["offset"]), int(doc["count"]), bytes.fromhex(doc.get("guard") or "")
+    except (KeyError, TypeError, ValueError):
+        return cut
+    if count >= int(cut[1]) or off >= int(cut[0]) or count <= 0:
+        return cut                                        # the assembly cut is the earlier (or the fold's is the file's start)
+    with _JSONL_CACHE_LOCK:
+        hit = _JSONL_CACHE.get(key)
+    if hit is not None and hit[5] <= count:
+        return (off, count, guard)                        # the entry holds it already: the reader serves or extends it, no guard
+    try:
+        st = os.stat(key)
+        if _ckpt_verdict(doc, st.st_size, st.st_mtime) is not None:
+            return cut                                    # the fold document's own restore will name the verdict; not here
+        with open(key, "rb") as fh:
+            fh.seek(max(0, off - len(guard)))
+            ok = fh.read(len(guard)) == guard
+        _count_read(key, len(guard))
+    except OSError:
+        return cut
+    return (off, count, guard) if ok else cut
+
+
 def _ckpt_pending(path, ent):
     """The restores waiting for `path`'s folds, given the reader's current entry: the ones a tail restore left, or,
     when a whole reader read the file first (the entry holds every record and no restore happened), the checkpoint's
@@ -1358,11 +1405,14 @@ def _ckpt_pending(path, ent):
     if not ok:
         _ckpt_fallback(path, "guard", "whole reader first"); return None
     if count < ent[5] or count > ent[5] + len(ent[4]):
+        folds = doc.get("folds") if isinstance(doc.get("folds"), dict) else {}
         with _CKPT_LOCK:
             _CKPT_SEQ[key] = int(doc.get("seq") or 0)
+            _CKPT_OUTSIDE[key] = set(folds)               # counted per fold as each asks (_restored_cursor): no longer silent
         return None                                       # the fold's count is outside the held records: a cold fold, no fallback
     pend = {"count": count, "gen": ent[6], "folds": _pending_folds(doc)}
     with _CKPT_LOCK:
+        _CKPT_OUTSIDE.pop(key, None)
         _CKPT_PENDING[key] = pend
         _CKPT_SEQ[key] = int(doc.get("seq") or 0)
         _CKPT_STATS["restored"] += 1
@@ -1383,6 +1433,13 @@ def _restored_cursor(key, name, ent):
     the current entry can resume from; None otherwise. Each fold's restore is taken once."""
     pend = _ckpt_pending(key, ent)
     if pend is None:
+        with _CKPT_LOCK:
+            outside = _CKPT_OUTSIDE.get(key)
+            mine = outside is not None and name in outside
+            if mine:
+                outside.discard(name)
+        if mine:                                          # the document's cut lay outside the entry's held records
+            _cursor_outside(key, name, "the document's cut lies outside the reader entry's records %d..%d" % (ent[5], ent[5] + len(ent[4])))
         return None
     f = pend["folds"].pop(name, None)
     if not isinstance(f, dict):
@@ -1399,6 +1456,7 @@ def _restored_cursor(key, name, ent):
                 pass
             return None
         if count < base or count > base + len(ent[4]):
+            _cursor_outside(key, name, "its cursor %d lies outside the reader entry's records %d..%d" % (count, base, base + len(ent[4])))
             return None                                   # a fold's count may differ from the document's cut (T359: the cut is the
         if "state" not in f:                              #  lowest written cursor): inside the entry's held records it is an append
             reason = "over" if f.get("over") else "cold"  #  from there; outside them it is nothing to resume from
@@ -1425,6 +1483,15 @@ def _restored_cursor(key, name, ent):
         return (count, ent[6], state)
     except (KeyError, TypeError, ValueError) as e:
         _ckpt_fallback(key, "corrupt", "fold %s: %s" % (name, e)); return None
+
+
+def _cursor_outside(key, name, why):
+    """A fold's restore refused because its cursor lay outside the reader entry's held records: counted under
+    checkpoints.cursorOutside per fold and said once on stderr (2026-10-10: this return was silent, and the fold that met it
+    read the file whole and walked every record from 0, about a million records per big transcript per fold)."""
+    with _CKPT_LOCK:
+        _CKPT_STATS["cursorOutside"][name] = _CKPT_STATS["cursorOutside"].get(name, 0) + 1
+    _say_once("checkpoint: fold %s of %s refolds from record 0: %s" % (name, key, why))
 
 
 _CKPT_LAG_FLOOR = 64                # a fold's count may lag the entry's by this many records, or an eighth of the entry, whichever
@@ -1919,6 +1986,8 @@ def checkpoint_stats():
         out["oversizeFolds"] = dict(_CKPT_STATS["oversizeFolds"]); out["coldFolds"] = dict(_CKPT_STATS["coldFolds"])
         out["coldWrites"] = dict(_CKPT_STATS["coldWrites"]); out["converge"] = dict(_CKPT_STATS["converge"])
         out["refolds"] = {k: dict(v) for k, v in _CKPT_STATS["refolds"].items()}
+        out["refoldWalks"] = {k: dict(v) for k, v in _CKPT_STATS["refoldWalks"].items()}
+        out["cursorOutside"] = dict(_CKPT_STATS["cursorOutside"])
         out["rewoundMemo"] = dict(_REWOUND_STATS)
         out["docMemo"] = {"entries": len(_DOC_MEMO), "bytes": _DOC_MEMO_BYTES[0], "capBytes": _DOC_MEMO_CAP,
                           "parseMultiple": _DOC_MEMO_PARSE_MULTIPLE}
@@ -3449,6 +3518,9 @@ def fold_records(cache, path, init, step, on=None, ckpt=None, drop_after=None, s
                     rf = _CKPT_STATS["refolds"].setdefault(ckpt, {"count": 0, "bytes": 0})   #  and weighed per fold on /perf (T377).
                     rf["count"] += 1; rf["bytes"] += got   #  Diagnostic: the delta is over the path's process-wide counter, so another
         #                                                    thread's read of the same file inside this call lands in it
+                rw = _CKPT_STATS["refoldWalks"].setdefault(ckpt, {"count": 0, "records": 0})   # the walk from record 0, whether
+                rw["count"] += 1; rw["records"] += len(recs)   #  or not it read (2026-10-10): a refold over an entry already indexed
+                #                                                from 0 reads nothing, so `refolds` missed it, and still walks all
     if not step_reads:
         if start < len(recs):
             state = step(state, None)                     # appended records: the step once, whatever they hold
@@ -4084,7 +4156,9 @@ class FileAdapter:
                     self._src_stat[str(fp)] = tuple(st_skip)
                 continue
             if cut is not None:
-                ent = _read_jsonl_entry(fp, tail_ok=True, tail_from=tuple(cut))
+                ent = _read_jsonl_entry(fp, tail_ok=True, tail_from=_entry_start(fp, tuple(cut)))   # from the earlier of the
+            #                                              assembly cut and the fold document's, so the folds resume over the entry;
+            #                                              the slice below still ingests from the assembly cut (2026-10-10)
             else:
                 ent = _read_jsonl_entry(fp, tail_ok=False)
             recs = ent[4] if ent is not None else []
@@ -8716,7 +8790,11 @@ def _tail_chains_onto_the_document(leaf_path, doc, assume_childless=False, walk_
     cut = f.get("cut")
     if not cut or f.get("skip"):
         return True
-    ent = _read_jsonl_entry(leaf_path, tail_ok=True, tail_from=(int(cut[0]), int(cut[1]), bytes.fromhex(cut[2])))
+    ent = _read_jsonl_entry(leaf_path, tail_ok=True,
+                            tail_from=_entry_start(leaf_path, (int(cut[0]), int(cut[1]), bytes.fromhex(cut[2]))))
+    #                                                     the earlier of the assembly cut and the fold document's (2026-10-10):
+    #                                                     whichever of the two reads comes first starts the entry where the folds
+    #                                                     resume; _tail_chains_over slices the tail from the assembly cut
     recs = ent[4] if ent is not None else []
     if walk_only and type(recs) is _TailRecords and _walk_ready(recs):
         try:                                              # the graph fields of the records between the cut and the window from

@@ -176,6 +176,207 @@ class RoutineCallersReadNothingBeforeTheWindow(R2Base):
         self._passes(lambda i: km._bg_placed_tops(SID, self.path, ("toolu_none_%d" % i,)), "_bg_placed_tops")
 
 
+def _upgrades():
+    """{"upgrade<-caller": count} of the reader's whole reads that upgraded a tail entry to the whole file, so far."""
+    table = em._RECORD_CACHE_STATS.get("wholeReads") or {}
+    return {k: v["count"] for k, v in table.items() if k.startswith("upgrade<-")}
+
+
+def _ckpt_counter(name, fold):
+    """A per-fold checkpoint counter's value for `fold` (0 when the counter or the fold is absent)."""
+    v = em.checkpoint_stats().get(name) or {}
+    v = v.get(fold, 0)
+    return v.get("count", 0) if isinstance(v, dict) else v
+
+
+class FoldsResumeOverARestoredAssemblyEntry(R2Base):
+    """A fold document whose cut lies BEFORE the assembly document's (the live shape on 7 of 8 big transcripts, 2026-10-09: a
+    background-task cursor a few hundred records behind the assembly cut). The parse's restore created the leaf's tail entry at
+    the assembly cut, the fold's cursor lay before the entry's first held record, the restore returned nothing without a word,
+    and the fold read the file whole and walked every record from 0 (an "upgrade" whole read, one refold). Now the entry starts
+    at the earlier of the two cuts and the fold resumes over the gap. RoutineCallersReadNothingBeforeTheWindow misses this: its
+    first call sets the cursors in-process, so no fold ever resumes from a document there."""
+
+    def append_bg(self, tid):
+        """One turn that launches a background shell `tid` (still running at the file's end)."""
+        k, p, t = self.k, self.parent, self.t
+        recs = [
+            {"type": "user", "uuid": "bu%d" % k, "parentUuid": p, "timestamp": iso(t), "promptSource": "typed", "cwd": "/w/notes-api",
+             "message": {"role": "user", "content": "start the slow test run %d in the background" % k}},
+            {"type": "assistant", "uuid": "bt%d" % k, "parentUuid": "bu%d" % k, "timestamp": iso(t + 5), "cwd": "/w/notes-api",
+             "message": {"role": "assistant", "stop_reason": "tool_use", "content": [
+                 {"type": "tool_use", "id": tid, "name": "Bash",
+                  "input": {"command": "make test-slow", "description": "slow tests %d" % k, "run_in_background": True}}]}},
+            {"type": "user", "uuid": "br%d" % k, "parentUuid": "bt%d" % k, "timestamp": iso(t + 6), "cwd": "/w/notes-api",
+             "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": tid,
+                                                      "content": "Command running in background with ID: b%d" % k}]}},
+            {"type": "assistant", "uuid": "ba%d" % k, "parentUuid": "br%d" % k, "timestamp": iso(t + 20), "cwd": "/w/notes-api",
+             "message": {"role": "assistant", "content": [{"type": "text", "text": "started run %d " % k + "ok " * 30}],
+                         "stop_reason": "end_turn"}},
+        ]
+        with open(self.path, "a") as f:
+            f.write("".join(json.dumps(r) + "\n" for r in recs))
+        self.parent, self.t, self.k = recs[-1]["uuid"], self.t + 120, self.k + 1
+        return recs
+
+    def _fold_doc(self):
+        return json.loads(em._ckpt_file(self.path).read_text())
+
+    def _asm_cut(self):
+        import gzip
+        with gzip.open(em._asm_ckpt_file(self.path), "rt") as f:
+            doc = json.load(f)
+        return int(doc["files"][Path(self.path).stem]["cut"][1])
+
+    def _fold_then_write(self):
+        jd._BG_SCAN_CACHE.clear()
+        jd._bg_scan(self.path)
+        self.assertTrue(em.checkpoint_write(self.path, force=True), em.checkpoint_stats())
+        return int(self._fold_doc()["folds"]["bgJudge"]["count"])
+
+    def _asm_write(self):
+        tree = self.parse()
+        self.assertTrue(em.asm_checkpoint_write(self.path, SID, tree=tree), em.asm_checkpoint_stats())
+        del tree
+        return self._asm_cut()
+
+    def _ref_tree(self):
+        with T.knobs(0, 4, roots=[str(self.proj)]):
+            self._reset()
+            saved = em._CKPT_DIR_FN; em._CKPT_DIR_FN = None
+            try:
+                return T._strip_tree(self.parse())
+            finally:
+                em._CKPT_DIR_FN = saved
+
+    def _boot_then_scan(self):
+        """A fresh boot: the parse restores from the assembly document, then the judge's background fold resumes. Returns
+        the scan's answer and what the scan cost: (answer, records read before the window by the scan, whole-read upgrades,
+        bgJudge refolds, bgJudge restores, bgJudge cursors outside the held records, the restored tree)."""
+        self._reset()
+        jd._BG_SCAN_CACHE.clear()
+        tree = self.parse()
+        key = (os.path.realpath(self.path), SID, False)
+        self.assertIsNotNone(em._ASM_CACHE[key].get("docPre"), "the parse after the restart restored from the document")
+        self.base_after_parse = em._JSONL_CACHE[self.path][5]   # where the restore started the leaf's entry
+        em.hydrate(tree, SID)
+        restored_tree = T._strip_tree(tree)
+        c0, by0 = cold()
+        up0, rf0 = _upgrades(), _ckpt_counter("refolds", "bgJudge")
+        rs0, out0 = _ckpt_counter("restoredFolds", "bgJudge"), _ckpt_counter("cursorOutside", "bgJudge")
+        got = jd._bg_scan(self.path)
+        c1, by1 = cold()
+        up1 = _upgrades()
+        return (got, by1.get("_bg_scan", 0) - by0.get("_bg_scan", 0) + (c1 - c0),
+                {k: v - up0.get(k, 0) for k, v in up1.items() if v != up0.get(k, 0)},
+                _ckpt_counter("refolds", "bgJudge") - rf0, _ckpt_counter("restoredFolds", "bgJudge") - rs0,
+                _ckpt_counter("cursorOutside", "bgJudge") - out0, restored_tree)
+
+    def _assert_resumed(self, res):
+        got, coldn, ups, refolds, restores, outside, _tree = res
+        self.assertEqual(coldn, 0, "the scan read no record before the window")
+        self.assertEqual(ups, {}, "no tail entry was upgraded to a whole read")
+        self.assertEqual(refolds, 0, "the background fold did not refold the file whole")
+        self.assertEqual(restores, 1, "the background fold resumed from its document")
+        self.assertEqual(outside, 0, "its cursor lay inside the entry's held records")
+        whole = em._scan_bg_tasks(self.path)
+        self.assertEqual(got, whole, "the resumed fold answers what a whole fold answers")
+        self.assertEqual({t["id"] for t in got}, {"toolu_bg_early", "toolu_bg_gap"}, "both launches, the gap's included")
+
+    def test_a_fold_cut_before_the_assembly_cut_resumes_over_the_gap(self):
+        with T.knobs(WINDOW, 4, roots=[str(self.proj)]):
+            self.append_bg("toolu_bg_early")
+            fold_cut = self._fold_then_write()
+            self.append_bg("toolu_bg_gap")                # launched between the fold's cut and the assembly cut
+            for _ in range(3):
+                self.append()
+            asm_cut = self._asm_write()
+            self.assertEqual(int(self._fold_doc()["folds"]["bgJudge"]["count"]), fold_cut, "the fold document stood")
+            self.assertLess(fold_cut, asm_cut - 4, "the fixture: the fold's cut lies records before the assembly cut")
+            res = self._boot_then_scan()
+            self.assertLessEqual(self.base_after_parse, fold_cut, "the restore started the entry at or before the fold's cut")
+            self._assert_resumed(res)
+            restored_tree = res[-1]
+        self.assertEqual(restored_tree, self._ref_tree(), "the assembly restore over the earlier entry equals a whole parse")
+
+    def test_a_fold_cut_after_the_assembly_cut_resumes_as_before(self):
+        with T.knobs(WINDOW, 4, roots=[str(self.proj)]):
+            self.append_bg("toolu_bg_early")
+            for _ in range(3):
+                self.append()
+            self.append_bg("toolu_bg_gap")
+            asm_cut = self._asm_write()
+            self.append()
+            fold_cut = self._fold_then_write()
+            self.assertGreater(fold_cut, asm_cut, "the control: the fold's cut lies after the assembly cut")
+            res = self._boot_then_scan()
+            self.assertEqual(self.base_after_parse, asm_cut, "the restore started the entry at the assembly cut, the earlier")
+            self._assert_resumed(res)
+            restored_tree = res[-1]
+        self.assertEqual(restored_tree, self._ref_tree(), "the assembly restore equals a whole parse")
+
+
+class ACursorOutsideTheHeldRecordsIsCounted(FoldsResumeOverARestoredAssemblyEntry):
+    """The restore's quiet refusal made loud: a fold whose document cursor lies outside the reader entry's held records is
+    counted under checkpoints.cursorOutside (per fold), and every refold's walk is counted under checkpoints.refoldWalks,
+    the one that read nothing (the entry already indexed from 0) included."""
+
+    def _gap_fixture(self):
+        self.append_bg("toolu_bg_early")
+        fold_cut = self._fold_then_write()
+        self.append_bg("toolu_bg_gap")
+        for _ in range(3):
+            self.append()
+        return fold_cut, self._asm_write()
+
+    def test_an_entry_started_after_the_documents_cut_is_counted(self):
+        with T.knobs(WINDOW, 4, roots=[str(self.proj)]):
+            fold_cut, asm_cut = self._gap_fixture()
+            self._reset()
+            jd._BG_SCAN_CACHE.clear()
+            import gzip
+            with gzip.open(em._asm_ckpt_file(self.path), "rt") as f:
+                cut = json.load(f)["files"][Path(self.path).stem]["cut"]
+            ent = em._read_jsonl_entry(self.path, tail_ok=True, tail_from=(int(cut[0]), int(cut[1]), bytes.fromhex(cut[2])))
+            self.assertEqual(ent[5], asm_cut, "an entry made at the assembly cut alone (another road than the restore)")
+            out0, rf0 = _ckpt_counter("cursorOutside", "bgJudge"), _ckpt_counter("refoldWalks", "bgJudge")
+            got = jd._bg_scan(self.path)
+            self.assertEqual(_ckpt_counter("cursorOutside", "bgJudge") - out0, 1, em.checkpoint_stats().get("cursorOutside"))
+            self.assertEqual(_ckpt_counter("refoldWalks", "bgJudge") - rf0, 1, "the walk from 0 that followed is counted")
+            self.assertEqual(got, em._scan_bg_tasks(self.path))
+
+    def test_a_fold_count_behind_its_documents_cut_is_counted(self):
+        with T.knobs(WINDOW, 4, roots=[str(self.proj)]):
+            self.append_bg("toolu_bg_early")
+            self._fold_then_write()
+            cp = em._ckpt_file(self.path)
+            doc = json.loads(cp.read_text())
+            doc["folds"]["bgJudge"]["count"] = int(doc["count"]) - 3   # a cursor behind the document's own cut (hand-made)
+            cp.write_text(json.dumps(doc))
+            self._reset()
+            jd._BG_SCAN_CACHE.clear()
+            out0 = _ckpt_counter("cursorOutside", "bgJudge")
+            got = jd._bg_scan(self.path)
+            self.assertEqual(_ckpt_counter("cursorOutside", "bgJudge") - out0, 1, em.checkpoint_stats().get("cursorOutside"))
+            self.assertEqual(got, em._scan_bg_tasks(self.path))
+
+    def test_a_refold_that_read_nothing_is_still_a_counted_walk(self):
+        with T.knobs(WINDOW, 4, roots=[str(self.proj)]):
+            self.append_bg("toolu_bg_early")
+            em._read_jsonl_entry(self.path, tail_ok=True)   # the file indexed from 0 by another reader first
+            jd._BG_SCAN_CACHE.clear()
+            rf0, w0 = _ckpt_counter("refolds", "bgJudge"), em.checkpoint_stats().get("refoldWalks", {}).get("bgJudge", {})
+            jd._bg_scan(self.path)
+            w1 = em.checkpoint_stats().get("refoldWalks", {}).get("bgJudge", {})
+            self.assertEqual(_ckpt_counter("refolds", "bgJudge") - rf0, 0, "the refold read nothing")
+            self.assertEqual(w1.get("count", 0) - w0.get("count", 0), 1, "but its walk is counted")
+            self.assertEqual(w1.get("records", 0) - w0.get("records", 0), len(self.recs) + 4, "every record walked")
+
+    # the parent's two tests run once, in the parent
+    test_a_fold_cut_before_the_assembly_cut_resumes_over_the_gap = None
+    test_a_fold_cut_after_the_assembly_cut_resumes_as_before = None
+
+
 def _decode_lines():
     """The (file, line) pairs of the reader's record decodes: a traced block allocated under one of them is a decoded record
     (the scan's, or a streaming pass's before a window)."""
