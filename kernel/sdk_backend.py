@@ -13178,7 +13178,9 @@ class SdkBackend:
             with self._reg_jobs_lock:
                 if self._reg_writer is me:
                     self._reg_writer = None
-                self._reg_running_sid = None
+                # never clears _reg_running_sid (review 4, must-fix 3): the inner finally already clears it after every
+                # item, and by now a successor writer may be running an item of some session; wiping its mark let that
+                # session's end skip waiting for the item, which then landed over the end's own writes (a lost message)
                 self._reg_jobs_cond.notify_all()
                 left = len(self._reg_jobs)
             if not clean:   # a BaseException out of an item (the items' own Exceptions are caught above): say so once here
