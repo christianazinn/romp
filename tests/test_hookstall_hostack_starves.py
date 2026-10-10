@@ -16,6 +16,10 @@ HERE = os.path.dirname(os.path.realpath(__file__))
 TREE = os.path.dirname(HERE)
 sys.path.insert(0, HERE)
 from romp_load import load_source  # noqa: E402
+# Hermetic state BEFORE the loads — they resolve their state root at import time, and only
+# pytest runs conftest's floor (a bare unittest or script run otherwise writes REAL state).
+os.environ["XDG_STATE_HOME"] = tempfile.mkdtemp()
+os.environ.pop("ROMP_STATE_DIR", None)  # a live kernel's export outranks the XDG floor
 
 sb = load_source("hookstall_sb_starve", os.path.join(TREE, "bin", "romp_sdk_backend.py"))
 SID = "11111111-2222-4333-8444-0000000000a1"
