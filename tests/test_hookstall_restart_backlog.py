@@ -253,8 +253,9 @@ class Review1ScenariosQueuedFinal(_Adapted):
 
     def test_new_host_acks_inside_throttle_leave_registry_naming_dead_host(self):
         """Same road, but H2's records all arrive inside the one-second throttle that the detach's forced call armed:
-        the per-record job queued before the detach (ahead of the final) writes H2, then the stale final writes H1 over
-        it. Shown for the record; consequence: a fresh kernel resumes H2 from -1 (a whole-journal replay)."""
+        the per-record job queued before the detach (ahead of the final) writes H2. The stale final then wrote H1 over
+        it and a fresh kernel resumed H2 from -1 (a whole-journal replay); since review 4 the queued final writes only
+        while the carry still names its host, so the registry keeps H2 and a fresh kernel resumes past what was read."""
         with _OtherWriterBlock(self.be) as blk:
             async def main():
                 t1 = self._consume_h1(6, 8, 10)
@@ -283,8 +284,8 @@ class Review1ScenariosQueuedFinal(_Adapted):
         self.s.backend = self.be
         t = asyncio.run(self.be._host_transport_for(self.s, None, None))
         print("\n[throttle-window] registry after unpark: %r; fresh kernel resumes H2 from %d" % (reg, t.ack_offset + 1))
-        self.assertEqual(reg.get("host"), "4242:h1", "expected the stale final to land last: %r" % (self.acks,))
-        self.assertEqual(t.ack_offset, -1)
+        self.assertEqual(reg.get("host"), "5151:h2", "the stale final landed last: %r" % (self.acks,))
+        self.assertEqual(t.ack_offset, 3, "a fresh kernel replays H2 from %d" % (t.ack_offset + 1))
 
     def test_fresh_kernel_after_clean_detach_with_writer_parked(self):
         """A kernel restart: the session detaches (host alive), the writer is parked on another session's work, the

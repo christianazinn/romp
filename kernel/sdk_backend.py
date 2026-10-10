@@ -12948,9 +12948,18 @@ class SdkBackend:
             self._write_host_ack_at_once(sess, fields, "the final hostAck")
             return
 
+        host = fields["hostAck"]["host"]
+
+        def current():
+            # read under _reg_lock: written only while the carry still names this host. Once a newer host has acked
+            # (the per-record hostAck goes to the front of the queue, so it can land first) or the orphan road dropped
+            # the host, this captured value is stale, and written it left the registry naming a host that is gone
+            carry = self._host_ack_carry.get(sess.sid)
+            return fields if carry is not None and carry[0] == host else None
+
         def write():
             try:
-                self._update_reg_with(sess.sid, lambda: fields)
+                self._update_reg_with(sess.sid, current)
             except Exception as e:
                 self._log("host (%s): hostAck write failed: %s" % (getattr(sess, "name", "?"), e))
         self._reg_job(("hostAckFinal", sess.sid), write)
@@ -12969,8 +12978,9 @@ class SdkBackend:
         for the registry writer (_reg_writer_run) and this returns at once, because a session loop that waits on
         _reg_lock answers none of its session's hook callbacks (see SESSION_LOOP_THREAD_PREFIX). Queued work runs in the
         order it was queued, one item at a time, on one thread, so one session's writes keep their order and the writer
-        is the only one making them. A `key` coalesces: queuing a key already waiting replaces its callable in place (the
-        mirrors and hostAck, whose latest value is the only one worth writing); key None never coalesces.
+        is the only one making them. A `key` coalesces: queuing a key already waiting replaces its callable (the mirrors
+        and hostAck, whose latest value is the only one worth writing) and moves it to the back, except the per-record
+        hostAck, which goes to the front when first queued and keeps its place after; key None never coalesces.
 
         The writer is published only once it has started, and a slot holding a thread that is not alive is replaced
         (2026-10-09, review 1: a slot stored before a failed start() stayed stuck for the kernel's life, silently, and the
@@ -12996,10 +13006,23 @@ class SdkBackend:
             if key is None:
                 self._reg_jobs_seq += 1
                 key = ("job", self._reg_jobs_seq)
-            # a re-queued key takes the new value AND the back of the line (review 2): kept in its old place, it ran
-            # ahead of work queued after the value it now carries, so an older write could land after a newer one
-            self._reg_jobs.pop(key, None)
-            self._reg_jobs[key] = fn
+            if key[0] == "hostAck":
+                # the per-record hostAck goes to the FRONT when first queued and keeps its place when re-queued (review
+                # 4, must-fix 2): sent to the back at each once-a-second re-queue, it never reached the front while the
+                # writer was over a second behind, so the saved offset stopped moving and a hard kill replayed the whole
+                # gap. Review 2's reason for the back does not apply to it: the job reads the session's current offset
+                # when it runs, and the merge refuses an older one (_reg_merge_locked). It trails by at most about one
+                # item plus the one-second throttle, whatever the backlog
+                fresh = key not in self._reg_jobs
+                self._reg_jobs[key] = fn
+                if fresh:
+                    self._reg_jobs.move_to_end(key, last=False)
+            else:
+                # any other re-queued key takes the new value AND the back of the line (review 2): kept in its old
+                # place, it ran ahead of work queued after the value it now carries, so an older write could land after
+                # a newer one
+                self._reg_jobs.pop(key, None)
+                self._reg_jobs[key] = fn
             self._reg_jobs_sid[key] = sid
             n = len(self._reg_jobs)
             if n >= REG_JOBS_WARN and not self._reg_jobs_warned:
