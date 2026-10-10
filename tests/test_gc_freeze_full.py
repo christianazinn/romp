@@ -504,7 +504,10 @@ class Knobs(unittest.TestCase):
 
 
 class Cyclic:
-    pass
+    # Slots keep a pair at two gc-tracked objects on every Python. Without them Python 3.10 tracks each instance's
+    # __dict__ as well (3.11 and later hold the attributes inline), so a pair is four objects there and the frozen-set
+    # bound, written as 2 objects per pair, failed on 3.10 alone (peak 6005 against 5600) with nothing retained.
+    __slots__ = ("o", "__weakref__")
 
 
 class RealCollector(unittest.TestCase):
