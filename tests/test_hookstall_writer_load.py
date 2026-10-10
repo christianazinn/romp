@@ -8,7 +8,10 @@ holds at a load average of 40 to 60):
 - other writes keep landing: at least half of the hook writes issued have run, and none waited 10 s or more (the
   back-of-queue tree, fb5c44b65, measured a median of about 1.6 s; with the saves at the front, 5420787e7 ran none);
 - every session's read position keeps being saved: each session's saved offset trails what it consumed by under 10 s of
-  records (fb5c44b65 saved none of them while the writer lagged; 5420787e7 never saved a few of them).
+  records (fb5c44b65 saved none of them while the writer lagged; 5420787e7 never saved a few of them);
+- every session's queue mirror (a keyed write, re-queued every 2 s: the saved message queue's shape) keeps landing: the
+  value on disk was queued under 10 s ago (sent to the back at each re-queue, it never landed once the saves took half
+  the writer).
 """
 import os
 import shutil
@@ -99,9 +102,14 @@ class WriterUnderLoad(unittest.TestCase):
             t.start()
         time.sleep(SECS)
         lags = []
+        stale = []
+        t_snap = time.monotonic()
         for sess in sessions:
-            ack = (sb.read_reg(Path(d), sess.sid) or {}).get("hostAck") or {}
+            reg = sb.read_reg(Path(d), sess.sid) or {}
+            ack = reg.get("hostAck") or {}
             lags.append(sess._host.ack_offset - int(ack.get("offset", -1)))
+            q = (reg.get("queueMirror") or {}).get("q")
+            stale.append(round(t_snap - q, 1) if q is not None else SECS)
         stop.set()
         t_end = time.monotonic()
         with lk:
@@ -112,14 +120,17 @@ class WriterUnderLoad(unittest.TestCase):
         issued = len(ran) + len(still)
         oldest = max([t_end - q for q in still] + ran + [0.0])
         print("\n[writer load] %d sessions, %.0f ms an item, %.0f s: other writes ran %d of %d, oldest wait %.2f s; "
-              "per-session save lag (records, sorted) %s" % (NSESS, ITEM_S * 1000, SECS, len(ran), issued, oldest,
-                                                            sorted(lags)))
+              "per-session save lag (records, sorted) %s; queue mirror age (s, sorted) %s"
+              % (NSESS, ITEM_S * 1000, SECS, len(ran), issued, oldest, sorted(lags), sorted(stale)))
         self.assertGreater(issued, 0)
         self.assertGreaterEqual(len(ran), issued / 2.0, "other writes starved: %d of %d ran" % (len(ran), issued))
         self.assertLess(oldest, WAIT_BOUND_S, "another write waited %.1f s" % oldest)
         trailing = [x for x in lags if x >= LAG_BOUND]
         self.assertEqual(trailing, [], "%d sessions' saved read position trails by %d or more records: %s"
                          % (len(trailing), LAG_BOUND, sorted(lags)))
+        self.assertLess(max(stale), WAIT_BOUND_S, "a session's queue mirror on disk is %.1f s old: %s"
+                        % (max(stale), sorted(stale)))
+
 
 
 if __name__ == "__main__":
