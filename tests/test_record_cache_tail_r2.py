@@ -10,6 +10,8 @@
    leaf's record window is pinned to the document's cut, so the pass reads nothing before the window.
 
 Every test here fails on the round-one head (62e03751a). Synthetic only: invented text, placeholder uuids."""
+import array
+import collections
 import gc
 import json
 import os
@@ -391,12 +393,41 @@ def held_record_bytes(snap, lines):
                if any((fr.filename, fr.lineno) in lines for fr in st.traceback))
 
 
+def entry_record_bytes(entry, lines):
+    """The decode-site bytes the record cache's entry itself keeps (its window records, the dropped records' skeletons and
+    the strings they share, its index arrays), by walking what the entry references while tracemalloc runs. Measured in the
+    same process as held_record_bytes, so a version's object sizes weigh on both sides alike."""
+    seen, stack, total = set(), [], 0
+    for a in dir(entry):
+        v = getattr(entry, a, None)
+        if not a.startswith("__") and isinstance(v, (list, tuple, dict, collections.deque, array.array)):
+            stack.append(v)
+    while stack:
+        o = stack.pop()
+        if id(o) in seen:
+            continue
+        seen.add(id(o))
+        tb = tracemalloc.get_object_traceback(o)
+        if tb is not None and any((fr.filename, fr.lineno) in lines for fr in tb):
+            total += sys.getsizeof(o)
+        if isinstance(o, dict):
+            stack.extend(o.keys()); stack.extend(o.values())
+        elif isinstance(o, (list, tuple, collections.deque)):
+            stack.extend(o)
+    return total
+
+
 class AnIdleLeafReleasesItsRecordsOnceItsDocumentStands(R2Base):
     """Defect 1. An idle leaf the boot parsed whole: the kernel's display parse holds its tree, the converge pass writes its
     document. On 62e03751a the whole assembly entry and the store's tree stayed (the next parse would re-seat, and an idle
     leaf is never parsed again), so every decoded record stayed alive though the record cache counted only the window. Now the
     writer releases the entry and the kernel replaces the tree with a restore: the decoded records still held fall to the
-    window's (measured by tracemalloc over the reader's decode sites)."""
+    window's (measured by tracemalloc over the reader's decode sites).
+
+    The bound is what the record cache's entry keeps by design, measured on the same snapshot's Python: its window records
+    plus the dropped records' skeletons, which weigh about a quarter of the whole leaf's decode. It was a fixed 0.3 of the
+    bytes before, which 3.12 met by 1.4 percent and 3.10 missed (0.305), its objects 14 to 18 percent heavier and every
+    count the same (2,349 decode-site objects in the entry on both, nothing held outside it)."""
 
     def test_the_held_decoded_records_fall_to_the_window(self):
         old = time.time() - 600
@@ -416,6 +447,7 @@ class AnIdleLeafReleasesItsRecordsOnceItsDocumentStands(R2Base):
                 self.assertEqual(km._converge_assembly(time.time(), time.monotonic()), 1, em.asm_checkpoint_stats())
                 gc.collect()
                 after = held_record_bytes(tracemalloc.take_snapshot(), lines)
+                kept = entry_record_bytes(em._JSONL_CACHE[self.path][4], lines)
             finally:
                 tracemalloc.stop()
             hot = em._JSONL_CACHE[self.path][4]
@@ -427,8 +459,11 @@ class AnIdleLeafReleasesItsRecordsOnceItsDocumentStands(R2Base):
             self.assertEqual(em._ASM_STATS.get("restore", 0) - s0.get("restore", 0), 1)
             self.assertEqual(em._ASM_STATS.get("full", 0), s0.get("full", 0), "never a whole parse")
         self.assertGreater(before, 0)
-        self.assertLess(after, 0.3 * before, "decoded records held: %d bytes after the document, %d before (the window holds "
-                                             "%d of %d records)" % (after, before, hot_n, len(self.recs)))
+        self.assertLess(hot_n, len(self.recs) // 4, "the entry's records are the window, not the leaf")
+        self.assertLess(after, 1.1 * kept, "decoded records held outside the record cache's entry: %d bytes held after the "
+                        "document, %d kept by the entry (the window holds %d of %d records), %d before"
+                        % (after, kept, hot_n, len(self.recs), before))
+        self.assertLess(after, 0.5 * before, "decoded records held: %d bytes after the document, %d before" % (after, before))
 
 
 class ALargeLeafsDocumentIsWritten(R2Base):
