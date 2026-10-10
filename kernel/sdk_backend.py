@@ -12909,12 +12909,44 @@ class SdkBackend:
         return {"hostAck": {"host": "%s:%s" % (h.get("pid"), h.get("start")),
                             "cli": "%s:%s" % (c.get("pid"), c.get("start")), "offset": int(t.ack_offset)}}
 
+    @staticmethod
+    def _host_leave_is_final(sess) -> bool:
+        """The connect loop will not reconnect after this leave (the test its `break` makes right after _leave_host): the
+        drain's detach, an ended session, or any leave with no reconnect pending."""
+        return bool(getattr(sess, "detached", False) or getattr(sess, "ended", False)
+                    or not getattr(sess, "_reconnect", False))
+
+    def _write_host_ack_at_once(self, sess, fields, what: str) -> None:
+        """A session's LAST hostAck, written now on the calling thread, AHEAD of the session's queued registry work, which
+        stays queued for the writer or the session's end (review 4, must-fix 1). Behind that backlog it lost the race to
+        the process's exit at a restart: the drain's 1.6 to 1.8 s ran out mid-backlog, the in-memory carry died with the
+        kernel, and the next kernel replayed records this one had handled. Writing first is safe: every hostAck merge is
+        monotonic per host (_reg_merge_locked), and a queued per-record ack reads the session's current transport, which
+        a final leave has dropped. The session's queued hostAck writes are dropped, since this one supersedes them."""
+        sid = sess.sid
+        with self._reg_jobs_lock:
+            for k in (("hostAck", sid), ("hostAckFinal", sid)):
+                self._reg_jobs.pop(k, None)
+                self._reg_jobs_sid.pop(k, None)
+        was = getattr(_REG_INLINE, "on", False)
+        _REG_INLINE.on = True     # a session-ending write: synchronous on its loop by design (the loop guard is told)
+        try:
+            self._update_reg_with(sid, lambda: fields)
+        except Exception as e:
+            self._log("host (%s): %s write failed: %s" % (getattr(sess, "name", "?"), what, e))
+        finally:
+            _REG_INLINE.on = was
+
     def _write_host_ack_forced(self, sess, t) -> None:
-        """The detach's last ack, its values captured now, under a key of its own so a later per-record ack for the next
-        transport can never replace it; through _reg_job, so on a loop it is queued (review 3: the lock wait it took at
-        every reconnect is no longer needed: the in-memory carry makes a reconnect in this kernel exact, the monotonic
-        merge orders the writes, and a session's end flushes its queued jobs before the kernel can lose them)."""
+        """The detach's last ack, its values captured now. On a final leave (the drain's detach, an ended session, no
+        reconnect pending) it is written at once, ahead of the session's queued work (_write_host_ack_at_once). On a
+        leave that reconnects it is queued through _reg_job under a key of its own, so a later per-record ack for the
+        next transport can never replace it (review 3: the lock wait it took at every reconnect is not needed there: the
+        in-memory carry makes a reconnect in this kernel exact and the monotonic merge orders the writes)."""
         fields = self._host_ack_fields(t)
+        if self._host_leave_is_final(sess):
+            self._write_host_ack_at_once(sess, fields, "the final hostAck")
+            return
 
         def write():
             try:
@@ -12924,17 +12956,13 @@ class SdkBackend:
         self._reg_job(("hostAckFinal", sess.sid), write)
 
     def _write_host_ack_departed(self, sess, t) -> None:
-        """A CLI that exited other than by a clean end: its host's final consumed offset, captured now and written
-        synchronously on the calling thread (a session-ending path, _leave_host), after the session's queued jobs."""
+        """A CLI that exited other than by a clean end: its host's final consumed offset, captured now and written at once
+        on the calling thread (_leave_host), ahead of the session's queued jobs (_write_host_ack_at_once); the session's
+        end runs those jobs afterwards."""
         if getattr(t, "hello", None) is None:
             return
         self._note_host_ack_carry(sess, t)
-        fields = self._host_ack_fields(t)
-        with self._session_ending(sess.sid):
-            try:
-                self._update_reg_with(sess.sid, lambda: fields)
-            except Exception as e:
-                self._log("host (%s): the departed host's final hostAck write failed: %s" % (getattr(sess, "name", "?"), e))
+        self._write_host_ack_at_once(sess, self._host_ack_fields(t), "the departed host's final hostAck")
 
     def _reg_job(self, key, fn, sid=None) -> None:
         """Run registry work `fn` now, unless the caller is a session's loop thread (on_session_loop): there it is queued
