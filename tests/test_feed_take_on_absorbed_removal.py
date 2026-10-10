@@ -264,25 +264,74 @@ class TakeOnTheCLIsQueueRemoval(unittest.TestCase):
         self._settle()
         self.assertEqual(len(c.writes), 3)
 
-    def test_a_dropped_by_hook_removal_releases_the_hold_but_is_reported_never_delivered(self):
-        """A hook dropped the fed text: it left the CLI's queue (so the next text may feed) but the turn never read
-        it. Not a take: no landing, no read stamp, not re-fed; its echo is flagged never delivered and one problem
-        line names the session and the reason."""
+    def test_a_drop_romp_did_not_decide_is_re_headed_and_fed_again(self):
+        """(a) The CLI dropped the fed text at its prompt hook, and romp's own gate did not block it: the hook timed out
+        or the session host reconnected before the answer came, which is no decision at all (2026-10-09: 78 such drops
+        in a day, 9 of 16 traced texts never came back). The text goes back to the head of the queue under its own id
+        and is fed again, once; its echo is neither dropped nor refused, its mail is not reported read at the drop, and
+        one log line names the session."""
         s, c = self.s, self._first_turn()
         reports = self._reports()
         b = _banner(_mid(3))
         s.enqueue_postal(b, [_mid(3)])
         self._wait(lambda: len(c.writes) == 2, "the mail forwarded")
-        q = self._send("a note the hook will drop", user=True)
-        self._wait(lambda: len(c.writes) == 2 and s.pending() == ["a note the hook will drop"], "the note waits")
+        q = self._send("a note the hook will time out on", user=True)
+        self._wait(lambda: s.pending() == ["a note the hook will time out on"], "the note waits behind the mail")
+        self._append(_enqueue_op(b))
+        self._append(_remove_op(None, reason="dropped_by_hook"))
+        self._assistant(c)
+        self._wait(lambda: len(c.writes) == 3, "the dropped mail fed again")
+        self.assertEqual(c.writes[2][0], b, "the dropped text itself, ahead of the note that queued behind it")
+        self._settle()
+        self.assertEqual(len(c.writes), 3, "fed once: the note waits for the re-sent mail's take")
+        self.assertEqual(s.pending(), ["a note the hook will time out on"])
+        self.assertEqual(reports, [], "a drop is not a read")
+        self.assertEqual(self._counts().get("removed:dropped_by_hook:reheaded"), 1, "counted as a re-head")
+        self.assertIsNone(self._counts().get("removed:dropped_by_hook"), "not counted as removed unread")
+        self.assertEqual([p for p in self.be._problems if "removed a fed text" in p.get("text", "")], [],
+                         "no never-delivered line")
+        self.assertTrue(any("back at the head of the queue" in l and "web" in l for l in self.lines),
+                        "one log line naming the session")
+
+        # the person's note, dropped the same way, comes back too, and its echo is never flagged
+        self._append(_enqueue_op(b))
+        self._append(_remove_op(None))                       # the re-sent mail is taken this time
+        self._assistant(c)
+        self._wait(lambda: len(c.writes) == 4, "the note fed after the re-sent mail's take")
+        self.assertEqual(reports, [(SID, [_mid(3)])], "the re-sent mail is reported read once it is taken")
+        self._append(_enqueue_op("a note the hook will time out on"))
+        self._append(_remove_op(None, reason="dropped_by_hook"))
+        self._assistant(c)
+        self._wait(lambda: len(c.writes) == 5, "the dropped note fed again")
+        self.assertEqual(c.writes[4][0], "a note the hook will time out on")
+        e = self._echo(q) or {}
+        self.assertFalse(e.get("dropped"), "never flagged dropped")
+        self.assertFalse(e.get("refused"), "never flagged refused")
+        self.assertEqual(self._counts().get("removed:dropped_by_hook:reheaded"), 2)
+
+    def test_a_drop_of_a_text_romps_gate_blocked_is_reported_never_delivered(self):
+        """(b) romp's own prompt gate blocked the text (a replayed schedule slot, _prompt_submit_gate's one block), so
+        the CLI's dropped_by_hook removal is a decision: the hold releases, since the text left the CLI's queue, but it
+        is not re-fed. Its echo is flagged never delivered, its mail gets no read stamp, and one problem line names the
+        session and the reason."""
+        s, c = self.s, self._first_turn()
+        reports = self._reports()
+        b = _banner(_mid(3))
+        s.enqueue_postal(b, [_mid(3)])
+        self._wait(lambda: len(c.writes) == 2, "the mail forwarded")
+        q = self._send("a note the gate will block", user=True)
+        self._wait(lambda: len(c.writes) == 2 and s.pending() == ["a note the gate will block"], "the note waits")
+        s._note_gate_blocked(b)                              # what the gate's block return records
         self._append(_enqueue_op(b))
         self._append(_remove_op(None, reason="dropped_by_hook"))
         self._assistant(c)
         self._wait(lambda: len(c.writes) == 3, "the note fed once the dropped mail left the CLI's queue")
         self._settle()
+        self.assertEqual(c.writes[2][0], "a note the gate will block", "the blocked mail was not re-fed")
         self.assertEqual(reports, [], "a dropped banner's mail is never reported read")
-        self.assertNotIn(b, s.pending(), "a hook's drop is not re-headed (the same hook would drop it again)")
+        self.assertNotIn(b, s.pending(), "a drop romp's gate decided is not re-headed")
         self.assertEqual(self._counts().get("removed:dropped_by_hook"), 1)
+        self.assertIsNone(self._counts().get("removed:dropped_by_hook:reheaded"))
         self.assertIsNone(self._counts().get("absorbed_removal"), "a drop is never counted as a take")
         lines = [p["text"] for p in self.be._problems if "removed a fed text" in p.get("text", "")]
         self.assertEqual(len(lines), 1, "one problem line")
@@ -290,8 +339,9 @@ class TakeOnTheCLIsQueueRemoval(unittest.TestCase):
         self.assertIn("dropped_by_hook", lines[0], "and the reason")
         self.assertIn(_mid(3), lines[0], "and the mail that stays unread")
 
-        # the note the person sent is dropped too: its echo is flagged never delivered, and never re-fed
-        self._append(_enqueue_op("a note the hook will drop"))
+        # the note the person sent is blocked too: its echo is flagged never delivered, and never re-fed
+        s._note_gate_blocked("a note the gate will block")
+        self._append(_enqueue_op("a note the gate will block"))
         self._append(_remove_op(None, reason="dropped_by_hook"))
         self._assistant(c)
         self._wait(lambda: (self._echo(q) or {}).get("dropped"), "the dropped note's echo flagged")
@@ -302,8 +352,68 @@ class TakeOnTheCLIsQueueRemoval(unittest.TestCase):
         self.assertIsNone(s._untaken, "the hold released")
         self.assertEqual(s.pending(), [], "nothing re-headed")
         self.assertEqual(self._counts().get("removed:dropped_by_hook"), 2)
+        self.assertEqual(len(c.writes), 3, "nothing fed again")
         self.be.prune_live(SID, set(), {})
         self.assertIsNotNone(self._echo(q), "a dropped echo stays visible until the person dismisses it")
+
+    def test_the_fourth_drop_of_the_same_item_falls_back_to_never_delivered(self):
+        """(c) A hook outside romp that really blocks a text drops it every time. The kernel re-sends one queued item at
+        most HOOK_DROP_RESEND_MAX (3) times; the fourth drop takes the never-delivered road, so nothing loops."""
+        s, c = self.s, self._first_turn()
+        self.assertEqual(sb.HOOK_DROP_RESEND_MAX, 3)
+        text = "a note some other hook always blocks"
+        q = self._send(text, user=True)
+        self._wait(lambda: len(c.writes) == 2, "forwarded")
+        for i in range(3):
+            self._append(_enqueue_op(text))
+            self._append(_remove_op(None, reason="dropped_by_hook"))
+            self._assistant(c)
+            self._wait(lambda: len(c.writes) == 3 + i, "re-send %d fed" % (i + 1))
+            self.assertEqual(c.writes[-1][0], text)
+            self.assertFalse((self._echo(q) or {}).get("dropped"), "not flagged while re-sends remain")
+        self.assertEqual(self._counts().get("removed:dropped_by_hook:reheaded"), 3)
+        self._append(_enqueue_op(text))
+        self._append(_remove_op(None, reason="dropped_by_hook"))
+        self._assistant(c)
+        self._wait(lambda: (self._echo(q) or {}).get("dropped"), "the fourth drop flags the echo never delivered")
+        self._settle()
+        self.assertTrue((self._echo(q) or {}).get("refused"))
+        self.assertEqual(len(c.writes), 5, "no fourth re-send")
+        self.assertEqual(s.pending(), [], "nothing re-headed")
+        self.assertIsNone(s._untaken)
+        self.assertEqual(self._counts().get("removed:dropped_by_hook"), 1)
+        self.assertEqual(self._counts().get("removed:dropped_by_hook:reheaded"), 3)
+
+    def test_a_text_that_landed_is_never_re_sent_on_a_drop(self):
+        """(e) A drop removal for a text whose record landed (here a queued_command attachment written after the
+        removal, so the first-match scan reads the drop) is a take: the landing check runs ahead of any re-head, so the
+        turn never reads it twice. Live take and exit path alike."""
+        s, c = self.s, self._first_turn()
+        reports = self._reports()
+        b = _banner(_mid(5))
+        s.enqueue_postal(b, [_mid(5)])
+        self._wait(lambda: len(c.writes) == 2, "the mail forwarded")
+        s.enqueue("a note queued behind it")
+        self._append(_enqueue_op(b))
+        self._append(_remove_op(b, reason="dropped_by_hook"))
+        self._append(_splice(b))
+        self._assistant(c)
+        self._wait(lambda: len(c.writes) == 3, "the next text feeds")
+        self.assertEqual(c.writes[2][0], "a note queued behind it", "the landed mail is not re-sent")
+        self.assertNotIn(b, s.pending())
+        self.assertEqual(reports, [(SID, [_mid(5)])], "a landed banner's mail is reported read")
+        self.assertIsNone(self._counts().get("removed:dropped_by_hook:reheaded"))
+        self.assertIsNone(self._counts().get("removed:dropped_by_hook"))
+
+        # the exit path: the held note landed and was dropped in the same file; the CLI exits
+        self._append(_enqueue_op("a note queued behind it"))
+        self._append(_remove_op("a note queued behind it", reason="dropped_by_hook"))
+        self._append(_splice("a note queued behind it"))
+        s._release_hold_at_exit()
+        self.assertIsNone(s._untaken)
+        self.assertEqual(s.pending(), [], "not re-headed: the turn read it")
+        self.assertTrue(any("after taking the last fed text" in l for l in self.lines))
+        self.assertIsNone(self._counts().get("removed:dropped_by_hook:reheaded"))
 
     def test_a_reasonless_or_foreign_removal_releases_nothing(self):
         """A remove with no reason (an older CLI's discard: no verdict about delivery), and removals naming other texts,
@@ -353,19 +463,79 @@ class TakeOnTheCLIsQueueRemoval(unittest.TestCase):
         self.assertEqual(s.pending(), [], "not re-headed: the turn read it")
         self.assertTrue(any("after taking the last fed text" in l for l in self.lines))
 
-    def test_the_cli_exiting_after_a_dropped_removal_does_not_re_head_the_text(self):
-        """The CLI removed the text unread and exited before any turn frame acted on it: the exit release reads the
-        removal and takes the same road (flagged, not re-fed)."""
+    def test_the_cli_exiting_after_a_drop_romp_did_not_decide_re_heads_the_text(self):
+        """(d) The CLI dropped the text at its prompt hook and exited before any turn frame acted on it: the exit release
+        reads the removal and, since romp's gate did not block the text, puts it back at the head for the next client.
+        Its echo is not flagged."""
         s, c = self.s, self._first_turn()
-        q = self._send("a note the hook will drop", user=True)
+        q = self._send("a note the hook will time out on", user=True)
         self._wait(lambda: len(c.writes) == 2, "forwarded")
-        self._append(_enqueue_op("a note the hook will drop"))
+        self._append(_enqueue_op("a note the hook will time out on"))
+        self._append(_remove_op(None, reason="dropped_by_hook"))
+        s._release_hold_at_exit()
+        self.assertIsNone(s._untaken)
+        self.assertEqual(s.pending(), ["a note the hook will time out on"], "re-headed for the next client")
+        self.assertEqual((s.pending_meta() or [{}])[0].get("qid"), q, "under its own id")
+        self.assertFalse((self._echo(q) or {}).get("dropped"), "not flagged never delivered")
+        self.assertEqual(self._counts().get("removed:dropped_by_hook:reheaded"), 1)
+        self.assertIsNone(self._counts().get("removed:dropped_by_hook"))
+
+    def test_the_cli_exiting_after_a_drop_romps_gate_blocked_does_not_re_head_the_text(self):
+        """The same exit, for a text romp's own gate blocked: the take's road (flagged, not re-fed), as before."""
+        s, c = self.s, self._first_turn()
+        q = self._send("a note the gate will block", user=True)
+        self._wait(lambda: len(c.writes) == 2, "forwarded")
+        s._note_gate_blocked("a note the gate will block")
+        self._append(_enqueue_op("a note the gate will block"))
         self._append(_remove_op(None, reason="dropped_by_hook"))
         s._release_hold_at_exit()
         self.assertIsNone(s._untaken)
         self.assertEqual(s.pending(), [], "not re-headed")
         self.assertTrue((self._echo(q) or {}).get("dropped"), "flagged never delivered")
         self.assertEqual(self._counts().get("removed:dropped_by_hook"), 1)
+
+
+class TheGateBlockedMapIsBounded(unittest.TestCase):
+    """The prompts romp's gate blocked are kept per session, bounded by count and by age, consumed by the drop they
+    answer, and cleared when the session shuts down (SdkSession._note_gate_blocked, _take_gate_blocked)."""
+
+    def _bare(self):
+        s = sb.SdkSession.__new__(sb.SdkSession)     # the map needs none of __init__
+        s.loop, s.client, s.detached = None, None, False
+        return s
+
+    def test_count_bound_drops_the_oldest(self):
+        s = self._bare()
+        for i in range(sb.GATE_BLOCKED_KEEP + 5):
+            s._note_gate_blocked("blocked prompt %d" % i)
+        self.assertEqual(len(s._gate_blocked), sb.GATE_BLOCKED_KEEP)
+        self.assertFalse(s._take_gate_blocked("blocked prompt 0"), "the oldest went first")
+        self.assertTrue(s._take_gate_blocked("blocked prompt %d" % (sb.GATE_BLOCKED_KEEP + 4)))
+        self.assertFalse(s._take_gate_blocked("blocked prompt %d" % (sb.GATE_BLOCKED_KEEP + 4)),
+                         "consumed: one block answers one drop")
+
+    def test_age_bound(self):
+        s = self._bare()
+        s._note_gate_blocked("an old block")
+        s._gate_blocked[sb._gate_prompt_key("an old block")] -= sb.GATE_BLOCKED_TTL_S + 1
+        self.assertFalse(s._take_gate_blocked("an old block"), "too old to answer a drop")
+        s._note_gate_blocked("another old block")
+        s._gate_blocked[sb._gate_prompt_key("another old block")] -= sb.GATE_BLOCKED_TTL_S + 1
+        s._note_gate_blocked("a fresh block")
+        self.assertEqual(list(s._gate_blocked), [sb._gate_prompt_key("a fresh block")], "old entries pruned on write")
+
+    def test_keyed_on_the_first_500_characters(self):
+        s = self._bare()
+        s._note_gate_blocked("y" * 500 + " tail one")
+        self.assertTrue(s._take_gate_blocked("y" * 500 + " a different tail"))
+
+    def test_cleared_at_shutdown(self):
+        s = self._bare()
+        s._note_gate_blocked("a block")
+        s._hook_drop_resends = {"q:x": 2}
+        s.shutdown()
+        self.assertEqual(s._gate_blocked, {})
+        self.assertEqual(s._hook_drop_resends, {})
 
 
 class TheLandingScanReadsRemovals(unittest.TestCase):

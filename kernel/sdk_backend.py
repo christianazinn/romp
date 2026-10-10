@@ -6518,6 +6518,8 @@ class SdkSession:
 
     def shutdown(self):
         self.ended = True
+        self._gate_blocked = {}                  # the session ends: what its gate blocked and its re-send counts go too
+        self._hook_drop_resends = {}
         if self.loop:
             self.loop.call_soon_threadsafe(self._wake_set)   # break the receive loop even if idle (no msg coming)
         if self.loop and self.client and not self.detached:
@@ -6656,11 +6658,18 @@ class SdkSession:
         take = u.get("take")
         if seen is False and isinstance(take, tuple) and len(take) == 2 and take[0] == "removed":
             # the CLI removed the text unread before it exited (a hook dropped it; _untaken_taken's third answer, which no
-            # turn frame arrived to act on): re-heading would hand it to the same hook again, so it takes the take's road
-            _unread = getattr(self.backend, "_feed_removed_unread", None)
-            if _unread is not None:
-                _unread(self.sid, u, take[1])
-            return
+            # turn frame arrived to act on). A prompt-hook drop no hook decided (a timeout, a host reconnect) goes back
+            # to the head for the next client (_requeue_hook_drop); a decided one, or another reason, takes the take's road
+            _redo = self._requeue_hook_drop_safe(u, take[1], live=False)
+            if _redo == "requeued":
+                return
+            if _redo == "landed":
+                seen = True                      # a record lands it after all: the landed branch below
+            else:
+                _unread = getattr(self.backend, "_feed_removed_unread", None)
+                if _unread is not None:
+                    _unread(self.sid, u, take[1])
+                return
         if seen is False or (seen is None and not self.resume_sid):
             with self._lock:
                 self._q_prepend(*self._unfeed_parts_locked([item]))   # back at the head under its own id (a joined text: each part under its own)
@@ -8952,6 +8961,134 @@ class SdkSession:
         except Exception:
             return None
 
+    def _note_gate_blocked(self, prompt: str) -> None:
+        """The prompt gate (_prompt_submit_gate) just BLOCKED `prompt`: remember it, so the CLI's dropped_by_hook removal
+        of that text is read as the kernel's own decision and never re-sent (_requeue_hook_drop). A small map of
+        prompt key (_gate_prompt_key) to monotonic time, bounded by count (GATE_BLOCKED_KEEP) and age
+        (GATE_BLOCKED_TTL_S), cleared at shutdown. Never raises: the gate's verdict must not depend on it."""
+        try:
+            m = getattr(self, "_gate_blocked", None)
+            if m is None:
+                m = self._gate_blocked = {}          # created here: __new__-built doubles skip __init__
+            now = time.monotonic()
+            for k in [k for k, at in m.items() if now - at > GATE_BLOCKED_TTL_S]:
+                m.pop(k, None)
+            k = _gate_prompt_key(prompt)
+            m.pop(k, None)                           # re-inserted last, so the count bound drops the oldest
+            m[k] = now
+            while len(m) > GATE_BLOCKED_KEEP:
+                m.pop(next(iter(m)), None)
+        except Exception:
+            pass
+
+    def _take_gate_blocked(self, text: str) -> bool:
+        """Did the prompt gate block `text` within the map's age bound? The entry is consumed: one block answers one
+        drop."""
+        m = getattr(self, "_gate_blocked", None)
+        if not m:
+            return False
+        at = m.pop(_gate_prompt_key(text), None)
+        return at is not None and time.monotonic() - at <= GATE_BLOCKED_TTL_S
+
+    @staticmethod
+    def _hook_drop_keys(took: dict) -> list:
+        """The keys a fed text's re-send count is kept under: every send id it carries (a joined text: each part's, which
+        ride the parts back to the queue on a re-head and into the next join), else a hash of each joined part, so a
+        banner keeps its count when the re-fed join gains or loses neighbours."""
+        qids = [q for q in (took.get("qids") or []) if q]
+        if qids:
+            return ["q:" + str(q) for q in qids]
+        text = took.get("text") or ""
+        return ["h:" + hashlib.sha1(p.encode("utf-8", "replace")).hexdigest() for p in text.split(MAIL_JOIN_SEP)] \
+            or ["h:"]
+
+    def _forget_hook_drops(self, took: dict) -> None:
+        """The CLI took `took`: its re-send count, if a drop left one, has done its job."""
+        counts = getattr(self, "_hook_drop_resends", None)
+        if counts:
+            for k in self._hook_drop_keys(took):
+                counts.pop(k, None)
+
+    def _requeue_hook_drop(self, took: dict, reason: str, live: bool = True):
+        """The CLI removed the fed text `took` unread for `reason`. Decide whether the kernel sends it again:
+          "landed"   a record after the feed's mark lands the text (_landed_despite_drop_scan: a user record, a
+                     queued_command attachment, an absorbed removal), so the turn read it and it is never re-sent; the
+                     caller treats it as taken;
+          "requeued" the drop was dropped_by_hook and the kernel's own prompt gate did not block the text, so no hook
+                     decided anything: the CLI's 540 s hook limit ran out, or the session host reconnected before the
+                     answer came. The text is back at the head of the queue under its own ids, as the exit path's
+                     re-head puts it (_unfeed_parts_locked, then _persist_queue), counted as
+                     `removed:dropped_by_hook:reheaded`, with one log line naming the session;
+          None       anything else: another reason, a text the gate blocked, a landing scan that could not read the
+                     transcript (never re-send on doubt), or an item already re-sent HOOK_DROP_RESEND_MAX times (a hook
+                     outside romp that really blocks it would drop it forever). The caller takes the never-delivered
+                     road, _feed_removed_unread.
+        `live` is the stream's take (_on_message): the text also leaves the fed-turn twin (_inflight_texts), so a
+        teardown before the turn's result cannot re-head or flag it a second time. The exit path passes False and keeps
+        the twin as its own re-head does."""
+        if reason != QUEUE_REMOVE_DROPPED_BY_HOOK:
+            return None
+        text = took.get("text") or ""
+        try:
+            landed = _landed_despite_drop_scan(self.backend.state_dir, self.sid, text, took.get("t"),
+                                               took.get("off"), took.get("fsid"))
+        except Exception:
+            landed = None
+        if landed is True:
+            self.backend._log("feed hold (%s): the CLI wrote a dropped_by_hook removal for a fed text whose record also "
+                              "landed: taken, not re-sent" % self.name)
+            return "landed"
+        if landed is None:
+            return None
+        if self._take_gate_blocked(text):
+            return None                              # romp's own gate blocked it: a decision, today's road
+        counts = getattr(self, "_hook_drop_resends", None)
+        if counts is None:
+            counts = self._hook_drop_resends = {}
+        keys = self._hook_drop_keys(took)
+        n = max(int(counts.get(k) or 0) for k in keys)
+        if n >= HOOK_DROP_RESEND_MAX:
+            for k in keys:
+                counts.pop(k, None)
+            return None
+        for k in keys:
+            counts.pop(k, None)
+            counts[k] = n + 1
+        while len(counts) > HOOK_DROP_COUNTS_KEEP:
+            counts.pop(next(iter(counts)), None)
+        item = took.get("item", text)
+        with self._lock:
+            if live:
+                try:
+                    self._inflight_texts.remove(item)
+                except (ValueError, AttributeError):
+                    pass
+            self._q_prepend(*self._unfeed_parts_locked([item]))   # back at the head under its own id (a joined text: each part under its own)
+        try:                                         # the text is queued now: nothing below may send it down the drop road
+            self._persist_queue()
+            self.backend._count_feed_take("removed:%s:reheaded" % reason)
+            label = getattr(self.backend, "_session_label", None)
+            self.backend._log("feed hold (%s): the CLI dropped a fed text at its prompt hook with no decision from romp "
+                              "(the hook timed out or the session host reconnected; reason %s): back at the head of the "
+                              "queue, re-send %d of %d" % (label(self.sid) if label else self.name, reason, n + 1,
+                                                            HOOK_DROP_RESEND_MAX))
+        except Exception as e:
+            self.backend._log("feed hold (%s): a dropped text went back to the queue, but its bookkeeping failed: %s: %s"
+                              % (self.sid[:8], type(e).__name__, _mask_ids(e)), problem=True,
+                              key=("feed-hook-drop-requeue", self.sid))
+        return "requeued"
+
+    def _requeue_hook_drop_safe(self, took: dict, reason: str, live: bool = True):
+        """_requeue_hook_drop, never raising: a failure is one problem line and today's road (None), so the stream that
+        saw the take keeps running."""
+        try:
+            return self._requeue_hook_drop(took, reason, live=live)
+        except Exception as e:
+            self.backend._log("feed hold (%s): deciding whether to re-send a dropped text failed: %s: %s"
+                              % (self.sid[:8], type(e).__name__, _mask_ids(e)), problem=True,
+                              key=("feed-hook-drop-requeue", self.sid))
+            return None
+
     def _untaken_taken(self, msg, AssistantMessage, ResultMessage, SystemMessage) -> bool:
         """Has the CLI TAKEN the last fed text (self._untaken), so the next queued text may be fed
         without the two fusing into one message? `msg` is the frame just streamed. Three exact events,
@@ -9066,10 +9203,18 @@ class SdkSession:
             _took = self._untaken
             self._untaken = None
             _how = (_took or {}).get("take")
-            if isinstance(_how, tuple):
-                # the CLI REMOVED the text unread (a hook dropped it): released, not delivered. No read stamp for its mail,
-                # no /clear take; the backend flags its echoes never delivered and says so once (_feed_removed_unread;
-                # getattr: a stand-in backend in tests has none)
+            _redo = self._requeue_hook_drop_safe(_took, _how[1]) if isinstance(_how, tuple) else None
+            if _redo == "landed":
+                _how = "record"                  # a record lands it after all: an ordinary take, never re-sent
+            if _redo == "requeued":
+                # a prompt-hook drop no hook decided (a timeout, a host reconnect): back at the head of the queue, and the
+                # feeder woken below sends it again (_requeue_hook_drop). Not a take: no read stamp, no /clear take.
+                _took = None
+            elif isinstance(_how, tuple):
+                # the CLI REMOVED the text unread, and a hook decided it (romp's own gate blocked it, or the re-sends are
+                # spent) or the reason is another: released, not delivered. No read stamp for its mail, no /clear take;
+                # the backend flags its echoes never delivered and says so once (_feed_removed_unread; getattr: a
+                # stand-in backend in tests has none)
                 _unread = getattr(self.backend, "_feed_removed_unread", None)
                 if _unread is not None:
                     _unread(self.sid, _took, _how[1])
@@ -9083,6 +9228,7 @@ class SdkSession:
                     _absorbed(self.sid, _took)
             # a postal banner the CLI has now taken: the model has the mail, and the sender's read stamp is due (2026-10-03)
             if _took is not None:
+                self._forget_hook_drops(_took)   # a re-sent text that got through: its re-send count is spent
                 self.backend._report_postal_take(self.sid, postal_mids(_took.get("text") or ""), "taken")
             # a /clear the CLI has now TAKEN: record its echo's identity so it retires on THIS copy's own
             # boundary (the flip it causes, or its own turn's settle), never by text and never before the CLI
@@ -10277,6 +10423,9 @@ class SdkSession:
             await asyncio.to_thread(self.backend._update_reg, self.sid, cronDelivered=delivered)
             return {}
         when = time.strftime("%Y-%m-%d %H:%M", time.localtime(replay_of))
+        # the one block romp's gate decides: remembered, so the CLI's dropped_by_hook removal of this text is read as
+        # a decision and never re-sent (_requeue_hook_drop); every other drop by this hook is a timeout or a reconnect
+        self._note_gate_blocked(prompt)
         self.backend._log("cron dedupe (%s): blocked a replayed schedule fire — its %s slot was "
                           "already delivered (a fresh process re-fires passed slots on resume)"
                           % (self.name, when), problem=False)
@@ -11163,6 +11312,54 @@ def _landed_texts(rec: dict) -> set:
 # it at the turn's next step. Every other reason (dropped_by_hook: a hook dropped it; and the rest the CLI writes)
 # took the text off the queue WITHOUT the running turn reading it.
 QUEUE_REMOVE_ABSORBED = "absorbed_mid_turn"
+# The reason the CLI writes when its UserPromptSubmit hook did not let a text through. That covers a real block, but
+# also a hook that never answered: the CLI's 540 s hook limit ran out, or the session host reconnected before the
+# kernel's answer arrived (2026-10-09: 78 such drops across 14 sessions in one day, 51 timeouts and 27 reconnects).
+# Only a block is a decision; the kernel re-sends the rest (SdkSession._requeue_hook_drop).
+QUEUE_REMOVE_DROPPED_BY_HOOK = "dropped_by_hook"
+# How many times one queued item goes back to the head after a drop the kernel's own gate did not decide. A hook
+# outside romp that really blocks the text drops it every time, so after this many re-sends the next drop takes the
+# never-delivered road (_feed_removed_unread) and the loop ends.
+HOOK_DROP_RESEND_MAX = 3
+# The prompts the kernel's own prompt gate blocked (SdkSession._note_gate_blocked), kept so a drop of one of them is
+# not re-sent: at most this many per session, none older than this many seconds (the CLI writes the removal right
+# after the hook's answer, so an entry is read within seconds or never), cleared when the session shuts down.
+GATE_BLOCKED_KEEP = 32
+GATE_BLOCKED_TTL_S = 3600.0
+# Re-send counts per queued item (SdkSession._hook_drop_resends): at most this many items per session.
+HOOK_DROP_COUNTS_KEEP = 64
+
+
+def _gate_prompt_key(text) -> str:
+    """The key the gate-blocked map holds a prompt under: a hash of its first 500 characters, the prompt gate's own
+    reading (the hook's prompt is the fed text, so the take path computes the same key from the hold's text)."""
+    return hashlib.sha1(str(text or "")[:500].encode("utf-8", "replace")).hexdigest()
+
+
+def _landed_despite_drop_scan(state_dir, sid: str, text: str, t=None, off=None, fsid=None):
+    """Does any record after the feed's mark LAND `text` (a user record, a queued_command attachment, or an
+    absorbed_mid_turn removal naming it), whatever else the file says? _text_take_scan answers with the FIRST matching
+    record in file order, so a drop written ahead of a landing reads as the drop; before the kernel re-sends a dropped
+    text it asks this instead, so a text the turn read is never fed twice. True (landed), False (readable, no
+    landing), None (unreadable: the caller does not re-send on doubt). Same mark and send-time floor as a landing."""
+    try:
+        want = set(echo_keys(text))
+        floor = int(t or 0)
+        for rec in _records_from_mark(state_dir, sid, off, fsid,
+                                      (b'"user"', b'"queued_command"', b'"queue-operation"')):
+            removal = _queue_removal(rec)
+            if removal is not None:
+                if removal[0] != QUEUE_REMOVE_ABSORBED or not (want & removal[1]):
+                    continue
+            elif not (want & _landed_texts(rec)):
+                continue
+            ts = _record_epoch(rec.get("timestamp"))
+            if floor and ts is not None and ts < floor:
+                continue
+            return True
+        return False
+    except Exception:
+        return None
 
 
 def _queue_removal(rec: dict):
@@ -15433,8 +15630,17 @@ class SdkBackend:
         """The CLI removed the fed text `took` from its queue for `reason` (dropped_by_hook, or any reason but
         absorbed_mid_turn): the hold is released, since the text can no longer fuse with the next one, but the running
         turn never read it. Not a delivery, and NOT re-fed: this follows the prompt gate's refusal (mark_echo_refused),
-        the existing road for a text the CLI was told not to run. A hook's drop is that hook's decision, and re-heading
-        the text would hand it to the same hook again, a loop that drops it every time; the person resends it if they
+        the existing road for a text the CLI was told not to run.
+
+        Which drops reach it (2026-10-10). A dropped_by_hook removal is NOT always a hook's decision: the CLI writes the
+        same removal when its 540 s hook limit runs out or the session host reconnects before the kernel's answer
+        arrives, and those drops lost texts for good (on 2026-10-09, 78 drops across 14 sessions; of 16 traced, 9 never
+        came back). So the take paths ask SdkSession._requeue_hook_drop first, which re-heads every dropped_by_hook text
+        romp's own prompt gate did not block, up to HOOK_DROP_RESEND_MAX re-sends per queued item. What still arrives
+        here: a removal for any reason other than dropped_by_hook; a dropped_by_hook text the kernel's own gate blocked
+        (a replayed schedule slot, _prompt_submit_gate), whose re-send would only be blocked again; the drop after an
+        item's re-sends are spent, where a hook outside romp that really blocks the text would otherwise loop; and a
+        drop whose landing scan could not read the transcript (never re-sent on doubt). The person resends it if they
         still want it. So the echoes it speaks for (_echoes_for_take) are flagged dropped AND refused, the reason riding
         as refusedWhy (kept in the chat as never delivered, dismissable, never re-delivered, both flags on the mirror);
         their fed ledger entries go (no landing will come); and one problem-ring line per text names the session, the
@@ -15459,7 +15665,7 @@ class SdkBackend:
                     self.forget_fed(sid, q)
             mids = postal_mids(text)
             self._log("feed hold (%s): the CLI removed a fed text from its queue without the turn reading it (reason "
-                      "%s): not delivered and not re-fed, since the same hook would drop it again; %s%s: %.80r"
+                      "%s): not delivered and not re-fed (a hook decided it, or its re-sends are spent); %s%s: %.80r"
                       % (self._session_label(sid), reason,
                          ("%d echo%s kept in the chat as never delivered" % (len(flagged), "" if len(flagged) == 1 else "es"))
                          if flagged else "no echo to flag",
