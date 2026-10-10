@@ -1,17 +1,20 @@
-"""Review 5 of hook-callback-stall, must-fix 2 (synthetic data only): the registry writer under the overload review 5
-measured. Twenty sessions stream records (the real _write_host_ack: its once-a-second throttle and carry), each queues a
-hook write every 3 s and a keyed queue mirror every 2 s, and every writer item costs 60 ms (review 4's measured cost under
-load), so the read-position saves alone want more than the writer has.
+"""Reviews 5 to 7 of hook-callback-stall (synthetic data only): the registry writer under overload. Twenty sessions
+stream records (the real _write_host_ack: its once-a-second throttle and carry), each queues a hook write every 2.5 s,
+and every writer item costs 60 ms (review 4's measured cost under load): the read-position saves alone want more than
+the writer has, and the hook writes alone fill the half of it the saves leave (so a copy sent to the back at every
+re-queue never reaches the front, the condition the saved-queue check needs). Five of the sessions are busy: their saved queue changes every second, so each re-queues its ('queue', sid)
+copy every second. Real sessions re-queue that copy only when the queue changes (review 7), so the other fifteen never
+do; all twenty re-queuing it every 2 s asked more than the writer can do and made the old fixed-share check depend on
+the machine's load (it failed 4 of 6 runs at a load average of 47 to 70).
 
-Two things must hold, and the bounds are generous on purpose (this asserts that starvation is gone, not a latency, so it
-holds at a load average of 40 to 60):
-- other writes keep landing: at least half of the hook writes issued have run, and none waited 10 s or more (the
-  back-of-queue tree, fb5c44b65, measured a median of about 1.6 s; with the saves at the front, 5420787e7 ran none);
-- every session's read position keeps being saved: each session's saved offset trails what it consumed by under 10 s of
-  records (fb5c44b65 saved none of them while the writer lagged; 5420787e7 never saved a few of them);
-- every session's queue mirror (a keyed write, re-queued every 2 s: the saved message queue's shape) keeps landing: the
-  value on disk was queued under 10 s ago (sent to the back at each re-queue, it never landed once the saves took half
-  the writer).
+What must hold, asserted as progress rather than as a share of a total that depends on machine load:
+- other writes keep making progress: after a 2 s warm-up there is no stretch of 3 s in which no other write ran, and
+  every other write queued in the run's first half has run by its end (with the saves at the front, 5420787e7 ran none);
+- every session's read position keeps being saved: each saved offset trails what it consumed by under 10 s of records
+  (fb5c44b65 saved none while the writer lagged; 5420787e7 never saved a few);
+- every busy session's saved queue keeps landing: the copy on disk was queued in the run's second half (sent to the
+  back at each re-queue, as at c695116fc, it never landed after the start).
+Each check holds as long as other writes' waits grow by less than a second a second, so none depends on a fixed latency.
 """
 import os
 import shutil
@@ -30,8 +33,9 @@ from romp_load import load_source  # noqa: E402
 
 sb = load_source("hookstall_sb_writer_load", os.path.join(TREE, "bin", "romp_sdk_backend.py"))
 
-NSESS, RATE, HOOK_EVERY, MIRROR_EVERY, ITEM_S, SECS = 20, 50.0, 3.0, 2.0, 0.06, 15.0
-WAIT_BOUND_S = 10.0
+NSESS, RATE, HOOK_EVERY, ITEM_S, SECS = 20, 50.0, 2.5, 0.06, 20.0
+BUSY, MIRROR_EVERY = 5, 1.0           # sessions whose saved queue changes, and how often it does
+WARMUP_S, GAP_S = 2.0, 3.0            # no stretch of GAP_S after the warm-up without another write run
 LAG_BOUND = int(RATE * 10.0)          # records: ten seconds of streaming
 
 
@@ -66,6 +70,8 @@ class WriterUnderLoad(unittest.TestCase):
         lk = threading.Lock()
         pending = {}      # token -> time queued
         waits = []        # how long each hook write that ran had waited
+        ran_at = []       # when each hook write ran
+        queued_at = {}    # token -> time queued, for every hook write issued
 
         def hook_item(tok, sid):
             t = time.monotonic()
@@ -73,6 +79,7 @@ class WriterUnderLoad(unittest.TestCase):
                 q = pending.pop(tok, None)
             if q is not None:
                 waits.append(t - q)
+                ran_at.append(t)
             be._update_reg(sid, lastSkill={"at": tok, "name": "x"})
 
         def loop(i):
@@ -91,13 +98,15 @@ class WriterUnderLoad(unittest.TestCase):
                     tok = i * 1_000_000 + n
                     with lk:
                         pending[tok] = now
+                        queued_at[tok] = now
                     be._reg_job(None, lambda t=tok, s=sess.sid: hook_item(t, s), sid=sess.sid)
-                if now >= next_mirror:                    # a keyed mirror (the queue mirror's shape)
+                if i < BUSY and now >= next_mirror:       # a busy session's saved queue changed: its copy re-queued
                     next_mirror = now + MIRROR_EVERY
                     be._reg_job(("queue", sess.sid), lambda s=sess.sid, q=now: be._update_reg(s, queueMirror={"q": q}))
                 time.sleep(1.0 / RATE)
 
         ths = [threading.Thread(target=loop, args=(i,), name="sdk:web%d" % i, daemon=True) for i in range(NSESS)]
+        t0 = time.monotonic()
         for t in ths:
             t.start()
         time.sleep(SECS)
@@ -108,29 +117,36 @@ class WriterUnderLoad(unittest.TestCase):
             reg = sb.read_reg(Path(d), sess.sid) or {}
             ack = reg.get("hostAck") or {}
             lags.append(sess._host.ack_offset - int(ack.get("offset", -1)))
-            q = (reg.get("queueMirror") or {}).get("q")
-            stale.append(round(t_snap - q, 1) if q is not None else SECS)
+            if sessions.index(sess) < BUSY:
+                q = (reg.get("queueMirror") or {}).get("q")
+                stale.append(round(t_snap - q, 1) if q is not None else SECS)
         stop.set()
         t_end = time.monotonic()
         with lk:
-            still = list(pending.values())
+            still = dict(pending)
             ran = list(waits)
+            ran_times = sorted(ran_at)
         for t in ths:
             t.join(5)
-        issued = len(ran) + len(still)
-        oldest = max([t_end - q for q in still] + ran + [0.0])
-        print("\n[writer load] %d sessions, %.0f ms an item, %.0f s: other writes ran %d of %d, oldest wait %.2f s; "
-              "per-session save lag (records, sorted) %s; queue mirror age (s, sorted) %s"
-              % (NSESS, ITEM_S * 1000, SECS, len(ran), issued, oldest, sorted(lags), sorted(stale)))
-        self.assertGreater(issued, 0)
-        self.assertGreaterEqual(len(ran), issued / 2.0, "other writes starved: %d of %d ran" % (len(ran), issued))
-        self.assertLess(oldest, WAIT_BOUND_S, "another write waited %.1f s" % oldest)
+        # the longest stretch after the warm-up with no other write run
+        marks = [t0 + WARMUP_S] + [x for x in ran_times if x >= t0 + WARMUP_S] + [t_end]
+        gap = max(b - a for a, b in zip(marks, marks[1:]))
+        half = t0 + SECS / 2.0
+        early_left = sorted(round(t_end - q, 1) for q in still.values() if q < half)
+        oldest = max([t_end - q for q in still.values()] + ran + [0.0])
+        print("\n[writer load] %d sessions (%d busy), %.0f ms an item, %.0f s: other writes ran %d of %d, longest stretch "
+              "with none %.2f s, oldest wait %.2f s, first-half writes still queued %d; per-session save lag (records, "
+              "sorted) %s; busy sessions' saved queue age (s, sorted) %s"
+              % (NSESS, BUSY, ITEM_S * 1000, SECS, len(ran), len(ran) + len(still), gap, oldest, len(early_left),
+                 sorted(lags), sorted(stale)))
+        self.assertLess(gap, GAP_S, "no other write ran for %.1f s" % gap)
+        self.assertEqual(early_left, [], "%d other writes queued in the first half never ran (waiting %s s)"
+                         % (len(early_left), early_left[-5:]))
         trailing = [x for x in lags if x >= LAG_BOUND]
         self.assertEqual(trailing, [], "%d sessions' saved read position trails by %d or more records: %s"
                          % (len(trailing), LAG_BOUND, sorted(lags)))
-        self.assertLess(max(stale), WAIT_BOUND_S, "a session's queue mirror on disk is %.1f s old: %s"
-                        % (max(stale), sorted(stale)))
-
+        self.assertLess(max(stale), SECS / 2.0, "a busy session's saved queue on disk was queued %.1f s before the "
+                        "end, before the run's second half: %s" % (max(stale), sorted(stale)))
 
 
 if __name__ == "__main__":
