@@ -6518,8 +6518,6 @@ class SdkSession:
 
     def shutdown(self):
         self.ended = True
-        self._gate_blocked = {}                  # the session ends: what its gate blocked and its re-send counts go too
-        self._hook_drop_resends = {}
         if self.loop:
             self.loop.call_soon_threadsafe(self._wake_set)   # break the receive loop even if idle (no msg coming)
         if self.loop and self.client and not self.detached:
@@ -8965,7 +8963,10 @@ class SdkSession:
         """The prompt gate (_prompt_submit_gate) just BLOCKED `prompt`: remember it, so the CLI's dropped_by_hook removal
         of that text is read as the kernel's own decision and never re-sent (_requeue_hook_drop). A small map of
         prompt key (_gate_prompt_key) to monotonic time, bounded by count (GATE_BLOCKED_KEEP) and age
-        (GATE_BLOCKED_TTL_S), cleared at shutdown. Never raises: the gate's verdict must not depend on it."""
+        (GATE_BLOCKED_TTL_S). Kept through shutdown(): _run's finally reads it after shutdown (_release_hold_at_exit), and
+        emptied there a blocked text dropped just before the session ended went back to the queue as undecided; the
+        session object is never reused, so nothing else needs it cleared. Never raises: the gate's verdict must not
+        depend on it."""
         try:
             m = getattr(self, "_gate_blocked", None)
             if m is None:
@@ -11325,7 +11326,8 @@ QUEUE_REMOVE_DROPPED_BY_HOOK = "dropped_by_hook"
 HOOK_DROP_RESEND_MAX = 3
 # The prompts the kernel's own prompt gate blocked (SdkSession._note_gate_blocked), kept so a drop of one of them is
 # not re-sent: at most this many per session, none older than this many seconds (the CLI writes the removal right
-# after the hook's answer, so an entry is read within seconds or never), cleared when the session shuts down.
+# after the hook's answer, so an entry is read within seconds or never). Never cleared at shutdown: the exit release
+# reads it after shutdown() runs.
 GATE_BLOCKED_KEEP = 32
 GATE_BLOCKED_TTL_S = 3600.0
 # Re-send counts per queued item (SdkSession._hook_drop_resends): at most this many items per session.

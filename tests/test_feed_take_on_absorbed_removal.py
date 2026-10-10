@@ -498,10 +498,29 @@ class TakeOnTheCLIsQueueRemoval(unittest.TestCase):
         self.assertTrue((self._echo(q) or {}).get("dropped"), "flagged never delivered")
         self.assertEqual(self._counts().get("removed:dropped_by_hook"), 1)
 
+    def test_a_gate_blocked_text_dropped_then_shut_down_is_not_re_headed(self):
+        """The session ends (shutdown(): ended by hand, or hosts off) between the CLI's drop of a text romp's gate blocked
+        and the next turn frame, so the exit release in _run's finally is what reads the drop. shutdown() runs first and
+        must leave the gate-blocked map alone: emptied there, the drop read as undecided and the blocked text (a replayed
+        schedule slot) went back to the head of the saved queue, to fire on the next revive (the review of c58720ac4)."""
+        s, c = self.s, self._first_turn()
+        q = self._send("a note the gate will block", user=True)
+        self._wait(lambda: len(c.writes) == 2, "forwarded")
+        s._note_gate_blocked("a note the gate will block")
+        self._append(_enqueue_op("a note the gate will block"))
+        self._append(_remove_op(None, reason="dropped_by_hook"))
+        s.shutdown()
+        self._wait(lambda: s._untaken is None, "the exit release ran in _run's finally")
+        self._wait(lambda: (self._echo(q) or {}).get("dropped"), "the blocked note's echo flagged never delivered")
+        self.assertEqual(s.pending(), [], "not re-headed after shutdown")
+        self.assertIsNone(self._counts().get("removed:dropped_by_hook:reheaded"))
+        self.assertEqual(self._counts().get("removed:dropped_by_hook"), 1)
+
 
 class TheGateBlockedMapIsBounded(unittest.TestCase):
     """The prompts romp's gate blocked are kept per session, bounded by count and by age, consumed by the drop they
-    answer, and cleared when the session shuts down (SdkSession._note_gate_blocked, _take_gate_blocked)."""
+    answer, and kept through shutdown, since the exit release reads them after it (SdkSession._note_gate_blocked,
+    _take_gate_blocked)."""
 
     def _bare(self):
         s = sb.SdkSession.__new__(sb.SdkSession)     # the map needs none of __init__
@@ -533,13 +552,15 @@ class TheGateBlockedMapIsBounded(unittest.TestCase):
         s._note_gate_blocked("y" * 500 + " tail one")
         self.assertTrue(s._take_gate_blocked("y" * 500 + " a different tail"))
 
-    def test_cleared_at_shutdown(self):
+    def test_kept_through_shutdown(self):
+        """shutdown() runs before _run's finally reads the map (_release_hold_at_exit), so it must not empty it; the
+        session object is never reused, and both maps bound themselves."""
         s = self._bare()
         s._note_gate_blocked("a block")
         s._hook_drop_resends = {"q:x": 2}
         s.shutdown()
-        self.assertEqual(s._gate_blocked, {})
-        self.assertEqual(s._hook_drop_resends, {})
+        self.assertEqual(s._hook_drop_resends, {"q:x": 2})
+        self.assertTrue(s._take_gate_blocked("a block"), "the exit release still finds the block")
 
 
 class TheLandingScanReadsRemovals(unittest.TestCase):
