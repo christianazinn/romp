@@ -2625,7 +2625,12 @@ The snapshot's fields, all plain numbers (`ms` is milliseconds of wall time):
   leaves the pass primed and the drop wrote), `coldWrites` (per fold name, writes that kept such a tail-only state
   out of the document so no later kernel restores it as complete), `droppedRestores` (a
   restore lost to a read that replaced the entry under it; the reader
-  serializes reads per path, so this should stay at zero), `documentBytes`
+  serializes reads per path, so this should stay at zero), `cursorOutside`
+  (per fold name, restores refused because the document's cursor, or its cut,
+  lay outside the records the reader holds for the file; each such fold then
+  refolds from record 0, so this should stay at zero), `refoldWalks` (per fold
+  name, `count` and `records` of every refold's walk from record 0, including
+  one that read nothing because the file was already indexed whole), `documentBytes`
   (what reading the checkpoint documents themselves cost since boot),
   `fallbacks` per reason (`version`, `path`, `shrunk`, `guard`, `rewrite`,
   `corrupt`), `dirty` (files whose folds moved since their last write),
