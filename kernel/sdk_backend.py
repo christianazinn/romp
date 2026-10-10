@@ -11828,6 +11828,9 @@ def _host_ack_backwards(old, new) -> bool:
 # that fires: Stop, the scheduling, ledger, failure and facts hooks, a rewind completion) grows while the lock is stuck,
 # each item a few hundred bytes since hooks copy only the fields they record. Past this many items the writer logs once.
 REG_JOBS_WARN = 2000
+# Registry writer queue keys of the read-position saves (hostAck): a block at the queue's head that the writer alternates
+# with everything else (SdkBackend._reg_job, _reg_pick_locked; review 5)
+REG_ACK_KEYS = frozenset({"hostAck"})
 
 # A host exit the kernel asked for, or the host's own idle grace: hostAck and the host's directory are dropped
 # (_host_ended). Any other cause (died, crash, lost) keeps them, and the departed host's last offset is written.
@@ -12979,8 +12982,9 @@ class SdkBackend:
         _reg_lock answers none of its session's hook callbacks (see SESSION_LOOP_THREAD_PREFIX). Queued work runs in the
         order it was queued, one item at a time, on one thread, so one session's writes keep their order and the writer
         is the only one making them. A `key` coalesces: queuing a key already waiting replaces its callable (the mirrors
-        and hostAck, whose latest value is the only one worth writing) and moves it to the back, except the per-record
-        hostAck, which goes to the front when first queued and keeps its place after; key None never coalesces.
+        and hostAck, whose latest value is the only one worth writing) and moves it to the back, except a read-position
+        save (REG_ACK_KEYS), which joins the end of the block of saves at the queue's head when first queued and keeps
+        its place after, the writer alternating that block with the rest; key None never coalesces.
 
         The writer is published only once it has started, and a slot holding a thread that is not alive is replaced
         (2026-10-09, review 1: a slot stored before a failed start() stayed stuck for the kernel's life, silently, and the
@@ -13006,17 +13010,31 @@ class SdkBackend:
             if key is None:
                 self._reg_jobs_seq += 1
                 key = ("job", self._reg_jobs_seq)
-            if key[0] == "hostAck":
-                # the per-record hostAck goes to the FRONT when first queued and keeps its place when re-queued (review
-                # 4, must-fix 2): sent to the back at each once-a-second re-queue, it never reached the front while the
-                # writer was over a second behind, so the saved offset stopped moving and a hard kill replayed the whole
-                # gap. Review 2's reason for the back does not apply to it: the job reads the session's current offset
-                # when it runs, and the merge refuses an older one (_reg_merge_locked). It trails by at most about one
-                # item plus the one-second throttle, whatever the backlog
-                fresh = key not in self._reg_jobs
-                self._reg_jobs[key] = fn
-                if fresh:
+            if key[0] in REG_ACK_KEYS:
+                # a read-position save joins the END of the block of saves at the queue's head and keeps its place when
+                # re-queued; the writer alternates between that block and the rest (_reg_pick_locked). Sent to the back
+                # at each once-a-second re-queue, it never reached the front while the writer was over a second behind,
+                # so the saved offset stopped moving and a hard kill replayed the whole gap (review 4, must-fix 2); put
+                # AHEAD of everything, the saves of 15 or more streaming sessions at about 60 ms a write ran nothing else
+                # (review 5, must-fix 1: other writes, the saved queue and taken-mail ids among them, never landed) and
+                # the newest saves kept cutting in front of older ones, so a few sessions were never saved (must-fix 2).
+                # Review 2's reason for the back does not apply here: the per-record job reads the session's current
+                # offset when it runs, the queued final writes only while the carry names its host, and the merge
+                # refuses an older offset for one host (_reg_merge_locked)
+                if key in self._reg_jobs:
+                    self._reg_jobs[key] = fn
+                else:
+                    self._reg_jobs[key] = fn
                     self._reg_jobs.move_to_end(key, last=False)
+                    ahead = []
+                    it = iter(self._reg_jobs)
+                    next(it)
+                    for k in it:                  # the saves already queued: a prefix of the queue, oldest first
+                        if k[0] not in REG_ACK_KEYS:
+                            break
+                        ahead.append(k)
+                    for k in reversed(ahead):
+                        self._reg_jobs.move_to_end(k, last=False)
             else:
                 # any other re-queued key takes the new value AND the back of the line (review 2): kept in its old
                 # place, it ran ahead of work queued after the value it now carries, so an older write could land after
@@ -13156,6 +13174,7 @@ class SdkBackend:
         However it ends, it clears its own slot, so the next queued item starts a fresh writer."""
         me = threading.current_thread()
         clean = False
+        after_save = False
         try:
             while True:
                 with self._reg_jobs_lock:
@@ -13164,7 +13183,8 @@ class SdkBackend:
                             self._reg_writer = None
                         clean = True
                         return
-                    key, fn = self._reg_jobs.popitem(last=False)
+                    key, fn = self._reg_pick_locked(after_save)
+                    after_save = key[0] in REG_ACK_KEYS
                     self._reg_running_sid = self._reg_jobs_sid.pop(key, None)
                 try:
                     fn()
@@ -13186,6 +13206,17 @@ class SdkBackend:
             if not clean:   # a BaseException out of an item (the items' own Exceptions are caught above): say so once here
                 self._log_quiet("registry writer: stopped on an unexpected error with %d write(s) queued; the next queued "
                                 "write starts a fresh writer" % left)
+
+    def _reg_pick_locked(self, after_save: bool):
+        """The writer's next item, popped (caller holds _reg_jobs_lock; the queue is not empty). Read-position saves
+        (REG_ACK_KEYS) form a block at the queue's head (_reg_job); right after one of them ran, the oldest OTHER item goes
+        next when there is one, else the head. So saves take at most half the writer and other writes keep moving, and
+        each save keeps moving too, round the block in turn (review 5, must-fixes 1 and 2)."""
+        if after_save:
+            for k in self._reg_jobs:
+                if k[0] not in REG_ACK_KEYS:
+                    return k, self._reg_jobs.pop(k)
+        return self._reg_jobs.popitem(last=False)
 
     def _write_host_ack_now(self, sess) -> None:
         """The hostAck registry write itself, from the session's CURRENT transport, read UNDER _reg_lock (see
