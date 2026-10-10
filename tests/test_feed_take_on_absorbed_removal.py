@@ -20,10 +20,14 @@ whose own removals keep their text), and by text where the removal names it (_qu
     counted (feed_take_counts);
   * a joined text (peer mail and tagged sends fed as one) matches its removal the same way, and every part's echo
     lands;
-  * a removal for another reason (dropped_by_hook: a hook dropped the text) releases the hold, since the text left the
-    CLI's queue, but the text is reported as removed unread: its echo is flagged never delivered (dropped and refused,
-    like the prompt gate's refusal), it is not re-fed, its mail gets no read stamp, and one problem line names the
-    session;
+  * a removal for another reason releases the hold, since the text left the CLI's queue, and is never a delivery. A
+    dropped_by_hook removal is not always a hook's decision: the CLI writes the same removal when its 540 s hook limit
+    runs out or the session host reconnects before the kernel answers (2026-10-09: 78 drops in a day, 9 of 16 traced
+    texts never came back). So a dropped_by_hook text romp's own prompt gate did not block goes back to the head of the
+    queue and is fed again, at most three times per item (the fourth drop falls back), and never once its record
+    landed; a text the gate blocked, or one whose re-sends are spent, is reported as removed unread: its echo is flagged
+    never delivered (dropped and refused, like the prompt gate's refusal), it is not re-fed, its mail gets no read
+    stamp, and one problem line names the session;
   * a remove with no reason (an older CLI's discard) or for another text releases nothing;
   * the queued_command attachment still releases the hold as before, and the boot re-delivery guard (_text_landed)
     reads an absorbed removal as a landing, so a restart cannot re-feed a text the turn already read.
@@ -360,7 +364,6 @@ class TakeOnTheCLIsQueueRemoval(unittest.TestCase):
         """(c) A hook outside romp that really blocks a text drops it every time. The kernel re-sends one queued item at
         most HOOK_DROP_RESEND_MAX (3) times; the fourth drop takes the never-delivered road, so nothing loops."""
         s, c = self.s, self._first_turn()
-        self.assertEqual(sb.HOOK_DROP_RESEND_MAX, 3)
         text = "a note some other hook always blocks"
         q = self._send(text, user=True)
         self._wait(lambda: len(c.writes) == 2, "forwarded")
@@ -383,6 +386,7 @@ class TakeOnTheCLIsQueueRemoval(unittest.TestCase):
         self.assertIsNone(s._untaken)
         self.assertEqual(self._counts().get("removed:dropped_by_hook"), 1)
         self.assertEqual(self._counts().get("removed:dropped_by_hook:reheaded"), 3)
+        self.assertEqual(sb.HOOK_DROP_RESEND_MAX, 3, "the cap this test walks")
 
     def test_a_text_that_landed_is_never_re_sent_on_a_drop(self):
         """(e) A drop removal for a text whose record landed (here a queued_command attachment written after the

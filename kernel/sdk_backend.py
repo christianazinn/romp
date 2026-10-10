@@ -9113,7 +9113,8 @@ class SdkSession:
             removal is read by queue order from the session's ledger (_queue_ledger_fold, _ledger_take),
             and by text only for an item whose removal names it. A remove for any other reason
             (dropped_by_hook) releases the hold as well, since the text is no longer in the CLI's queue,
-            and is reported as removed unread, never as delivered.
+            and is never read as delivered: a prompt-hook drop romp's own gate did not decide goes back to
+            the head of the queue (_requeue_hook_drop), anything else is reported as removed unread.
         Only turn frames count (_turn_frame: the init, assistant messages, the CLI's own user records,
         results); a task, hook, rate-limit or progress frame proves nothing about the queue. The scan is
         bounded: it resumes at the last complete line it read and skips a file that has not grown.
@@ -9146,8 +9147,9 @@ class SdkSession:
             return True
         # The CLI's queue-operation REMOVE of the text for a reason other than absorbed_mid_turn (dropped_by_hook
         # first among them; _text_landed leaves the verdict in u["take"]): the text is off the CLI's queue, so the
-        # next one can no longer fuse with it and the hold releases, but the turn never read it. _on_message hands
-        # it to the backend as a text the CLI removed unread (_feed_removed_unread), never as a delivery.
+        # next one can no longer fuse with it and the hold releases, but the turn never read it. _on_message re-heads
+        # an undecided prompt-hook drop (_requeue_hook_drop) and hands any other to the backend as a text the CLI
+        # removed unread (_feed_removed_unread), never as a delivery.
         take = u.get("take")
         return isinstance(take, tuple) and len(take) == 2 and take[0] == "removed"
 
