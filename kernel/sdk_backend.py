@@ -12034,6 +12034,12 @@ REG_JOBS_WARN = 2000
 # review 5, must-fix 3). A block at the queue's head that the writer alternates with everything else (SdkBackend._reg_job,
 # _reg_pick_locked; review 5)
 REG_ACK_KEYS = frozenset({"hostAck", "hostAckFinal"})
+# Registry writer queue keys that keep their place when re-queued, because their job reads the value it writes when it
+# runs, never when it was queued (review 6): the saved queue (SdkSession._persist_queue_due re-reads the queue and takes
+# the taken flag under its lock) and the background-task copy (_mirror_bg_tasks reads the live set under _reg_lock).
+# A key whose job captures its value at queue time (liveCtx) must never join: kept in place, an older value it carries
+# could land after work queued later
+REG_KEEP_PLACE_KEYS = frozenset({"queue", "bgTasks"})
 
 # A host exit the kernel asked for, or the host's own idle grace: hostAck and the host's directory are dropped
 # (_host_ended). Any other cause (died, crash, lost) keeps them, and the departed host's last offset is written.
@@ -13238,6 +13244,12 @@ class SdkBackend:
                         ahead.append(k)
                     for k in reversed(ahead):
                         self._reg_jobs.move_to_end(k, last=False)
+            elif key[0] in REG_KEEP_PLACE_KEYS and key in self._reg_jobs:
+                # a mirror that reads its value when it runs keeps its place when re-queued (review 6): sent to the back
+                # at every re-queue, it never ran whenever other writes waited longer than its re-queue period (the
+                # saved queue went 13 to 30 s stale under overload, never saved after the start). Running early cannot
+                # land an older value, since the job reads the live state under the lock when it runs
+                self._reg_jobs[key] = fn
             else:
                 # any other re-queued key takes the new value AND the back of the line (review 2): kept in its old
                 # place, it ran ahead of work queued after the value it now carries, so an older write could land after
