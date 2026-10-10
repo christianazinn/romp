@@ -3458,8 +3458,10 @@ every record.
   keeps a skeleton: only the fields the rewind, membership and document-chain
   walks read (ids, parent links, type, the flags, the compaction segment, a
   queued prompt, the content blocks' ids, a user record's text, and whether an
-  assistant record's text is non-empty), about 600 bytes a record, counted in
-  the entry's weight. Skeletons are built from records already in memory (the
+  assistant record's text is non-empty). Each is counted in the entry's weight
+  by what it holds once its record is freed (its containers and strings, a
+  user record's text by its length): about 850 to 1,050 bytes a record on
+  typical records (`tailOnly.skeletonBytes` and `tailOnly.skeletons`). Skeletons are built from records already in memory (the
   scan's dropped records and the window's records as it slides), never by a
   read, so the judges' per-pass walks over a growing leaf cost no disk pass. A
   skeleton asked for a field it does not keep raises; the walk is then run

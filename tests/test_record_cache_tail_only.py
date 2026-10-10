@@ -201,7 +201,7 @@ class LargeTranscriptHoldsItsTail(Base):
             window = size - got.hot_offset()
             self.assertLessEqual(window, 32 * MIB + 400 * 1024, "the window is the last 32 MiB (plus at most one record)")
             stats = em.record_cache_stats()
-            skel = (getattr(em, "_SKEL_BYTES_PER_RECORD", 0) + 8) * count   # the walk skeleton of each older record (review fix)
+            skel = 8 * count + int(getattr(got, "skel_bytes", 0) or 0)   # the walk skeleton of each older record, by what it holds
             self.assertLess(stats["bytes"], int(3 * (32 * MIB + 400 * 1024)) + 20 * count + skel + 1,
                             "the cache weighs the window, the index and the skeletons, not the file: %d" % stats["bytes"])
             self.assertLess(held - base_now, 160 * MIB,
@@ -593,9 +593,6 @@ class ChatScrollBack(unittest.TestCase):
                 self.assertTrue(_tail(ent[4]) or ent[5] > 0, "the leaf's record entry never became whole")
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 def write_forked(path, n, fork_at=40, branch=3, seed=5):
     """A synthetic linear transcript of `n` records with a REWOUND branch: `branch` records hanging off record `fork_at`,
@@ -731,6 +728,35 @@ def golden_scenarios():
         os.environ.clear(); os.environ.update(saved_env)
 
 
+def _verdict_field_shapes():
+    """Shapes whose verdicts turn on the skeleton fields no golden scenario exercises (review find, 2026-10-07): a retry-storm
+    fork whose second assistant branch is an isApiErrorMessage echo, one whose second branch is a blank-text stub (the
+    assistant-text mark), and a parallel batch carrying an isMeta hook note. Synthetic ids and text."""
+    U = lambda n: "66666666-2222-3333-4444-%012d" % n
+    ts = lambda k: "2026-10-07T03:00:%02d.000Z" % k
+
+    def storm(second):
+        return [
+            {"type": "user", "uuid": U(1), "parentUuid": None, "timestamp": ts(0), "message": {"role": "user", "content": "do the thing"}},
+            {"type": "assistant", "uuid": U(2), "parentUuid": U(1), "timestamp": ts(1),
+             "message": {"id": "m1", "role": "assistant", "content": [{"type": "thinking", "thinking": "hm"}]}},
+            {"type": "assistant", "uuid": U(5), "parentUuid": U(2), "timestamp": ts(2),
+             "message": {"id": "m2", "role": "assistant", "content": [{"type": "text", "text": "the real reply"}]}},
+            dict({"type": "assistant", "uuid": U(6), "parentUuid": U(2), "timestamp": ts(3)}, **second),
+            {"type": "system", "subtype": "api_error", "uuid": U(3), "parentUuid": U(2), "timestamp": ts(4)},
+            {"type": "user", "uuid": U(4), "parentUuid": U(3), "timestamp": ts(5), "message": {"role": "user", "content": "next prompt"}},
+        ]
+    meta = _batch_shape()
+    meta.insert(5, {"type": "user", "uuid": "b-m", "parentUuid": "b-r1", "isMeta": True, "timestamp": "2026-10-07T01:00:12.500Z",
+                    "message": {"role": "user", "content": "a hook note the harness wrote"}})
+    return {
+        "storm_api_error_echo": storm({"isApiErrorMessage": True, "message": {"id": "m3", "role": "assistant",
+                                                                              "content": [{"type": "text", "text": "API Error: overloaded"}]}}),
+        "storm_blank_stub": storm({"message": {"id": "m3", "role": "assistant", "content": [{"type": "text", "text": "  \n "}]}}),
+        "batch_with_meta_note": meta,
+    }
+
+
 class SkeletonWalksEqualFullWalks(Base):
     """A walk over a tail-only entry's skeletons files every record as the walk over the full records does, for every graph
     shape the golden scenarios pin (compactions with intact and broken stitches, a detached manual compact, an eclipsed
@@ -740,6 +766,33 @@ class SkeletonWalksEqualFullWalks(Base):
     def _scenarios(self):
         out = {name: fn() for name, (fn, _states) in golden_scenarios().items()}
         out["parallel_batch"] = _batch_shape()
+        out.update(_verdict_field_shapes())
+        return out
+
+    def _mismatches(self):
+        """Every (scenario, layout) whose walk over skeletons differs from the walk over the full records, or refuses a field
+        (_SkelMiss), with the shape before the window; [] when the skeletons stand in for the records exactly."""
+        path = self.leaf()
+        out = []
+        with knobs(16 * 1024, 4, roots=[str(self.proj)]):
+            for name, recs in sorted(self._scenarios().items()):
+                for layout in ("continue", "back"):
+                    fresh()
+                    self._write(path, recs, layout)
+                    ent = em._read_jsonl_entry(path)
+                    self.assertTrue(_tail(ent[4]) and ent[4].ncold > len(recs), "the scenario is before the window")
+                    full = em.FileAdapter([path], path)
+                    c0 = cold_records()
+                    try:
+                        walk = em.FileAdapter([path], path, walk_only=True)
+                        got = (walk.chain_verdicts(), em._membership_of(walk), walk.leaf_uuid, walk.parent_of, walk._adopted)
+                    except em._SkelMiss as e:
+                        out.append((name, layout, "refused %s" % e)); continue
+                    self.assertEqual(cold_records(), c0, "the walk read nothing before the window")
+                    want = (full.chain_verdicts(), em._membership_of(full), full.leaf_uuid, full.parent_of, full._adopted)
+                    if got != want:
+                        diff = sorted(u for u in set(got[0]) | set(want[0]) if got[0].get(u) != want[0].get(u))
+                        out.append((name, layout, "verdicts differ on %s" % diff[:4]))
         return out
 
     def _write(self, path, recs, layout):
@@ -759,23 +812,43 @@ class SkeletonWalksEqualFullWalks(Base):
         Path(path).write_text("\n".join(lines) + "\n")
 
     def test_skeleton_walks_file_every_shape_as_the_full_walk(self):
-        path = self.leaf()
-        with knobs(16 * 1024, 4, roots=[str(self.proj)]):
-            for name, recs in sorted(self._scenarios().items()):
-                for layout in ("continue", "back"):
-                    with self.subTest(scenario=name, layout=layout):
-                        fresh()
-                        self._write(path, recs, layout)
-                        ent = em._read_jsonl_entry(path)
-                        self.assertTrue(_tail(ent[4]) and ent[4].ncold > len(recs), "the scenario is before the window")
-                        full = em.FileAdapter([path], path)
-                        c0 = cold_records()
-                        walk = em.FileAdapter([path], path, walk_only=True)
-                        self.assertEqual(cold_records(), c0, "the walk read nothing before the window")
-                        self.assertEqual(walk.chain_verdicts(), full.chain_verdicts())
-                        self.assertEqual(em._membership_of(walk), em._membership_of(full))
-                        self.assertEqual((walk.leaf_uuid, walk.parent_of, walk._adopted),
-                                         (full.leaf_uuid, full.parent_of, full._adopted))
+        self.assertEqual(self._mismatches(), [])
+
+    def test_a_broken_verdict_field_in_the_skeleton_is_caught(self):
+        """Review find (2026-10-07): the check above stayed green with isApiErrorMessage or isMeta dropped from the skeleton,
+        or the assistant-text mark broken, because no shape it walked depended on them; the verdict-field shapes now do. Each
+        mutation of the skeleton builder must make the check report a mismatch (a wrong verdict, or a refused field)."""
+        S0, A0, M0, K0 = em._SKEL_SCALARS, em._SkelRec._ALLOW, em._skel_text_mark, em._skel
+
+        def blank(field):                                 # the key kept in the allowed set, its value gone: answers "absent"
+            def mut(r):
+                sk = K0(r)
+                if type(sk) is em._SkelRec and dict.__contains__(sk, field) and em._SKEL_BARE.get(dict.get(sk, "type")) is not sk:
+                    dict.__delitem__(sk, field)
+                return sk
+            return {"_skel": mut}
+
+        def unkept(field):                                # the natural edit: the field leaves the kept list (and the allowed set)
+            sc = tuple(k for k in S0 if k != field)
+            return {"_SKEL_SCALARS": sc, "_ALLOW": frozenset(sc + ("message", "attachment", "compactMetadata"))}
+        mutations = {
+            "isApiErrorMessage blanked": blank("isApiErrorMessage"), "isApiErrorMessage unkept": unkept("isApiErrorMessage"),
+            "isMeta blanked": blank("isMeta"), "isMeta unkept": unkept("isMeta"),
+            "text mark without strip": {"_skel_text_mark": lambda t: ("x" if t else "") if type(t) is str else t},
+            "text mark always non-empty": {"_skel_text_mark": lambda t: "x" if type(t) is str else t},
+        }
+        for name, patch in mutations.items():
+            with self.subTest(mutation=name):
+                try:
+                    em._skel = patch.get("_skel", K0)
+                    em._skel_text_mark = patch.get("_skel_text_mark", M0)
+                    em._SKEL_SCALARS = patch.get("_SKEL_SCALARS", S0)
+                    em._SkelRec._ALLOW = patch.get("_ALLOW", A0)
+                    found = self._mismatches()
+                finally:
+                    em._SKEL_SCALARS, em._SkelRec._ALLOW, em._skel_text_mark, em._skel = S0, A0, M0, K0
+                    fresh()
+                self.assertTrue(found, "the skeleton-vs-full check caught the mutation")
 
     def test_a_skeleton_refuses_a_field_it_does_not_keep_and_the_walk_reruns_whole(self):
         r = {"type": "user", "uuid": "u1", "parentUuid": None, "toolUseResult": {"stdout": "x"},
@@ -1043,3 +1116,156 @@ class SkeletonsStayOutOfTheCollectorsWalk(Base):
             recs = em._read_jsonl_entry(path)[4]
             self.assertEqual([i for i, s in enumerate(recs.skel[:recs.ncold]) if gc.is_tracked(s)], [])
             self.assertFalse(gc.is_tracked(recs.skel))
+
+
+def _counted_skeleton_bytes(skels):
+    """What the cache counts for these skeletons (and their list's pointers): each skeleton by what it holds, or, on a tree
+    with the first flat charge, that charge."""
+    fn = getattr(em, "_skel_bytes", None)
+    if fn is not None:
+        return sum(fn(s) for s in skels) + 8 * len(skels)
+    return len(skels) * (getattr(em, "_SKEL_BYTES_PER_RECORD", 0) + 8)
+
+
+def _weight_mix(n, rnd, prompt_words=300):
+    """Synthetic records of every skeleton shape: the coding-session mix, long typed prompts, queued prompts and a compaction
+    boundary with its preserved segment (invented text, placeholder ids)."""
+    out = []
+    for i in range(n):
+        r = _rec(i, rnd)
+        if i % 10 == 4:
+            r["message"]["content"] = " ".join(rnd.choice(WORDS) for _ in range(prompt_words))
+        if i % 50 == 7:
+            r = {"type": "attachment", "uuid": r["uuid"], "parentUuid": r["parentUuid"], "timestamp": r["timestamp"],
+                 "attachment": {"type": "queued_command", "prompt": " ".join(rnd.choice(WORDS) for _ in range(40))}}
+        if i % 200 == 99:
+            r = {"type": "system", "subtype": "compact_boundary", "uuid": r["uuid"], "parentUuid": None,
+                 "logicalParentUuid": r["parentUuid"], "timestamp": r["timestamp"],
+                 "compactMetadata": {"trigger": "auto", "preTokens": 9000,
+                                     "preservedSegment": {"headUuid": r["parentUuid"], "anchorUuid": r["parentUuid"],
+                                                          "tailUuid": r["parentUuid"]}}}
+        out.append(r)
+    return out
+
+
+class SkeletonWeightIsWhatSkeletonsHold(Base):
+    """The cache counts each skeleton by what it holds once its decoded record is freed (review find, 2026-10-07): the first
+    flat charge, 600 bytes a record, was measured while the records were still alive, and the skeletons alone held 25 to 40
+    percent more (ids, parent links, timestamps, message and tool ids, a user record's text), without bound for a long user
+    text. The counted figure must stay within about 10 percent of tracemalloc's, measured after the records are freed."""
+
+    def test_the_counted_weight_is_within_ten_percent_of_tracemalloc_after_the_records_are_freed(self):
+        import gc
+        for prompt_words in (12, 300, 2000):
+            with self.subTest(prompt_words=prompt_words):
+                lines = [json.dumps(r) for r in _weight_mix(20000, random.Random(prompt_words), prompt_words)]
+                gc.collect()
+                tracemalloc.start()
+                try:
+                    b0, _ = tracemalloc.get_traced_memory()
+                    recs = [json.loads(l) for l in lines]        # decoded the way the scan decodes them
+                    skels = [em._skel(r) for r in recs]
+                    del recs                                       # the records leave memory: what stays is the skeletons
+                    gc.collect()
+                    held = tracemalloc.get_traced_memory()[0] - b0
+                finally:
+                    tracemalloc.stop()
+                counted = _counted_skeleton_bytes(skels)
+                self.assertLess(abs(counted - held) / held, 0.10,
+                                "counted %d bytes for %d skeletons, tracemalloc holds %d (%.0f against %.0f a record)"
+                                % (counted, len(skels), held, counted / len(skels), held / len(skels)))
+
+    def test_a_tail_only_entrys_weight_carries_its_skeletons_and_a_long_prompt_by_its_length(self):
+        with knobs(32 * 1024, 4, roots=[str(self.proj)]):
+            path = self.leaf()
+            rnd = random.Random(3)
+            recs = _weight_mix(3000, rnd)
+            recs[100] = dict(recs[100], type="user", message={"role": "user", "content": "q" * 1000000})   # a pasted megabyte
+            Path(path).write_text("".join(json.dumps(r) + "\n" for r in recs))
+            ent = em._read_jsonl_entry(path)
+            t = ent[4]
+            self.assertTrue(_tail(t) and t.ncold > 200)
+            held = max(0, ent[1] - t.hot_offset())
+            base = int(held * em.RECORD_CACHE_RESIDENT_PER_FILE_BYTE) + len(t.offs) * t.offs.itemsize + len(t.crcs) * t.crcs.itemsize
+            skel_term = em._entry_weight(ent) - base
+            self.assertEqual(skel_term, _counted_skeleton_bytes(t.skel[:t.ncold]),
+                             "the entry's weight counts its skeletons as each holds")
+            self.assertGreater(skel_term, 1000000, "the pasted megabyte before the window is counted by its length")
+            stats = em.record_cache_stats()["tailOnly"]
+            self.assertEqual((stats.get("skeletonBytes"), stats.get("skeletons")), (t.skel_bytes, t.ncold))
+
+
+class TheFileRunsWhole(unittest.TestCase):
+    """A direct run (python tests/test_record_cache_tail_only.py) runs every class: the main guard sat mid-file, so the seven
+    classes after it never ran that way and the run still said OK (review find, 2026-10-07)."""
+
+    def test_the_main_guard_is_the_last_statement(self):
+        import ast
+        tree = ast.parse(Path(__file__).read_text())
+        guards = [i for i, n in enumerate(tree.body) if isinstance(n, ast.If) and "__main__" in ast.dump(n.test)]
+        self.assertEqual(guards, [len(tree.body) - 1], "the main guard is the file's last top-level statement")
+
+
+
+class TheAssemblyConvergePassOverATailOnlyLeaf(Base):
+    """The kernel's assembly converge pass (kernel._converge_assembly, review find, 2026-10-07: only its predicate,
+    entry_indexed_whole, was tested over a tail-only leaf). An idle leaf the boot parsed whole, held tail-only, gets its
+    assembly document written by the pass from the entry in memory: no record read before the window, the entry stays
+    tail-only, and the document restores. A planted control with the pass's old predicate (a whole RESIDENT entry) skips the
+    leaf as having nothing to write from, so this test fails if the pass stops serving tail-only leaves."""
+
+    def parse(self, path):
+        return em.parse_session(path, rompuuid=SID, name="impl", dir="/TESTDIR", candidate_files=[path],
+                                states=None, postal_log=[], now=NOW)
+
+    def _pass(self, path):
+        for name, val in (("CKPT_CONVERGE_MS", 5000.0), ("CKPT_CONVERGE_BYTES", em._CKPT_CYCLE_CAP_DEFAULT), ("ASM_CONVERGE", True)):
+            saved = getattr(km, name); setattr(km, name, val); self.addCleanup(setattr, km, name, saved)
+        km._ASM_CONVERGE_DONE.clear(); km._ASM_CONVERGE_BLIP.clear(); km._ASM_CONVERGE_NOENTRY.clear()
+        em._ASM_CKPT_STATS["converge"] = {"writes": 0, "bytes": 0, "deferred": 0, "candidates": 0, "skipped": {}}
+        km._begin_checkpoint_cycle()
+        c0 = cold_records()
+        n = km._converge_assembly(time.time(), time.monotonic())
+        return n, cold_records() - c0, dict(em.asm_checkpoint_stats()["converge"])
+
+    def _setup(self):
+        path = self.leaf()
+        recs = transcript(NOW - 86400, turns=160, compact_every=40)
+        Path(path).write_text("".join(json.dumps(r) + "\n" for r in recs))
+        old = time.time() - 600
+        os.utime(path, (old, old))                     # idle past the quiescence window: the converge pass's leaf, not the settle's
+        return path
+
+    def test_the_converge_pass_writes_the_document_from_a_tail_only_entry_and_reads_nothing(self):
+        path = self._setup()
+        with knobs(16 * 1024, 4, roots=[str(self.proj)]):
+            tree = self.parse(path)
+            ent = em._JSONL_CACHE.get(path)
+            self.assertTrue(ent is not None and _tail(ent[4]) and ent[5] == 0, "the boot's whole parse left a tail-only entry")
+            self.assertFalse(em._asm_ckpt_file(path).exists())
+            n, cold, conv = self._pass(path)
+            self.assertEqual((n, conv["writes"]), (1, 1), "the pass wrote the leaf's document: %r" % conv)
+            self.assertTrue(em._asm_ckpt_file(path).exists())
+            self.assertEqual(cold, 0, "the pass read nothing before the window")
+            self.assertTrue(_tail(em._JSONL_CACHE[path][4]), "the entry stayed tail-only")
+            ref = _strip_tree(tree)
+            fresh()
+            restored = self.parse(path)
+            em.hydrate(restored, SID)
+            self.assertEqual(_strip_tree(restored), ref, "a fresh process restores from the pass's document")
+
+    def test_planted_the_old_predicate_skips_the_leaf(self):
+        path = self._setup()
+        with knobs(16 * 1024, 4, roots=[str(self.proj)]):
+            self.parse(path)
+            saved = em.entry_indexed_whole
+            em.entry_indexed_whole = em.entry_whole_resident          # the pass's predicate before tail-only entries
+            self.addCleanup(setattr, em, "entry_indexed_whole", saved)
+            n, cold, conv = self._pass(path)
+            self.assertEqual(n, 0)
+            self.assertEqual(conv["skipped"].get("noEntry"), 1, "the planted predicate finds nothing to write from: %r" % conv)
+            self.assertFalse(em._asm_ckpt_file(path).exists())
+
+
+if __name__ == "__main__":
+    unittest.main()
